@@ -59,12 +59,17 @@
 
 #![warn(missing_docs)]
 
-#[cfg(any(test, mediax_hw_codec))]
+#[cfg(any(test, mediax_hw_codec, mediax_hw_codec_vaapi))]
 mod annexb;
 #[cfg(feature = "aac")]
 pub mod audio;
 
-#[cfg(any(test, mediax_hw_codec_android, mediax_hw_codec_windows))]
+#[cfg(any(
+    test,
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
+))]
 mod bitstream;
 mod color;
 #[cfg(any(
@@ -84,7 +89,12 @@ mod image_apple;
 mod software;
 mod sys;
 
-#[cfg(any(test, mediax_hw_codec_android, mediax_hw_codec_windows))]
+#[cfg(any(
+    test,
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
+))]
 pub use bitstream::{ConvertedProtectedSample, NalStreamConverter, annex_b_to_length_prefixed};
 pub use color::{
     ColorOutputTarget, SDR_REFERENCE_WHITE_NITS, VideoColorUniform, YUV_COLOR_SHADER_WGSL,
@@ -773,6 +783,8 @@ enum EncoderInner {
     Android(sys::android::AndroidEncoder),
     #[cfg(mediax_hw_codec_windows)]
     Windows(sys::windows::WindowsEncoder),
+    #[cfg(mediax_hw_codec_vaapi)]
+    Vaapi(Box<sys::vaapi::VaapiEncoder>),
     #[cfg(mediax_av1_software_encode)]
     Av1(Box<software::av1::Av1Encoder>),
 }
@@ -823,13 +835,22 @@ impl Encoder {
                     inner: sys::windows::open_encoder(&config)?,
                 }),
 
+                #[cfg(mediax_hw_codec_vaapi)]
+                EncoderCodec::H264(_) => Ok(Self {
+                    inner: sys::vaapi::open_encoder(&config)?,
+                }),
+
                 #[cfg(not(mediax_hw_codec))]
-                EncoderCodec::H264(_) | EncoderCodec::H265(_) => {
-                    Err(CodecError::Unsupported(format!(
-                        "{:?} hardware encoding not available on this platform",
-                        config.codec.codec_type()
-                    )))
-                }
+                EncoderCodec::H265(_) => Err(CodecError::Unsupported(format!(
+                    "{:?} hardware encoding not available on this platform",
+                    config.codec.codec_type()
+                ))),
+
+                #[cfg(not(any(mediax_hw_codec, mediax_hw_codec_vaapi)))]
+                EncoderCodec::H264(_) => Err(CodecError::Unsupported(format!(
+                    "{:?} hardware encoding not available on this platform",
+                    config.codec.codec_type()
+                ))),
 
                 #[cfg(mediax_av1_software_encode)]
                 EncoderCodec::Av1 => Ok(Self {
@@ -846,8 +867,8 @@ impl Encoder {
 
     /// Change the target bitrate of the running stream.
     ///
-    /// On the hardware backends (`VideoToolbox`, Media Foundation, `MediaCodec`)
-    /// the new rate applies from the next submitted frame. The software AV1
+    /// On the hardware backends (`VideoToolbox`, Media Foundation, `MediaCodec`,
+    /// VA-API) the new rate applies from the next submitted frame. The software AV1
     /// encoder (rav1e) cannot change its rate mid-stream, so the new bitrate
     /// is held and applied by rebuilding the encoder context at the next
     /// keyframe: [`Self::encode_nv12`] after this call encodes the frame as a
@@ -875,6 +896,8 @@ impl Encoder {
             EncoderInner::Android(ref mut enc) => enc.set_bitrate(bitrate),
             #[cfg(mediax_hw_codec_windows)]
             EncoderInner::Windows(ref mut enc) => enc.set_bitrate(bitrate),
+            #[cfg(mediax_hw_codec_vaapi)]
+            EncoderInner::Vaapi(ref mut enc) => enc.set_bitrate(bitrate),
             #[cfg(mediax_av1_software_encode)]
             EncoderInner::Av1(ref mut enc) => {
                 enc.set_bitrate(bitrate);
@@ -891,7 +914,7 @@ impl Encoder {
         EncodeStream::new(self.encode_nv12_inner(data, options))
     }
 
-    #[cfg(not(any(mediax_hw_codec, mediax_av1_software_encode)))]
+    #[cfg(not(any(mediax_hw_codec, mediax_hw_codec_vaapi, mediax_av1_software_encode)))]
     fn encode_nv12_inner(
         &self,
         data: &[u8],
@@ -906,7 +929,7 @@ impl Encoder {
         }
     }
 
-    #[cfg(any(mediax_hw_codec, mediax_av1_software_encode))]
+    #[cfg(any(mediax_hw_codec, mediax_hw_codec_vaapi, mediax_av1_software_encode))]
     fn encode_nv12_inner(
         &mut self,
         data: &[u8],
@@ -921,6 +944,9 @@ impl Encoder {
 
             #[cfg(mediax_hw_codec_windows)]
             EncoderInner::Windows(ref mut enc) => enc.encode_nv12(data, options),
+
+            #[cfg(mediax_hw_codec_vaapi)]
+            EncoderInner::Vaapi(ref mut enc) => enc.encode_nv12(data, options),
 
             #[cfg(mediax_av1_software_encode)]
             EncoderInner::Av1(ref mut enc) => enc.encode_nv12(data, options),
@@ -992,6 +1018,8 @@ impl Encoder {
             EncoderInner::Android(_) => Ok(Vec::new()),
             #[cfg(mediax_hw_codec_windows)]
             EncoderInner::Windows(ref mut enc) => enc.drain(),
+            #[cfg(mediax_hw_codec_vaapi)]
+            EncoderInner::Vaapi(_) => Ok(Vec::new()),
             #[cfg(mediax_av1_software_encode)]
             EncoderInner::Av1(ref mut enc) => enc.flush(),
         }
@@ -1015,6 +1043,9 @@ impl Encoder {
 
             #[cfg(mediax_hw_codec_windows)]
             EncoderInner::Windows(ref enc) => enc.get_codec_config(),
+
+            #[cfg(mediax_hw_codec_vaapi)]
+            EncoderInner::Vaapi(ref enc) => enc.codec_config(),
 
             #[cfg(mediax_av1_software_encode)]
             EncoderInner::Av1(ref enc) => Some(enc.codec_config()),

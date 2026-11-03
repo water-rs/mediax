@@ -20,6 +20,8 @@ COSE = "COSE"
 formatable = "formatable"
 NdefFormatable = "NdefFormatable"
 cros = "cros"
+# The H.264 Exp-Golomb syntax descriptor `ue(v)`, as the specification writes it.
+ue = "ue"
 # Apple's Unique Device Identifier, as `devicectl` and Xcode name it.
 UDID = "UDID"
 # Win32 accelerator flag on `ACCEL::fVirt`, alongside FSHIFT and FCONTROL.

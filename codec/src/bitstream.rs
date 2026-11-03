@@ -1,6 +1,8 @@
+#[cfg(any(test, target_os = "android", target_os = "windows"))]
+use crate::annexb::length_prefixed_to_annex_b;
 use crate::{
     CodecError,
-    annexb::{START_CODE, annex_b_nalus, length_prefixed_to_annex_b, read_length_field},
+    annexb::{START_CODE, annex_b_nalus, read_length_field},
 };
 use mediax_core::EncryptionSubsample;
 
@@ -326,7 +328,7 @@ pub fn annex_b_to_length_prefixed(data: &[u8], is_hevc: bool) -> (Option<Vec<u8>
 /// units — either the parameter sets an encoder prepends to its first IDR
 /// access unit or the raw `MF_MT_MPEG_SEQUENCE_HEADER` blob on Windows.
 /// Returns `None` when the bitstream carries no usable SPS/PPS pair.
-#[cfg(mediax_hw_codec_windows)]
+#[cfg(any(all(test, unix), mediax_hw_codec_windows, mediax_hw_codec_vaapi))]
 pub fn build_h264_avcc_from_annex_b(bitstream: &[u8]) -> Option<Vec<u8>> {
     let mut sps = None;
     let mut pps = None;

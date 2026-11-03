@@ -8,3 +8,7 @@ pub mod android;
 
 #[cfg(mediax_hw_codec_windows)]
 pub mod windows;
+
+// The driver-double tests need unix file descriptors and a dynamic loader.
+#[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
+pub mod vaapi;
