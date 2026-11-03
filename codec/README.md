@@ -26,7 +26,6 @@ mediax-codec = "0.1"
 | `gpu` | yes | `wgpu` texture upload and the YUV-to-linear-RGBA compute conversion (`GpuFrame`, `DecodedFrameUploader`, `LinearRgbaConverter`, `DecodedFrame::to_gpu_frame`), plus the `wgpu`, `wgpu-hal` and `shaderloom` dependencies. |
 | `software-decode` | via `software-encode` | AV1/AVIF decode in software on desktop (`rav1d`, `avif-parse`, `yuv`, `moxcms`). |
 | `software-encode` | yes | AV1 encode in software on desktop (`rav1e`); implies `software-decode`. |
-| `vaapi` | no | VA-API hardware decode/encode on Linux (`cros-codecs`, system libva >= 2.20). |
 | `aac` | no | Packet-oriented AAC decoding (`audio`): MediaCodec on Android, Media Foundation on Windows, a pure-Rust AAC-LC decoder elsewhere. HE-AAC is not supported. |
 
 A consumer that only wants decoded pixels can take
@@ -41,7 +40,7 @@ at all; decoded planes come out through `DecodedFrame::copy_to_buffer` and
 | **macOS/iOS** | VideoToolbox |
 | **Android** | MediaCodec (NDK/JNI) |
 | **Windows** | Media Foundation |
-| **Linux** | VA-API / rav1d |
+| **Linux** | rav1d / rav1e (no hardware path yet; the VA-API backend is being rewritten, #6) |
 
 ## Usage
 

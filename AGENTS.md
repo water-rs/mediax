@@ -13,11 +13,9 @@ cargo hack check -p mediax-codec --feature-powerset --no-dev-deps
 cargo machete
 ```
 
-`vaapi` is a no-op off Linux; on Linux it needs the system libva (2.20 or newer).
-
 ## Architecture
 
-**mediax** is hardware-accelerated, permissively licensed media processing for Rust: iOS, Android, macOS, Windows and Linux (plus wasm32 where a crate supports it).
+**mediax** is hardware-accelerated (Linux has no hardware path yet, #6), permissively licensed media processing for Rust: iOS, Android, macOS, Windows and Linux (plus wasm32 where a crate supports it).
 
 - Root crate `mediax`: facade re-exporting the member crates behind features.
 - `core` (`mediax-core`): engine-neutral timing, color, stream and error types.
@@ -27,7 +25,7 @@ cargo machete
 - `processing` (`mediax-processing`): typed frame-processing composition.
 - `bench` (`mediax-bench`): host-only encoder benchmark, not published.
 
-Platform access goes through `objc2`, `windows`, `jni`/`ndk` and `cros-codecs` directly.
+Platform access goes through `objc2`, `windows` and `jni`/`ndk` directly.
 
 ## Codec policy
 

@@ -16,7 +16,7 @@ permissions:
 jobs:
   verify-source:
     name: PR source gate
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       # Two sources may land on main: the integration branch, and the release

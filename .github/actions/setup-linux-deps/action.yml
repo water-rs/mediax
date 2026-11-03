@@ -1,8 +1,8 @@
 name: Setup Linux native dependencies
 description: >
-  Installs the native libraries a Linux build of this workspace needs: video
-  (VA-API, GBM, EGL, nasm) and libclang for the bindgen-based crates. Every
-  Linux job needs the same list, so it lives here once.
+  Installs the native libraries a Linux build of this workspace needs: EGL
+  development files, which `khronos-egl` (via `wgpu-hal`) locates through
+  pkg-config. Every Linux job needs the same list, so it lives here once.
 runs:
   using: composite
   steps:
@@ -11,8 +11,4 @@ runs:
       run: |
         sudo apt-get -c "$GITHUB_WORKSPACE/.github/apt.conf" update
         sudo apt-get -c "$GITHUB_WORKSPACE/.github/apt.conf" install -y \
-          libva-dev \
-          libgbm-dev \
-          libegl-dev \
-          nasm \
-          libclang-dev
+          libegl-dev

@@ -7,7 +7,7 @@ fn main() {
     compose_yuv_shader();
 
     // Codec backend predicates, defined once and emitted as cfg aliases.
-    // hw_* are the four hardware backends; *_av1_software the CPU fallback;
+    // hw_* are the three hardware backends; *_av1_software the CPU fallback;
     // *_hw_codec any hardware backend; *_any_codec any backend at all;
     // *_software_frames: decoded frames stored as CPU planes (every backend
     // except Apple's `IOSurface` path).
@@ -15,7 +15,6 @@ fn main() {
         mediax_hw_codec_apple: { target_vendor = "apple" },
         mediax_hw_codec_android: { target_os = "android" },
         mediax_hw_codec_windows: { target_os = "windows" },
-        mediax_hw_codec_vaapi: { all(target_os = "linux", feature = "vaapi") },
         mediax_av1_software: { all(
             feature = "software-decode",
             not(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))
@@ -27,14 +26,12 @@ fn main() {
         mediax_hw_codec: { any(
             target_vendor = "apple",
             target_os = "android",
-            target_os = "windows",
-            all(target_os = "linux", feature = "vaapi")
+            target_os = "windows"
         ) },
         mediax_any_codec: { any(
             target_vendor = "apple",
             target_os = "android",
             target_os = "windows",
-            all(target_os = "linux", feature = "vaapi"),
             all(
                 any(feature = "software-decode", feature = "software-encode"),
                 not(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))
@@ -43,7 +40,6 @@ fn main() {
         mediax_software_frames: { any(
             target_os = "android",
             target_os = "windows",
-            all(target_os = "linux", feature = "vaapi"),
             all(
                 any(feature = "software-decode", feature = "software-encode"),
                 not(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))
