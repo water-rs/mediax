@@ -1133,7 +1133,7 @@ mod tests {
                     profile_compatibility: 0,
                     level_indication: 30,
                     length_size_minus_one: 3,
-                    sps: vec![AvcSps(vec![0x67, 0x42, 0x00, 0x1e, 0xe9, 0x01, 0x40])],
+                    sps: vec![AvcSps(crate::parameters::tests::avc_sps(None))],
                     pps: vec![AvcPps(vec![0x68, 0xce, 0x06, 0xe2])],
                     chroma_format: None,
                     bit_depth_luma_minus8: None,

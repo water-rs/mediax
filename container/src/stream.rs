@@ -6,10 +6,11 @@ use std::{
     time::Duration,
 };
 
+use crate::parameters::{VideoParameters, canonical_configuration};
 use broadcast_common::{Parse, Serialize, Unpackage};
 use bytes::{Bytes, BytesMut};
 use mediax_core::Error;
-use mediax_core::VideoColorInfo;
+use mediax_core::{FrameRate, VideoColorInfo};
 use transmux::{
     CodecConfig as TransmuxCodecConfig, DemuxEvent as TransmuxDemuxEvent, Fmp4Demux,
     MovieFragmentBox, ProtectionSchemeInfoBox, ProtectionSystemSpecificHeaderBox,
@@ -215,6 +216,7 @@ pub struct TrackInfo {
     decoder_configuration: Bytes,
     video_dimensions: Option<VideoDimensions>,
     video_color_info: Option<VideoColorInfo>,
+    video_parameters: Option<VideoParameters>,
     audio_layout: Option<AudioLayout>,
     source_pid: Option<u16>,
     protection: Option<TrackProtection>,
@@ -224,17 +226,25 @@ impl TrackInfo {
     /// Describes a video track.
     ///
     /// `decoder_configuration` is the codec's configuration record (`avcC`,
-    /// `hvcC` or `av1C`), with or without its ISO BMFF box header.
-    #[must_use]
-    pub const fn video(
+    /// `hvcC` or `av1C`), with or without its ISO BMFF box header; the track
+    /// keeps it as the box. For those codecs the record is parsed into
+    /// [`video_parameters`](Self::video_parameters).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration record of an H.264, H.265 or
+    /// AV1 track is malformed.
+    pub fn video(
         id: TrackId,
         codec: Codec,
         timescale: NonZeroU32,
         decoder_configuration: Bytes,
         dimensions: VideoDimensions,
         color: VideoColorInfo,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Error> {
+        let decoder_configuration = canonical_configuration(codec, decoder_configuration)?;
+        let video_parameters = VideoParameters::parse(codec, &decoder_configuration)?;
+        Ok(Self {
             id,
             kind: TrackKind::Video,
             timescale,
@@ -242,10 +252,11 @@ impl TrackInfo {
             decoder_configuration,
             video_dimensions: Some(dimensions),
             video_color_info: Some(color),
+            video_parameters,
             audio_layout: None,
             source_pid: None,
             protection: None,
-        }
+        })
     }
 
     /// Describes an audio track.
@@ -267,6 +278,7 @@ impl TrackInfo {
             decoder_configuration,
             video_dimensions: None,
             video_color_info: None,
+            video_parameters: None,
             audio_layout: Some(layout),
             source_pid: None,
             protection: None,
@@ -281,6 +293,19 @@ impl TrackInfo {
     #[must_use]
     pub const fn with_video_color_info(mut self, color: VideoColorInfo) -> Self {
         self.video_color_info = Some(color);
+        self
+    }
+
+    /// Sets the nominal frame rate of a video track whose parameters mediax
+    /// parses, replacing the one its configuration record declares.
+    ///
+    /// Readers use it for the rate the container's sample timing declares,
+    /// which takes precedence over the codec's own.
+    #[must_use]
+    pub const fn with_frame_rate(mut self, frame_rate: FrameRate) -> Self {
+        if let Some(parameters) = &mut self.video_parameters {
+            parameters.frame_rate = Some(frame_rate);
+        }
         self
     }
 
@@ -321,8 +346,9 @@ impl TrackInfo {
 
     /// Returns decoder initialization bytes in the codec's canonical form.
     ///
-    /// Video codecs retain their ISOBMFF configuration box. AAC returns the
-    /// raw `AudioSpecificConfig` carried by `esds`.
+    /// H.264, H.265 and AV1 return their `avcC`, `hvcC` or `av1C` box,
+    /// header included. AAC returns the raw `AudioSpecificConfig` carried by
+    /// `esds`.
     #[must_use]
     pub fn decoder_configuration(&self) -> &[u8] {
         &self.decoder_configuration
@@ -332,6 +358,13 @@ impl TrackInfo {
     #[must_use]
     pub const fn video_dimensions(&self) -> Option<VideoDimensions> {
         self.video_dimensions
+    }
+
+    /// Returns the parsed profile, level, bit depth, chroma format and
+    /// nominal frame rate of an H.264, H.265 or AV1 track.
+    #[must_use]
+    pub const fn video_parameters(&self) -> Option<VideoParameters> {
+        self.video_parameters
     }
 
     /// Returns color and HDR signaling for a video track when the container declares it.
@@ -1068,6 +1101,7 @@ fn subtitle_track_info(track: &TrackBox) -> Result<Option<TrackInfo>, Error> {
         decoder_configuration: decoder_configuration.into(),
         video_dimensions: None,
         video_color_info: None,
+        video_parameters: None,
         audio_layout: None,
         source_pid: None,
         protection: None,
@@ -2130,12 +2164,14 @@ pub fn track_info_from_spec(spec: &TrackSpec) -> Result<TrackInfo, Error> {
         .ok_or_else(|| Error::Container(format!("track {} declares a zero timescale", id.get())))?;
     let (kind, codec, decoder_configuration, video_dimensions, audio_layout) =
         normalize_codec(&spec.config)?;
+    let video_parameters = VideoParameters::parse(codec, &decoder_configuration)?;
     Ok(TrackInfo {
         id,
         kind,
         timescale,
         codec,
         decoder_configuration,
+        video_parameters,
         video_dimensions,
         video_color_info: video_dimensions
             .map(|dimensions| super::color::inferred_sdr_color_info(Some(dimensions.height.get()))),
@@ -2159,7 +2195,7 @@ fn normalize_codec(config: &TransmuxCodecConfig) -> Result<NormalizedCodec, Erro
         Ok((
             TrackKind::Video,
             codec,
-            Bytes::from(bytes),
+            canonical_configuration(codec, Bytes::from(bytes))?,
             Some(VideoDimensions {
                 width: non_zero_dimension(width, "width")?,
                 height: non_zero_dimension(height, "height")?,
@@ -2465,6 +2501,7 @@ mod tests {
             decoder_configuration: Bytes::new(),
             video_dimensions: None,
             video_color_info: None,
+            video_parameters: None,
             audio_layout: None,
             source_pid: None,
             protection: None,
@@ -2490,7 +2527,7 @@ mod tests {
             profile_compatibility: 0,
             level_indication: 30,
             length_size_minus_one: 3,
-            sps: vec![AvcSps(vec![0x67, 0x42, 0x00, 0x1e, 0xe9, 0x01, 0x40])],
+            sps: vec![AvcSps(crate::parameters::tests::avc_sps(None))],
             pps: vec![AvcPps(vec![0x68, 0xce, 0x06, 0xe2])],
             chroma_format: None,
             bit_depth_luma_minus8: None,

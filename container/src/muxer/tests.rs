@@ -16,12 +16,12 @@ use super::*;
 use crate::stream::{AudioLayout, MediaTime, VideoDimensions};
 use crate::{ProgressiveTrackReader, probe_mp4_color_info};
 
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 240;
-const FRAMES: usize = 12;
+pub const WIDTH: u32 = 320;
+pub const HEIGHT: u32 = 240;
+pub const FRAMES: usize = 12;
 
 /// Video timescale and per-frame duration: 30 frames per second.
-const VIDEO_TIMESCALE: u32 = 30_000;
+pub const VIDEO_TIMESCALE: u32 = 30_000;
 const FRAME_TICKS: i64 = 1_000;
 
 const AAC_SAMPLE_RATE: u32 = 44_100;
@@ -32,11 +32,11 @@ const AAC_CONFIG: [u8; 2] = [0x12, 0x10];
 /// access unit per line.
 const AAC_STREAM: &str = include_str!("../../../codec/src/fixtures/aac-lc-44k-stereo-stream.hex");
 
-fn nz(value: u32) -> NonZeroU32 {
+pub fn nz(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).expect("test value is non-zero")
 }
 
-fn track_id(value: u32) -> TrackId {
+pub fn track_id(value: u32) -> TrackId {
     TrackId::new(value).expect("test track id is non-zero")
 }
 
@@ -61,7 +61,7 @@ fn color(
     }
 }
 
-fn bt709() -> VideoColorInfo {
+pub fn bt709() -> VideoColorInfo {
     color(
         ColorPrimaries::Bt709,
         TransferFunction::Sdr,
@@ -73,12 +73,12 @@ fn bt709() -> VideoColorInfo {
 
 /// Where a test writes its file. With `MEDIAX_MUXER_SAMPLES` set, files land
 /// in the build directory and stay there for playback checks.
-struct Output {
-    path: PathBuf,
+pub struct Output {
+    pub path: PathBuf,
     _directory: Option<tempfile::TempDir>,
 }
 
-fn output(name: &str) -> Output {
+pub fn output(name: &str) -> Output {
     if std::env::var_os("MEDIAX_MUXER_SAMPLES").is_some() {
         let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/muxer-samples");
         std::fs::create_dir_all(&directory).expect("create sample directory");
@@ -96,11 +96,11 @@ fn output(name: &str) -> Output {
 }
 
 /// Encoded video, as the encoder produced it.
-struct EncodedVideo {
-    codec: Codec,
+pub struct EncodedVideo {
+    pub codec: Codec,
     /// The configuration record without a box header, as encoders emit it.
-    record: Vec<u8>,
-    packets: Vec<EncodedPacket>,
+    pub record: Vec<u8>,
+    pub packets: Vec<EncodedPacket>,
 }
 
 fn nv12_frame(index: usize) -> Vec<u8> {
@@ -158,7 +158,7 @@ fn encode(codec: EncoderCodec) -> Option<EncodedVideo> {
     })
 }
 
-fn h264() -> Option<EncodedVideo> {
+pub fn h264() -> Option<EncodedVideo> {
     encode(EncoderCodec::H264(H264Settings {
         profile: H264Profile::High,
         level: H264Level::L4_0,
@@ -166,13 +166,13 @@ fn h264() -> Option<EncodedVideo> {
     }))
 }
 
-fn h265() -> Option<EncodedVideo> {
+pub fn h265() -> Option<EncodedVideo> {
     encode(EncoderCodec::H265(H265Settings {
         bitstream: BitstreamFormat::LengthPrefixed,
     }))
 }
 
-fn av1() -> EncodedVideo {
+pub fn av1() -> EncodedVideo {
     encode(EncoderCodec::Av1).expect("software AV1 encoder is always available")
 }
 
@@ -188,7 +188,7 @@ fn config_box(fourcc: [u8; 4], record: &[u8]) -> Bytes {
 }
 
 impl EncodedVideo {
-    fn fourcc(&self) -> [u8; 4] {
+    pub fn fourcc(&self) -> [u8; 4] {
         match self.codec {
             Codec::H264 => *b"avcC",
             Codec::H265 => *b"hvcC",
@@ -196,16 +196,12 @@ impl EncodedVideo {
         }
     }
 
-    /// The configuration a demuxer reports for `record`: the whole box for
-    /// H.264 and H.265, the bare record for AV1.
+    /// The configuration a demuxer reports for `record`: the whole box.
     fn expected_configuration(&self) -> Bytes {
-        match self.codec {
-            Codec::Av1 => Bytes::from(self.record.clone()),
-            _ => config_box(self.fourcc(), &self.record),
-        }
+        config_box(self.fourcc(), &self.record)
     }
 
-    fn track(&self, id: u32, color: VideoColorInfo) -> TrackInfo {
+    pub fn track(&self, id: u32, color: VideoColorInfo) -> TrackInfo {
         TrackInfo::video(
             track_id(id),
             self.codec,
@@ -217,12 +213,13 @@ impl EncodedVideo {
             },
             color,
         )
+        .expect("the encoder's configuration record parses")
     }
 
     /// Decode order samples. `reorder` gives each sample's display slot within
     /// its group of four (a decode-order `I P B B` pattern), `lead` the frames
     /// presentation trails decode by.
-    fn samples(&self, id: u32, reorder: Option<[i64; 4]>, lead: i64) -> Vec<EncodedSample> {
+    pub fn samples(&self, id: u32, reorder: Option<[i64; 4]>, lead: i64) -> Vec<EncodedSample> {
         self.packets
             .iter()
             .enumerate()
@@ -254,7 +251,7 @@ fn aac_packets() -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn aac_track(id: u32) -> TrackInfo {
+pub fn aac_track(id: u32) -> TrackInfo {
     TrackInfo::audio(
         track_id(id),
         Codec::Aac,
@@ -269,7 +266,7 @@ fn aac_track(id: u32) -> TrackInfo {
 }
 
 /// AAC access units starting `start` ticks into the timeline.
-fn aac_samples(id: u32, start: i64) -> Vec<EncodedSample> {
+pub fn aac_samples(id: u32, start: i64) -> Vec<EncodedSample> {
     aac_packets()
         .into_iter()
         .enumerate()
@@ -288,7 +285,7 @@ fn aac_samples(id: u32, start: i64) -> Vec<EncodedSample> {
 }
 
 /// Writes `tracks` with their samples interleaved by decode time.
-fn write(path: &Path, format: ContainerFormat, tracks: Vec<(TrackInfo, Vec<EncodedSample>)>) {
+pub fn write(path: &Path, format: ContainerFormat, tracks: Vec<(TrackInfo, Vec<EncodedSample>)>) {
     let mut muxer = Muxer::create(path, format).expect("create muxer");
     let mut samples = Vec::new();
     for (info, track_samples) in tracks {
