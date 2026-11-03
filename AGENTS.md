@@ -23,6 +23,7 @@ cargo machete
 - `container` (`mediax-container`): demuxing and muxing.
 - `streaming` (`mediax-streaming`): HLS/DASH delivery and cache primitives over Zenwave.
 - `processing` (`mediax-processing`): typed frame-processing composition.
+- `cli` (`mediax-cli`): the `mediax` binary (`probe`, `transcode`, `remux`) over `mediax-container` and `mediax-codec`, shipped as prebuilt binaries by cargo-dist (`dist.yml`, triggered by the `cli/v<version>` tag).
 - `bench` (`mediax-bench`): host-only encoder benchmark, not published.
 
 Platform access goes through `objc2`, `windows` and `jni`/`ndk` directly.
