@@ -5,10 +5,11 @@ mod support;
 use std::path::Path;
 
 use mediax_codec::{CodecType, Decoder};
+use mediax_container::EncodedSample;
 use serde_json::Value;
 use support::{
-    AUDIO_ID, Container, FRAMES, HEIGHT, VIDEO_ID, Video, WIDTH, assert_same_samples, encode,
-    fixture_path, mediax, path_arg, read_samples, same_time, scratch, write_fixture,
+    AUDIO_ID, Container, HEIGHT, VIDEO_ID, Video, WIDTH, assert_same_samples, encode, fixture_path,
+    mediax, path_arg, read_samples, same_time, scratch, write_fixture,
 };
 
 fn probe(path: &Path) -> Value {
@@ -23,7 +24,9 @@ fn probe(path: &Path) -> Value {
 
 /// Runs `mediax transcode` and returns its output.
 fn transcode(input: &Path, output: &Path, codec: Video, extra: &[&str]) -> std::process::Output {
+    // `-v` makes the encoder log debug lines, including each packet's times.
     let mut args: Vec<&std::ffi::OsStr> = vec![
+        "-v".as_ref(),
         "transcode".as_ref(),
         path_arg(input),
         path_arg(output),
@@ -31,18 +34,52 @@ fn transcode(input: &Path, output: &Path, codec: Video, extra: &[&str]) -> std::
         codec.name().as_ref(),
     ];
     args.extend(extra.iter().map(std::ffi::OsStr::new));
-    mediax(&args)
+    let result = mediax(&args);
+    // The harness shows this when the test fails.
+    eprintln!(
+        "mediax transcode log:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    result
 }
 
-/// Asserts the transcoded `output` against the source's samples.
-fn assert_transcoded(source: &Path, output: &Path, codec: Video, label: &str) {
+/// Every source frame's presentation time and every output sample's
+/// presentation and decode time, in ticks, for a failure message.
+fn timeline(video_in: &[EncodedSample], video_out: &[EncodedSample]) -> String {
+    let ticks =
+        |time: mediax_container::MediaTime| format!("{}/{}", time.ticks(), time.timescale());
+    let source: Vec<_> = video_in
+        .iter()
+        .map(|sample| ticks(sample.presentation_time()))
+        .collect();
+    let output: Vec<_> = video_out
+        .iter()
+        .map(|sample| {
+            format!(
+                "pts {} dts {}",
+                ticks(sample.presentation_time()),
+                ticks(sample.decode_time())
+            )
+        })
+        .collect();
+    format!(
+        "source frames: {}\noutput samples in decode order:\n{}",
+        source.join(", "),
+        output.join("\n")
+    )
+}
+
+/// Asserts the transcoded `output` against the source's samples: the output
+/// samples present at exactly the times of the source frames the encoder kept.
+/// Unless `may_drop`, the encoder kept every frame, so the times match the
+/// source's one for one.
+fn assert_transcoded(source: &Path, output: &Path, codec: Video, may_drop: bool, label: &str) {
     let report = probe(output);
     let video = &report["tracks"][0];
     assert_eq!(video["id"], VIDEO_ID, "{label}");
     assert_eq!(video["codec"], format!("{:?}", codec.codec()), "{label}");
     assert_eq!(video["video"]["width"], WIDTH, "{label}");
     assert_eq!(video["video"]["height"], HEIGHT, "{label}");
-    assert_eq!(video["sample_count"], FRAMES, "{label}");
 
     let source_samples = read_samples(source);
     let output_samples = read_samples(output);
@@ -52,22 +89,57 @@ fn assert_transcoded(source: &Path, output: &Path, codec: Video, label: &str) {
         &source_samples[&AUDIO_ID],
         &format!("{label}: audio"),
     );
-    // The video keeps every frame's presentation time and its keyframe start.
+    // Every video sample presents at the time of a source frame the encoder
+    // kept, each frame at most once; a frame the encoder dropped leaves no
+    // sample. The AV1 encoder never drops.
     let (video_out, video_in) = (&output_samples[&VIDEO_ID], &source_samples[&VIDEO_ID]);
-    assert_eq!(video_out.len(), video_in.len(), "{label}: frame count");
-    for (index, (out, source)) in video_out.iter().zip(video_in).enumerate() {
-        assert!(
-            same_time(out.presentation_time(), source.presentation_time()),
-            "{label}: frame {index} presentation time {:?} != {:?}",
-            out.presentation_time(),
-            source.presentation_time()
-        );
-        assert!(
-            same_time(out.decode_time(), out.presentation_time()),
-            "{label}: frame {index} decodes when it presents"
+    assert_eq!(video["sample_count"], video_out.len(), "{label}");
+    if !may_drop {
+        assert_eq!(
+            video_out.len(),
+            video_in.len(),
+            "{label}: frame count\n{}",
+            timeline(video_in, video_out)
         );
     }
+    assert!(!video_out.is_empty() && video_out.len() <= video_in.len());
+    let mut kept = vec![false; video_in.len()];
+    for (index, out) in video_out.iter().enumerate() {
+        let source = video_in
+            .iter()
+            .position(|source| same_time(out.presentation_time(), source.presentation_time()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: sample {index} presents at {:?}, which is no source frame\n{}",
+                    out.presentation_time(),
+                    timeline(video_in, video_out)
+                )
+            });
+        assert!(
+            !std::mem::replace(&mut kept[source], true),
+            "{label}: source frame {source} is presented twice\n{}",
+            timeline(video_in, video_out)
+        );
+        // Decode time advances from sample to sample.
+        if let Some(previous) = index.checked_sub(1).map(|previous| &video_out[previous]) {
+            assert!(
+                previous.decode_time().ticks() < out.decode_time().ticks(),
+                "{label}: decode time does not advance at sample {index}\n{}",
+                timeline(video_in, video_out)
+            );
+        }
+    }
     assert!(video_out[0].is_keyframe(), "{label}: opens on a keyframe");
+    let reordered = video_out
+        .iter()
+        .any(|sample| sample.decode_time().ticks() != sample.presentation_time().ticks());
+    tracing::info!(
+        label,
+        kept = video_out.len(),
+        dropped = video_in.len() - video_out.len(),
+        reordered,
+        "video timing checked"
+    );
 }
 
 /// Transcodes an AV1 MP4 into `target`, or logs why the host cannot.
@@ -82,16 +154,14 @@ fn check_from_av1(target: Video, extension: &str) {
     let source = fixture_path(dir.path(), "source", Container::Mp4);
     write_fixture(&source_video, Container::Mp4, &source);
     let output = dir.path().join(format!("out.{extension}"));
-    // A hardware encoder may drop frames at the default bitrate on this test
-    // pattern, which is white noise; the flag keeps the output frame for frame.
-    let result = transcode(&source, &output, target, &["--bitrate", "3M"]);
+    let result = transcode(&source, &output, target, &[]);
     let label = format!("av1 to {} in .{extension}", target.name());
     assert!(
         result.status.success(),
         "{label}: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert_transcoded(&source, &output, target, &label);
+    assert_transcoded(&source, &output, target, false, &label);
 }
 
 #[test]
@@ -133,7 +203,7 @@ fn check_into_av1(source_codec: Video, decoder: CodecType) {
         "{label}: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert_transcoded(&source, &output, Video::Av1, &label);
+    assert_transcoded(&source, &output, Video::Av1, false, &label);
 }
 
 #[test]
@@ -144,6 +214,33 @@ fn h264_to_av1() {
 #[test]
 fn h265_to_av1() {
     check_into_av1(Video::H265, CodecType::H265);
+}
+
+/// A bitrate far below what the pattern needs makes a hardware encoder drop
+/// frames, and the offline profile lets it reorder them; either way the
+/// samples keep the times of the frames that were kept.
+#[test]
+fn a_starved_bitrate_keeps_the_times_of_the_frames_the_encoder_kept() {
+    let Some(source_video) = encode(Video::Av1) else {
+        return;
+    };
+    let dir = scratch();
+    let source = fixture_path(dir.path(), "source", Container::Mp4);
+    write_fixture(&source_video, Container::Mp4, &source);
+    for target in [Video::H264, Video::H265] {
+        if !target.available() {
+            continue;
+        }
+        let output = dir.path().join(format!("starved-{}.mp4", target.name()));
+        let result = transcode(&source, &output, target, &["--bitrate", "20k"]);
+        let label = format!("av1 to {} at 20 kbps", target.name());
+        assert!(
+            result.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_transcoded(&source, &output, target, true, &label);
+    }
 }
 
 #[test]

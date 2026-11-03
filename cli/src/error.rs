@@ -97,19 +97,6 @@ pub enum CliError {
     #[error("the video track decoded to no frames")]
     NoFrames,
 
-    /// The encoder returned packets that do not pair up with the frames fed to it.
-    #[error("the encoder returned more packets than frames")]
-    UnpairedPacket,
-
-    /// The encoder returned fewer packets than frames.
-    #[error("the encoder returned {packets} packets for {frames} frames")]
-    MissingPackets {
-        /// Packets returned.
-        packets: u64,
-        /// Frames fed.
-        frames: u64,
-    },
-
     /// The encoder reported no codec configuration after its first packet.
     #[error("the encoder reported no codec configuration")]
     NoCodecConfiguration,

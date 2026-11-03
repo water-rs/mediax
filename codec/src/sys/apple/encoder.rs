@@ -44,6 +44,7 @@ use std::fmt;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::Duration;
 
 /// What the `VideoToolbox` output callback hands back to the encoder.
 enum Output {
@@ -60,6 +61,9 @@ struct CallbackContext {
     output: Sender<Output>,
     bitstream: BitstreamFormat,
     is_hevc: bool,
+    /// Whether the session may reorder frames, so a sample's decode time can
+    /// differ from its presentation time.
+    reorders: bool,
     /// The H.264 `level_idc` the SPS must not exceed.
     max_level_idc: Option<u8>,
     /// Whether the codec configuration has been sent already.
@@ -75,7 +79,9 @@ pub struct AppleEncoder {
     width: u32,
     height: u32,
     frame_rate: FrameRate,
-    frame_index: i64,
+    /// Whether each frame is completed as it is submitted (the realtime
+    /// profile) rather than left to the encoder's reordering window.
+    complete_each_frame: bool,
     color: VideoColorInfo,
     codec_config: Option<Vec<u8>>,
 }
@@ -85,7 +91,6 @@ impl fmt::Debug for AppleEncoder {
         f.debug_struct("AppleEncoder")
             .field("width", &self.width)
             .field("height", &self.height)
-            .field("frame_index", &self.frame_index)
             .finish_non_exhaustive()
     }
 }
@@ -159,6 +164,26 @@ fn h264_profile_level(profile: H264Profile, level: H264Level) -> &'static CFStri
     }
 }
 
+/// Nanoseconds are the timescale of every time handed to the session, so a
+/// presentation time comes back exactly.
+const NANOSECOND_TIMESCALE: i32 = 1_000_000_000;
+
+fn nanos_to_cm_time(time: Duration) -> Result<CMTime, CodecError> {
+    i64::try_from(time.as_nanos())
+        .map(|nanos| cm_time(nanos, NANOSECOND_TIMESCALE))
+        .map_err(|_| CodecError::EncodingFailed("presentation time exceeds i64 nanoseconds".into()))
+}
+
+/// A valid `CMTime` in nanoseconds, or `None` for an invalid, infinite or
+/// indefinite one.
+fn cm_time_to_nanos(time: CMTime) -> Option<i64> {
+    if !time.flags.contains(CMTimeFlags::Valid) || time.timescale <= 0 {
+        return None;
+    }
+    let nanos = i128::from(time.value) * 1_000_000_000 / i128::from(time.timescale);
+    i64::try_from(nanos).ok()
+}
+
 const fn cm_time(value: i64, timescale: i32) -> CMTime {
     CMTime {
         value,
@@ -199,6 +224,7 @@ impl AppleEncoder {
             output: sender,
             bitstream,
             is_hevc,
+            reorders: !realtime,
             max_level_idc: match config.codec {
                 EncoderCodec::H264(settings) => Some(settings.level.idc()),
                 _ => None,
@@ -259,7 +285,7 @@ impl AppleEncoder {
             width: config.width.get(),
             height: config.height.get(),
             frame_rate: config.frame_rate,
-            frame_index: 0,
+            complete_each_frame: realtime,
             color: config.color,
             codec_config: None,
         })
@@ -294,6 +320,7 @@ impl AppleEncoder {
     pub fn encode_nv12(
         &mut self,
         nv12: &[u8],
+        presentation_time: Duration,
         options: FrameOptions,
     ) -> Result<Vec<EncodedPacket>, CodecError> {
         let width = self.width as usize;
@@ -360,7 +387,7 @@ impl AppleEncoder {
             CVPixelBufferUnlockBaseAddress(&pixel_buffer, flags);
         }
 
-        self.submit(&pixel_buffer, options)
+        self.submit(&pixel_buffer, presentation_time, options)
     }
 
     /// Encode a BGRA or NV12 pixel buffer.
@@ -373,6 +400,7 @@ impl AppleEncoder {
     pub fn encode_pixel_buffer(
         &mut self,
         buffer: &CVPixelBuffer,
+        presentation_time: Duration,
         options: FrameOptions,
     ) -> Result<Vec<EncodedPacket>, CodecError> {
         let (format, width, height) = (
@@ -397,21 +425,21 @@ impl AppleEncoder {
                 self.width, self.height
             )));
         }
-        self.submit(buffer, options)
+        self.submit(buffer, presentation_time, options)
     }
 
     /// Submit one pixel buffer and collect what the session finishes for it.
     fn submit(
         &mut self,
         buffer: &CVPixelBuffer,
+        presentation_time: Duration,
         options: FrameOptions,
     ) -> Result<Vec<EncodedPacket>, CodecError> {
         let numerator = i32::try_from(self.frame_rate.numerator().get())
             .expect("the numerator was checked against i32::MAX at construction");
         let denominator = i64::from(self.frame_rate.denominator().get());
-        let presentation_time = cm_time(self.frame_index * denominator, numerator);
         let duration = cm_time(denominator, numerator);
-        self.frame_index += 1;
+        let presentation_time = nanos_to_cm_time(presentation_time)?;
 
         let frame_properties = options.keyframe.then(|| {
             // SAFETY: a constant key exported by `VideoToolbox`.
@@ -437,16 +465,40 @@ impl AppleEncoder {
                 "VTCompressionSessionEncodeFrame failed: OSStatus {status}"
             )));
         }
-        // A non-numeric time completes every pending frame, so the packet for
-        // this frame is out before the call returns.
-        // SAFETY: the session is live.
-        let status = unsafe { self.session.complete_frames(cm_time(0, 0)) };
-        if status != 0 {
-            return Err(CodecError::EncodingFailed(format!(
-                "VTCompressionSessionCompleteFrames failed: OSStatus {status}"
-            )));
+        if self.complete_each_frame {
+            self.complete_frames()?;
         }
+        self.collect()
+    }
 
+    /// Emit the frames the session still holds, which the offline profile's
+    /// reordering window keeps back, and return their packets.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CodecError::EncodingFailed` if `VideoToolbox` fails.
+    pub fn flush(&mut self) -> Result<Vec<EncodedPacket>, CodecError> {
+        self.complete_frames()?;
+        self.collect()
+    }
+
+    /// Have the session finish every frame it holds, so their packets are out
+    /// before the call returns.
+    fn complete_frames(&self) -> Result<(), CodecError> {
+        // SAFETY: the session is live; a non-numeric time completes every
+        // pending frame.
+        let status = unsafe { self.session.complete_frames(cm_time(0, 0)) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(CodecError::EncodingFailed(format!(
+                "VTCompressionSessionCompleteFrames failed: OSStatus {status}"
+            )))
+        }
+    }
+
+    /// The packets the output callback has queued so far.
+    fn collect(&mut self) -> Result<Vec<EncodedPacket>, CodecError> {
         let mut packets = Vec::new();
         while let Ok(output) = self.output.try_recv() {
             match output {
@@ -626,7 +678,27 @@ unsafe fn frame_sample(
             data
         }
     };
-    results.push(Output::Packet(EncodedPacket { data, keyframe }));
+    // SAFETY: caller contract; read-only accessors.
+    let (presentation, decode) =
+        unsafe { (sample.presentation_time_stamp(), sample.decode_time_stamp()) };
+    let presentation_nanos =
+        cm_time_to_nanos(presentation).ok_or_else(|| failed("no valid presentation time"))?;
+    let presentation_time = u64::try_from(presentation_nanos)
+        .map(Duration::from_nanos)
+        .map_err(|_| failed("negative presentation time"))?;
+    // A session that cannot reorder (realtime) may leave the decode time
+    // unset; it then equals the presentation time.
+    let decode_time_nanos = match cm_time_to_nanos(decode) {
+        Some(nanos) => nanos,
+        None if !context.reorders => presentation_nanos,
+        None => return Err(failed("a reordering session reported no decode time")),
+    };
+    results.push(Output::Packet(EncodedPacket {
+        data,
+        keyframe,
+        presentation_time,
+        decode_time_nanos,
+    }));
     Ok(results)
 }
 

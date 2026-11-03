@@ -6,11 +6,12 @@ use crate::{
     annexb::AnnexBPackets,
     bitstream::{NalStreamConverter, build_h264_avcc_from_annex_b, build_h265_hvcc_from_annex_b},
     config::decoded_pixel_layout,
+    encoder_config::signed_nanos,
 };
 use mediax_core::{
     ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr;
@@ -20,12 +21,13 @@ use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncCommonRealTime, CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMF2DBuffer,
-    IMFMediaType, IMFSample, IMFTransform, MF_E_NO_MORE_TYPES, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-    MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE,
-    MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES,
-    MF_MT_YUV_MATRIX, MF_VERSION, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
-    MFNominalRange, MFNominalRange_0_255, MFNominalRange_16_235, MFSTARTUP_NOSOCKET, MFShutdown,
+    IMFMediaType, IMFSample, IMFTransform, MF_E_ATTRIBUTENOTFOUND, MF_E_NO_MORE_TYPES,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER,
+    MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
+    MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_VERSION,
+    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFNominalRange, MFNominalRange_0_255,
+    MFNominalRange_16_235, MFSTARTUP_NOSOCKET, MFSampleExtension_DecodeTimestamp, MFShutdown,
     MFStartup, MFT_CATEGORY_VIDEO_DECODER, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
     MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_DRAIN,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
@@ -416,7 +418,16 @@ pub struct WindowsEncoder {
     width: u32,
     height: u32,
     frame_rate: FrameRate,
-    frame_count: i64,
+    /// The presentation time of the last packet that came without a
+    /// `MFSampleExtension_DecodeTimestamp`; the next must follow it.
+    last_undated_presentation: Option<Duration>,
+    /// Presentation times submitted whose frames have not come out yet.
+    pending: BTreeSet<Duration>,
+    /// The presentation time of the first submitted frame.
+    first_submitted: Option<Duration>,
+    /// How far the transform's output clock runs ahead of the input times, in
+    /// nanoseconds, known from the first output sample.
+    clock_lead: Option<i64>,
     output_stream_info: MFT_OUTPUT_STREAM_INFO,
     codec_config: Option<Vec<u8>>,
     packets: AnnexBPackets,
@@ -429,9 +440,20 @@ impl fmt::Debug for WindowsEncoder {
             .field("codec_type", &self.codec_type)
             .field("width", &self.width)
             .field("height", &self.height)
-            .field("frame_count", &self.frame_count)
             .finish_non_exhaustive()
     }
+}
+
+/// One encoded output sample with the times Media Foundation stamped on it.
+struct OutputSample {
+    data: Vec<u8>,
+    /// `IMFSample::GetSampleTime`. The transform stamps it from its own frame
+    /// clock, so it is not an input frame's time; see
+    /// [`WindowsEncoder::resolve_frame`].
+    sample_time: Duration,
+    /// `MFSampleExtension_DecodeTimestamp` in nanoseconds, when the transform
+    /// sets it (it does for streams with B-frames).
+    decode_time_nanos: Option<i64>,
 }
 
 /// `eAVEncH264VProfile_ConstrainedBase`.
@@ -634,7 +656,10 @@ impl WindowsEncoder {
                 width,
                 height,
                 frame_rate: config.frame_rate,
-                frame_count: 0,
+                last_undated_presentation: None,
+                pending: BTreeSet::new(),
+                first_submitted: None,
+                clock_lead: None,
                 output_stream_info,
                 codec_config,
                 packets: AnnexBPackets::new(
@@ -661,6 +686,7 @@ impl WindowsEncoder {
     pub fn encode_nv12(
         &mut self,
         nv12: &[u8],
+        presentation_time: Duration,
         options: FrameOptions,
     ) -> Result<Vec<EncodedPacket>, CodecError> {
         let y_size = self.width as usize * self.height as usize;
@@ -692,15 +718,32 @@ impl WindowsEncoder {
             let frame_duration_hns = HNS_PER_SECOND
                 * i64::from(self.frame_rate.denominator().get())
                 / i64::from(self.frame_rate.numerator().get());
-            let time_100ns = self.frame_count * frame_duration_hns;
-            self.frame_count += 1;
-            input_sample.SetSampleTime(time_100ns).ok();
+            // The transform copies the sample time onto the output sample of
+            // the frame it encodes.
+            let time_100ns = i64::try_from(presentation_time.as_nanos() / 100).map_err(|_| {
+                CodecError::EncodingFailed("presentation time exceeds i64 100 ns units".into())
+            })?;
+            tracing::debug!(
+                time_100ns,
+                duration_100ns = frame_duration_hns,
+                keyframe = options.keyframe,
+                "Media Foundation encoder input sample"
+            );
+            input_sample
+                .SetSampleTime(time_100ns)
+                .map_err(|e| CodecError::EncodingFailed(format!("SetSampleTime: {e}")))?;
             input_sample.SetSampleDuration(frame_duration_hns).ok();
 
             self.transform
                 .ProcessInput(0, &input_sample, 0)
                 .map_err(|e| CodecError::EncodingFailed(format!("ProcessInput: {e}")))?;
         }
+        if !self.pending.insert(presentation_time) {
+            return Err(CodecError::EncodingFailed(format!(
+                "presentation time {presentation_time:?} was submitted twice"
+            )));
+        }
+        self.first_submitted.get_or_insert(presentation_time);
 
         let raw = self.pump_output_samples()?;
         self.frame_packets(raw)
@@ -713,6 +756,7 @@ impl WindowsEncoder {
     /// tail of a recording only ever arrives here; each entry is one access
     /// unit and becomes one container sample.
     pub fn drain(&mut self) -> Result<Vec<EncodedPacket>, CodecError> {
+        tracing::debug!("Media Foundation encoder end of stream and drain");
         unsafe {
             self.transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)
@@ -728,7 +772,12 @@ impl WindowsEncoder {
 
     /// Frames raw Annex B samples as the configured bitstream, first taking
     /// the parameter sets the transform has published since the last call.
-    fn frame_packets(&mut self, raw: Vec<Vec<u8>>) -> Result<Vec<EncodedPacket>, CodecError> {
+    ///
+    /// The decode time is the sample's `MFSampleExtension_DecodeTimestamp`. A
+    /// sample without one is decoded at
+    /// its presentation time, which only holds while the transform does not
+    /// reorder, so presentation times must then keep increasing.
+    fn frame_packets(&mut self, raw: Vec<OutputSample>) -> Result<Vec<EncodedPacket>, CodecError> {
         if self.codec_config.is_none()
             && let Some(header) = sequence_header_from_media_type(&self.transform)
         {
@@ -736,14 +785,80 @@ impl WindowsEncoder {
             self.packets.set_parameter_sets(header);
         }
         raw.into_iter()
-            .map(|sample| self.packets.packet(sample))
+            .map(|sample| {
+                let (presentation_time, lead) = self.resolve_frame(sample.sample_time)?;
+                let decode_time_nanos = if let Some(decode_time) = sample.decode_time_nanos {
+                    decode_time.checked_sub(lead).ok_or_else(|| {
+                        CodecError::EncodingFailed("encoded sample decode time underflows".into())
+                    })?
+                } else {
+                    if self
+                        .last_undated_presentation
+                        .is_some_and(|last| presentation_time <= last)
+                    {
+                        return Err(CodecError::EncodingFailed(
+                            "the encoder reordered frames without reporting decode timestamps"
+                                .into(),
+                        ));
+                    }
+                    self.last_undated_presentation = Some(presentation_time);
+                    signed_nanos(presentation_time)?
+                };
+                self.packets
+                    .packet(sample.data, presentation_time, decode_time_nanos)
+            })
             .collect()
     }
 
-    /// Pump every output sample the transform can currently produce,
-    /// returning each sample's bytes as a separate entry (one access unit per
-    /// element). Returns when the transform asks for more input.
-    fn pump_output_samples(&mut self) -> Result<Vec<Vec<u8>>, CodecError> {
+    /// The submitted frame an output sample encodes, and the encoder's lead.
+    ///
+    /// The transform does not echo input sample times: it stamps output from
+    /// its own frame clock, which runs a fixed lead ahead of the inputs (its
+    /// reorder delay) so decode times never pass presentation times. The first
+    /// output sample is always the first input frame, which gives the lead;
+    /// every later sample encodes the pending frame nearest to its sample time
+    /// minus the lead, within half a frame period.
+    fn resolve_frame(&mut self, sample_time: Duration) -> Result<(Duration, i64), CodecError> {
+        let stamped = signed_nanos(sample_time)?;
+        let lead = if let Some(lead) = self.clock_lead {
+            lead
+        } else {
+            let first = self.first_submitted.ok_or_else(|| {
+                CodecError::EncodingFailed("the encoder emitted before any input".into())
+            })?;
+            let lead = stamped - signed_nanos(first)?;
+            self.clock_lead = Some(lead);
+            lead
+        };
+        let target = Duration::from_nanos(u64::try_from(stamped - lead).map_err(|_| {
+            CodecError::EncodingFailed("encoded sample precedes the first input frame".into())
+        })?);
+        let half_period = Duration::from_nanos(
+            1_000_000_000 * u64::from(self.frame_rate.denominator().get())
+                / u64::from(self.frame_rate.numerator().get())
+                / 2,
+        );
+        let before = self.pending.range(..=target).next_back().copied();
+        let after = self.pending.range(target..).next().copied();
+        let nearest = [before, after]
+            .into_iter()
+            .flatten()
+            .min_by_key(|candidate| candidate.abs_diff(target))
+            .filter(|candidate| candidate.abs_diff(target) <= half_period)
+            .ok_or_else(|| {
+                CodecError::EncodingFailed(format!(
+                    "encoded sample time {sample_time:?} (lead {lead} ns) matches no pending \
+                     input frame within half a frame period"
+                ))
+            })?;
+        self.pending.remove(&nearest);
+        Ok((nearest, lead))
+    }
+
+    /// Pump every output sample the transform can currently produce, one
+    /// access unit per element. Returns when the transform asks for more
+    /// input.
+    fn pump_output_samples(&mut self) -> Result<Vec<OutputSample>, CodecError> {
         let mut packets = Vec::new();
         unsafe {
             loop {
@@ -775,7 +890,19 @@ impl WindowsEncoder {
                         if let Some(sample) = output_sample.as_ref()
                             && let Ok(data) = extract_sample_data(sample)
                         {
-                            packets.push(data);
+                            let (sample_time, decode_time_nanos) = sample_times(sample)?;
+                            tracing::debug!(
+                                sample_time_100ns = sample_time.as_nanos() / 100,
+                                decode_timestamp_100ns = ?decode_time_nanos.map(|nanos| nanos / 100),
+                                duration_100ns = ?sample.GetSampleDuration().ok(),
+                                bytes = data.len(),
+                                "Media Foundation encoder output sample"
+                            );
+                            packets.push(OutputSample {
+                                data,
+                                sample_time,
+                                decode_time_nanos,
+                            });
                         }
                     }
                     Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
@@ -1193,6 +1320,31 @@ fn copy_2d_biplanar_buffer(
             .map_err(|error| CodecError::DecodingFailed(format!("Unlock2D failed: {error}")))?;
         result
     }
+}
+
+/// The presentation time of an encoder output sample and, when the transform
+/// stamped one, its decode time in nanoseconds.
+///
+/// Both are 100 ns units; the decode timestamp is a signed value stored in an
+/// unsigned attribute.
+fn sample_times(sample: &IMFSample) -> Result<(Duration, Option<i64>), CodecError> {
+    let missing = |what: &str, error: windows::core::Error| {
+        CodecError::EncodingFailed(format!("encoded sample {what}: {error}"))
+    };
+    // SAFETY: `sample` is a live output sample.
+    let sample_time = unsafe { sample.GetSampleTime() }.map_err(|e| missing("has no time", e))?;
+    let presentation_time = u64::try_from(sample_time)
+        .map(|hns| Duration::from_nanos(hns * 100))
+        .map_err(|_| CodecError::EncodingFailed("encoded sample has a negative time".into()))?;
+    // SAFETY: as above; the key is a valid attribute GUID.
+    let decode_time = match unsafe { sample.GetUINT64(&MFSampleExtension_DecodeTimestamp) } {
+        Ok(hns) => Some(hns.cast_signed().checked_mul(100).ok_or_else(|| {
+            CodecError::EncodingFailed("encoded sample decode timestamp overflows".into())
+        })?),
+        Err(error) if error.code() == MF_E_ATTRIBUTENOTFOUND => None,
+        Err(error) => return Err(missing("has an unreadable decode timestamp", error)),
+    };
+    Ok((presentation_time, decode_time))
 }
 
 fn extract_sample_data(sample: &IMFSample) -> Result<Vec<u8>, CodecError> {

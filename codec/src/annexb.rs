@@ -7,6 +7,13 @@
     mediax_hw_codec_vaapi
 ))]
 use crate::{BitstreamFormat, CodecError, EncodedPacket};
+#[cfg(any(
+    test,
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
+))]
+use std::time::Duration;
 
 /// The four-byte Annex B start code.
 pub const START_CODE: [u8; 4] = [0, 0, 0, 1];
@@ -188,7 +195,12 @@ impl AnnexBPackets {
     ///
     /// Returns [`CodecError::EncodingFailed`] when `raw` has no start code, or
     /// when an IDR arrives and no parameter sets are known for an Annex B stream.
-    pub fn packet(&mut self, raw: Vec<u8>) -> Result<EncodedPacket, CodecError> {
+    pub fn packet(
+        &mut self,
+        raw: Vec<u8>,
+        presentation_time: Duration,
+        decode_time_nanos: i64,
+    ) -> Result<EncodedPacket, CodecError> {
         let nalus = annex_b_nalus(&raw);
         if nalus.is_empty() {
             return Err(CodecError::EncodingFailed(
@@ -223,11 +235,15 @@ impl AnnexBPackets {
                     return Ok(EncodedPacket {
                         data,
                         keyframe: true,
+                        presentation_time,
+                        decode_time_nanos,
                     });
                 }
                 Ok(EncodedPacket {
                     data: raw,
                     keyframe,
+                    presentation_time,
+                    decode_time_nanos,
                 })
             }
             BitstreamFormat::LengthPrefixed => {
@@ -239,6 +255,8 @@ impl AnnexBPackets {
                         )
                     })?,
                     keyframe,
+                    presentation_time,
+                    decode_time_nanos,
                 })
             }
         }
@@ -285,7 +303,7 @@ mod tests {
     fn idr_without_parameter_sets_gets_them_prepended() {
         let mut packets =
             AnnexBPackets::new(false, BitstreamFormat::AnnexB, annex_b(&[&SPS, &PPS]));
-        let packet = packets.packet(annex_b(&[&IDR])).unwrap();
+        let packet = packets.packet(annex_b(&[&IDR]), Duration::ZERO, 0).unwrap();
         assert!(packet.keyframe);
         assert_eq!(packet.data, annex_b(&[&SPS, &PPS, &IDR]));
     }
@@ -294,8 +312,14 @@ mod tests {
     fn idr_with_parameter_sets_is_left_alone_and_cached() {
         let mut packets = AnnexBPackets::new(false, BitstreamFormat::AnnexB, Vec::new());
         let first = annex_b(&[&SPS, &PPS, &IDR]);
-        assert_eq!(packets.packet(first.clone()).unwrap().data, first);
-        let second = packets.packet(annex_b(&[&IDR])).unwrap();
+        assert_eq!(
+            packets
+                .packet(first.clone(), Duration::ZERO, 0)
+                .unwrap()
+                .data,
+            first
+        );
+        let second = packets.packet(annex_b(&[&IDR]), Duration::ZERO, 0).unwrap();
         assert_eq!(second.data, annex_b(&[&SPS, &PPS, &IDR]));
     }
 
@@ -303,7 +327,9 @@ mod tests {
     fn delta_frames_are_not_keyframes_and_get_no_parameter_sets() {
         let mut packets =
             AnnexBPackets::new(false, BitstreamFormat::AnnexB, annex_b(&[&SPS, &PPS]));
-        let packet = packets.packet(annex_b(&[&P_SLICE])).unwrap();
+        let packet = packets
+            .packet(annex_b(&[&P_SLICE]), Duration::ZERO, 0)
+            .unwrap();
         assert!(!packet.keyframe);
         assert_eq!(packet.data, annex_b(&[&P_SLICE]));
     }
@@ -311,7 +337,7 @@ mod tests {
     #[test]
     fn idr_with_no_known_parameter_sets_is_an_error() {
         let mut packets = AnnexBPackets::new(false, BitstreamFormat::AnnexB, Vec::new());
-        assert!(packets.packet(annex_b(&[&IDR])).is_err());
+        assert!(packets.packet(annex_b(&[&IDR]), Duration::ZERO, 0).is_err());
     }
 
     #[test]
@@ -320,7 +346,7 @@ mod tests {
             AnnexBPackets::new(false, BitstreamFormat::AnnexB, annex_b(&[&SPS, &PPS]));
         let other_pps = [0x68, 0xEE];
         packets.set_parameter_sets(annex_b(&[&SPS, &other_pps]));
-        let packet = packets.packet(annex_b(&[&IDR])).unwrap();
+        let packet = packets.packet(annex_b(&[&IDR]), Duration::ZERO, 0).unwrap();
         assert_eq!(packet.data, annex_b(&[&SPS, &other_pps, &IDR]));
     }
 
@@ -332,7 +358,7 @@ mod tests {
         let idr = [0x26, 0x01, 0xAF];
         let mut packets =
             AnnexBPackets::new(true, BitstreamFormat::AnnexB, annex_b(&[&vps, &sps, &pps]));
-        let packet = packets.packet(annex_b(&[&idr])).unwrap();
+        let packet = packets.packet(annex_b(&[&idr]), Duration::ZERO, 0).unwrap();
         assert!(packet.keyframe);
         assert_eq!(packet.data, annex_b(&[&vps, &sps, &pps, &idr]));
     }
@@ -340,10 +366,14 @@ mod tests {
     #[test]
     fn length_prefixed_output_converts_and_flags_keyframes() {
         let mut packets = AnnexBPackets::new(false, BitstreamFormat::LengthPrefixed, Vec::new());
-        let packet = packets.packet(annex_b(&[&SPS, &PPS, &IDR])).unwrap();
+        let packet = packets
+            .packet(annex_b(&[&SPS, &PPS, &IDR]), Duration::ZERO, 0)
+            .unwrap();
         assert!(packet.keyframe);
         assert_eq!(&packet.data[..4], &4_u32.to_be_bytes());
-        let delta = packets.packet(annex_b(&[&P_SLICE])).unwrap();
+        let delta = packets
+            .packet(annex_b(&[&P_SLICE]), Duration::ZERO, 0)
+            .unwrap();
         assert!(!delta.keyframe);
     }
 }

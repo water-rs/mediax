@@ -138,7 +138,8 @@ fn encode(codec: EncoderCodec) -> Option<EncodedVideo> {
         let options = FrameOptions {
             keyframe: index == 0 || index == FRAMES / 2,
         };
-        for packet in encoder.encode_nv12(&nv12_frame(index), options) {
+        let presentation_time = std::time::Duration::from_secs(index as u64) / 30;
+        for packet in encoder.encode_nv12(&nv12_frame(index), presentation_time, options) {
             packets.push(packet.expect("encode frame"));
         }
     }
