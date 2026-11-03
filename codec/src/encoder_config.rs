@@ -330,7 +330,9 @@ pub struct EncodedPacket {
     mediax_av1_software_encode,
     mediax_hw_codec_android,
     mediax_hw_codec_windows,
-    mediax_hw_codec_vaapi
+    mediax_hw_codec_vaapi,
+    // The VA-API module also compiles for its driver-double tests.
+    all(test, unix)
 ))]
 pub fn signed_nanos(time: Duration) -> Result<i64, CodecError> {
     i64::try_from(time.as_nanos())

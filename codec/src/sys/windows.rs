@@ -712,6 +712,12 @@ impl WindowsEncoder {
             let time_100ns = i64::try_from(presentation_time.as_nanos() / 100).map_err(|_| {
                 CodecError::EncodingFailed("presentation time exceeds i64 100 ns units".into())
             })?;
+            tracing::debug!(
+                time_100ns,
+                duration_100ns = frame_duration_hns,
+                keyframe = options.keyframe,
+                "Media Foundation encoder input sample"
+            );
             input_sample
                 .SetSampleTime(time_100ns)
                 .map_err(|e| CodecError::EncodingFailed(format!("SetSampleTime: {e}")))?;
@@ -733,6 +739,7 @@ impl WindowsEncoder {
     /// tail of a recording only ever arrives here; each entry is one access
     /// unit and becomes one container sample.
     pub fn drain(&mut self) -> Result<Vec<EncodedPacket>, CodecError> {
+        tracing::debug!("Media Foundation encoder end of stream and drain");
         unsafe {
             self.transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)
@@ -762,21 +769,20 @@ impl WindowsEncoder {
         }
         raw.into_iter()
             .map(|sample| {
-                let decode_time_nanos = match sample.decode_time_nanos {
-                    Some(decode_time) => decode_time,
-                    None => {
-                        if self
-                            .last_undated_presentation
-                            .is_some_and(|last| sample.presentation_time <= last)
-                        {
-                            return Err(CodecError::EncodingFailed(
-                                "the encoder reordered frames without reporting decode timestamps"
-                                    .into(),
-                            ));
-                        }
-                        self.last_undated_presentation = Some(sample.presentation_time);
-                        signed_nanos(sample.presentation_time)?
+                let decode_time_nanos = if let Some(decode_time) = sample.decode_time_nanos {
+                    decode_time
+                } else {
+                    if self
+                        .last_undated_presentation
+                        .is_some_and(|last| sample.presentation_time <= last)
+                    {
+                        return Err(CodecError::EncodingFailed(
+                            "the encoder reordered frames without reporting decode timestamps"
+                                .into(),
+                        ));
                     }
+                    self.last_undated_presentation = Some(sample.presentation_time);
+                    signed_nanos(sample.presentation_time)?
                 };
                 self.packets
                     .packet(sample.data, sample.presentation_time, decode_time_nanos)
@@ -820,6 +826,13 @@ impl WindowsEncoder {
                             && let Ok(data) = extract_sample_data(sample)
                         {
                             let (presentation_time, decode_time_nanos) = sample_times(sample)?;
+                            tracing::debug!(
+                                sample_time_100ns = presentation_time.as_nanos() / 100,
+                                decode_timestamp_100ns = ?decode_time_nanos.map(|nanos| nanos / 100),
+                                duration_100ns = ?sample.GetSampleDuration().ok(),
+                                bytes = data.len(),
+                                "Media Foundation encoder output sample"
+                            );
                             packets.push(OutputSample {
                                 data,
                                 presentation_time,

@@ -5,6 +5,7 @@ mod support;
 use std::path::Path;
 
 use mediax_codec::{CodecType, Decoder};
+use mediax_container::EncodedSample;
 use serde_json::Value;
 use support::{
     AUDIO_ID, Container, FRAMES, HEIGHT, VIDEO_ID, Video, WIDTH, assert_same_samples, encode,
@@ -23,7 +24,9 @@ fn probe(path: &Path) -> Value {
 
 /// Runs `mediax transcode` and returns its output.
 fn transcode(input: &Path, output: &Path, codec: Video, extra: &[&str]) -> std::process::Output {
+    // `-v` makes the encoder log debug lines, including each packet's times.
     let mut args: Vec<&std::ffi::OsStr> = vec![
+        "-v".as_ref(),
         "transcode".as_ref(),
         path_arg(input),
         path_arg(output),
@@ -31,7 +34,39 @@ fn transcode(input: &Path, output: &Path, codec: Video, extra: &[&str]) -> std::
         codec.name().as_ref(),
     ];
     args.extend(extra.iter().map(std::ffi::OsStr::new));
-    mediax(&args)
+    let result = mediax(&args);
+    // The harness shows this when the test fails.
+    eprintln!(
+        "mediax transcode log:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    result
+}
+
+/// Every source frame's presentation time and every output sample's
+/// presentation and decode time, in ticks, for a failure message.
+fn timeline(video_in: &[EncodedSample], video_out: &[EncodedSample]) -> String {
+    let ticks =
+        |time: mediax_container::MediaTime| format!("{}/{}", time.ticks(), time.timescale());
+    let source: Vec<_> = video_in
+        .iter()
+        .map(|sample| ticks(sample.presentation_time()))
+        .collect();
+    let output: Vec<_> = video_out
+        .iter()
+        .map(|sample| {
+            format!(
+                "pts {} dts {}",
+                ticks(sample.presentation_time()),
+                ticks(sample.decode_time())
+            )
+        })
+        .collect();
+    format!(
+        "source frames: {}\noutput samples in decode order:\n{}",
+        source.join(", "),
+        output.join("\n")
+    )
 }
 
 /// Asserts the transcoded `output` against the source's samples.
@@ -67,19 +102,22 @@ fn assert_transcoded(source: &Path, output: &Path, codec: Video, label: &str) {
             .position(|source| same_time(out.presentation_time(), source.presentation_time()))
             .unwrap_or_else(|| {
                 panic!(
-                    "{label}: sample {index} presents at {:?}, which is no source frame",
-                    out.presentation_time()
+                    "{label}: sample {index} presents at {:?}, which is no source frame\n{}",
+                    out.presentation_time(),
+                    timeline(video_in, video_out)
                 )
             });
         assert!(
             !std::mem::replace(&mut kept[source], true),
-            "{label}: source frame {source} is presented twice"
+            "{label}: source frame {source} is presented twice\n{}",
+            timeline(video_in, video_out)
         );
         // Decode time advances from sample to sample.
         if let Some(previous) = index.checked_sub(1).map(|previous| &video_out[previous]) {
             assert!(
                 previous.decode_time().ticks() < out.decode_time().ticks(),
-                "{label}: decode time does not advance at sample {index}"
+                "{label}: decode time does not advance at sample {index}\n{}",
+                timeline(video_in, video_out)
             );
         }
     }
