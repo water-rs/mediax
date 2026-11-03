@@ -8,6 +8,8 @@ use std::{
 
 use broadcast_common::{Parse, Serialize, Unpackage};
 use bytes::{Bytes, BytesMut};
+use mediax_core::Error;
+use mediax_core::VideoColorInfo;
 use transmux::{
     CodecConfig as TransmuxCodecConfig, DemuxEvent as TransmuxDemuxEvent, Fmp4Demux,
     MovieFragmentBox, ProtectionSchemeInfoBox, ProtectionSystemSpecificHeaderBox,
@@ -15,8 +17,6 @@ use transmux::{
     SampleEncryptionBox, SampleEntryVariant, StblChild, StreamingTsDemux, Track as TransmuxTrack,
     TrackBox, TrackExtendsBox, TrackFragmentBox, TrackFragmentRunBox, TrackSpec, parse_box,
 };
-use waterkit_video_core::Error;
-use waterkit_video_core::VideoColorInfo;
 
 use crate::subtitles::{SubtitleCue, parse_ttml_document};
 use crate::{
@@ -1899,7 +1899,7 @@ impl MpegTsDemuxer {
     /// # Errors
     ///
     /// Returns an error when a discovered track or sample cannot be represented by
-    /// the `WaterKit` container contract.
+    /// the mediax container contract.
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<MpegTsEvent>, Error> {
         self.inner.feed(data);
         self.drain_events()
@@ -2294,7 +2294,7 @@ fn normalize_codec(config: &TransmuxCodecConfig) -> Result<NormalizedCodec, Erro
             None,
         )),
         _ => Err(Error::Unsupported(String::from(
-            "container emitted a codec unknown to this WaterKit version",
+            "container emitted a codec unknown to this mediax version",
         ))),
     }
 }

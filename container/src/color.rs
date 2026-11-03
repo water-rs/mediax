@@ -4,7 +4,7 @@ use std::{
     path::Path,
 };
 
-use waterkit_video_core::{
+use mediax_core::{
     ColorPrimaries, ColorRange, ContentLightLevel, Error, MatrixCoefficients, TransferFunction,
     VideoColorInfo,
 };
@@ -413,7 +413,7 @@ fn read_u64(reader: &mut impl Read) -> Result<u64, Error> {
 
 #[cfg(test)]
 mod tests {
-    use waterkit_video_core::{
+    use mediax_core::{
         ColorPrimaries, ColorRange, ContentLightLevel, MatrixCoefficients, TransferFunction,
     };
 

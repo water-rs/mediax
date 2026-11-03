@@ -1,12 +1,12 @@
-//! Performance benchmark for waterkit-codec.
+//! Performance benchmark for mediax-codec.
 //!
 //! Tests encoding performance using hardware accelerated (Apple `VideoToolbox`) encoders.
-//! Measures throughput with screen capture as input source.
+//! Measures throughput on synthetic NV12 frames.
 
 mod common;
 
+use mediax_codec::{CodecType, Encoder, EncoderProfile};
 use std::time::Instant;
-use waterkit_codec::{CodecType, Encoder, EncoderProfile};
 
 fn create_test_nv12(width: u32, height: u32) -> Vec<u8> {
     // Create a dummy NV12 frame for testing
@@ -131,29 +131,6 @@ fn run_case(results: &mut Vec<BenchResult>, case: &BenchCase<'_>, nv12_data: &[u
     }
 }
 
-/// The resolution of the primary screen, or 4K when no screen is reported.
-fn screen_size() -> (u32, u32) {
-    match waterkit_screen::screens() {
-        Ok(screens) if !screens.is_empty() => {
-            let primary = screens
-                .iter()
-                .find(|s| s.is_primary())
-                .unwrap_or(&screens[0]);
-            println!(
-                "  Using screen: {} ({}x{})",
-                primary.name(),
-                primary.width(),
-                primary.height()
-            );
-            (primary.width(), primary.height())
-        }
-        _ => {
-            println!("  No screen info available, using 4K default");
-            (3840, 2160)
-        }
-    }
-}
-
 fn print_summary(results: &[BenchResult]) {
     println!("\n=================================================");
     println!("                  SUMMARY");
@@ -201,20 +178,20 @@ fn main() {
         run_case(&mut results, &case, &nv12_data);
     }
 
-    // Screen capture input (4K, high pressure)
-    println!("\n>>> Screen Capture (High Pressure - 4K)");
-    let (screen_width, screen_height) = screen_size();
-    let nv12_data = create_test_nv12(screen_width, screen_height);
+    // 4K input, high pressure
+    println!("\n>>> 4K Input (High Pressure)");
+    let (width_4k, height_4k) = (3840, 2160);
+    let nv12_data = create_test_nv12(width_4k, height_4k);
     for (label, name, codec) in [
         ("H.264", "H.264 VT (4K)", CodecType::H264),
         ("H.265", "H.265 VT (4K)", CodecType::H265),
     ] {
-        println!("\n--- Hardware {label} (VideoToolbox) on Screen Size ---");
+        println!("\n--- Hardware {label} (VideoToolbox) at 4K ---");
         let case = BenchCase {
             name,
             codec,
-            width: screen_width,
-            height: screen_height,
+            width: width_4k,
+            height: height_4k,
             profile: EncoderProfile::Realtime,
             iterations: 50,
         };

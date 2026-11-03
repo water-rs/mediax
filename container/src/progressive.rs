@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use broadcast_common::Unpackage as _;
 use bytes::Bytes;
+use mediax_core::Error;
 use transmux::Fmp4Demux;
-use waterkit_video_core::Error;
 
 use crate::demuxer::{IndexedTrackSamples, index_track_samples};
 use crate::isobmff::read_top_level_box;
@@ -85,7 +85,7 @@ impl ProgressiveTrackReader {
     /// # Errors
     ///
     /// Returns an error for malformed ISO BMFF metadata or a sample table
-    /// whose codec parameters cannot be represented by the `WaterKit` contract.
+    /// whose codec parameters cannot be represented by the mediax contract.
     pub fn open(path: impl AsRef<Path>, kind: TrackKind) -> Result<Self, Error> {
         let mp4_kind = match kind {
             TrackKind::Audio => mp4::TrackType::Audio,

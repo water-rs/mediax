@@ -1,6 +1,7 @@
 //! Video demuxer and frame representation.
 
 use broadcast_common::Parse;
+use mediax_core::Error;
 use mp4::WriteBox;
 use std::{
     io::{BufReader, Cursor, Read, Seek, SeekFrom},
@@ -8,7 +9,6 @@ use std::{
     time::Duration,
 };
 use transmux::{MovieFragmentBox, TrackExtendsBox, TrackFragmentBox};
-use waterkit_video_core::Error;
 
 use crate::isobmff::{TopLevelBoxSpan, read_top_level_box, scan_top_level_boxes};
 use crate::stream::{SAMPLE_FLAG_IS_NON_SYNC, TFHD_DEFAULT_BASE_IS_MOOF};

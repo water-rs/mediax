@@ -4,7 +4,7 @@
 // `R16Uint`/`Rg16Uint` for P010), sampled with textureLoad and passed through
 // `ycbcr_codes` before the range/matrix/transfer decode.
 //
-// The range and matrix math is waterkit-video-core's `ycbcr.wgsl`, which the
+// The range and matrix math is mediax-core's `ycbcr.wgsl`, which the
 // build script prepends to this file.
 
 @group(0) @binding(0) var y_texture: texture_2d<u32>;

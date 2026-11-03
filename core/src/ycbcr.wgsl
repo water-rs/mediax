@@ -1,4 +1,4 @@
-// Y'CbCr to R'G'B' conversion shared by WaterKit's GPU colour converters.
+// Y'CbCr to R'G'B' conversion shared by mediax's GPU colour converters.
 //
 // This is a fragment, not a module: a converter prepends it to its own WGSL
 // (shaderloom's `--prepend`, or string composition in a build script) and
@@ -10,7 +10,7 @@
 // primaries; linearization belongs to the caller.
 //
 // The YCBCR_MATRIX_* and YCBCR_RANGE_* mode constants are declared ahead of
-// this text by waterkit-video-core's `YCBCR_WGSL`, from the same Rust
+// this text by mediax-core's `YCBCR_WGSL`, from the same Rust
 // definitions converters fill their uniforms with.
 
 // Y', Cb and Cr code values, normalized by the largest code, of samples each

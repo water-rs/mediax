@@ -1,17 +1,17 @@
 [package]
-name = "waterkit-video-streaming"
+name = "mediax-streaming"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 readme.workspace = true
 repository.workspace = true
-description = "Zenwave-based network delivery and cache primitives for WaterKit video"
+description = "Zenwave-based network delivery and cache primitives for mediax"
 keywords = ["video", "streaming", "http", "cache"]
 categories = ["multimedia::video", "network-programming"]
 
 [dependencies]
-waterkit-video-core.workspace = true
+mediax-core.workspace = true
 async-fs.workspace = true
 blocking.workspace = true
 futures.workspace = true

@@ -4,7 +4,7 @@ use filtrate::{
     Effect, EffectContext, EffectFrameTiming, EffectInput, EffectOutput, EffectRedrawCallback,
     ShapeTextures,
 };
-use waterkit_video_core::{Error, FrameTiming};
+use mediax_core::{Error, FrameTiming};
 
 use crate::{FrameProcessor, TimedFrame};
 
@@ -157,7 +157,7 @@ impl TexturePool {
             wgpu::TextureUsages::empty()
         };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("waterkit video processed frame"),
+            label: Some("mediax processed frame"),
             size: wgpu::Extent3d {
                 width,
                 height,
@@ -178,7 +178,7 @@ impl TexturePool {
     }
 }
 
-/// A Filtrate effect adapted to `WaterKit`'s typed video processing pipeline.
+/// A Filtrate effect adapted to mediax's typed video processing pipeline.
 ///
 /// The processor submits GPU commands without waiting for completion; wgpu
 /// queue ordering keeps the returned texture usable by subsequent GPU stages.
@@ -336,7 +336,7 @@ impl<E: Effect> GpuEffectProcessor<E> {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("waterkit video Filtrate frame"),
+                label: Some("mediax Filtrate frame"),
             });
         self.needs_redraw = self
             .effect
@@ -361,7 +361,7 @@ mod tests {
     use std::time::Duration;
 
     use filtrate::{Executor, filters::Brightness};
-    use waterkit_video_core::FrameTiming;
+    use mediax_core::FrameTiming;
 
     use crate::{FrameProcessor, TimedFrame};
 
@@ -392,14 +392,14 @@ mod tests {
                     apply_limit_buckets: false,
                 })
                 .await
-                .expect("WaterKit Filtrate test requires a GPU adapter");
+                .expect("mediax Filtrate test requires a GPU adapter");
             let (device, queue) = adapter
                 .request_device(&wgpu::DeviceDescriptor::default())
                 .await
-                .expect("WaterKit Filtrate test requires a working GPU device");
+                .expect("mediax Filtrate test requires a working GPU device");
             let format = wgpu::TextureFormat::Rgba8Unorm;
             let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("WaterKit Filtrate test input"),
+                label: Some("mediax Filtrate test input"),
                 size: wgpu::Extent3d {
                     width: 8,
                     height: 6,

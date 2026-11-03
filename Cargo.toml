@@ -1,0 +1,145 @@
+[workspace]
+resolver = "2"
+members = ["core", "codec", "container", "streaming", "processing", "bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Lexo Liu"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/water-rs/mediax"
+
+[package]
+name = "mediax"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "Hardware-accelerated, permissively licensed codecs, containers and streaming for Rust"
+keywords = ["video", "codec", "hardware", "streaming", "media"]
+categories = ["multimedia::video", "multimedia::encoding"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mediax-core.workspace = true
+mediax-codec = { workspace = true, optional = true }
+mediax-container = { workspace = true, optional = true }
+mediax-streaming = { workspace = true, optional = true }
+mediax-processing = { workspace = true, optional = true }
+
+[features]
+default = ["container"]
+codec = ["dep:mediax-codec"]
+container = ["dep:mediax-container"]
+streaming = ["dep:mediax-streaming"]
+# Offline download and license storage in `mediax-streaming`.
+offline = ["streaming", "mediax-streaming/offline"]
+processing = ["dep:mediax-processing"]
+# Filtrate GPU effects in `mediax-processing`.
+filtrate = ["processing", "mediax-processing/filtrate"]
+# `mediax-codec` features, each enabling the codec crate itself.
+gpu = ["codec", "mediax-codec/gpu"]
+software-decode = ["codec", "mediax-codec/software-decode"]
+software-encode = ["codec", "mediax-codec/software-encode"]
+# VA-API hardware decode/encode on Linux; needs the system libva.
+vaapi = ["codec", "mediax-codec/vaapi"]
+aac = ["codec", "mediax-codec/aac"]
+full = ["container", "streaming", "offline", "processing", "filtrate", "gpu", "software-encode", "aac"]
+
+[workspace.dependencies]
+mediax-core = { path = "core", version = "0.1.0" }
+# No default features: consumers opt into `gpu` (decoded-frame upload),
+# `software-decode` (rav1d + image decoding), `software-encode` (adds rav1e),
+# `vaapi` and `aac` explicitly.
+mediax-codec = { path = "codec", version = "0.1.0", default-features = false }
+mediax-container = { path = "container", version = "0.1.0" }
+mediax-streaming = { path = "streaming", version = "0.1.0" }
+mediax-processing = { path = "processing", version = "0.1.0" }
+
+thiserror = "2"
+tracing = "0.1.44"
+futures = "0.3"
+num-traits = "0.2"
+blocking = "1"
+async-channel = "2.5"
+async-fs = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+url = "2.5"
+zenwave = { version = "0.7.1", default-features = false, features = ["hyper-backend"] }
+hex = "0.4"
+byteorder = "1.5"
+bytes = "1.12"
+pollster = "1.0"
+
+# Decoders only. `default-formats` also pulls `image`'s AVIF *encoder*
+# (ravif -> rav1e); the one place that encodes AVIF is a `mediax-codec` test,
+# which asks for that feature itself as a dev-dependency.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
+wgpu = "30.0.1"
+wgpu-hal = { version = "30.0.1", features = ["metal"] }
+shaderloom = { version = "0.2.1", default-features = false }
+rav1e = { version = "0.8", default-features = false, features = ["threading"] }
+rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+symphonia-core = "0.6.1"
+symphonia-codec-aac = "0.6.1"
+mp4 = "0.14"
+broadcast-common = { version = "9.4", default-features = false, features = ["std"] }
+transmux = { version = "0.26", default-features = false, features = ["std"] }
+quick-xml = "0.42"
+subtp = "0.2"
+
+# Apple
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-graphics = { version = "0.3", default-features = false }
+objc2-core-image = { version = "0.3", default-features = false }
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-video-toolbox = "0.3"
+objc2-core-foundation = "0.3"
+objc2-image-io = { version = "0.3", default-features = false }
+objc2-io-surface = "0.3"
+objc2-metal = "0.3"
+
+# Android
+jni = "0.22"
+ndk-context = "0.1"
+
+# Windows
+windows = { version = "0.62", features = ["Foundation"] }
+
+[workspace.lints]
+rust.missing_docs = "warn"
+rust.missing_debug_implementations = "warn"
+clippy.all = { level = "warn", priority = -1 }
+clippy.style = { level = "warn", priority = -1 }
+clippy.correctness = { level = "warn", priority = -1 }
+clippy.complexity = { level = "warn", priority = -1 }
+clippy.suspicious = { level = "warn", priority = -1 }
+clippy.perf = { level = "warn", priority = -1 }
+clippy.pedantic = { level = "warn", priority = -1 }
+clippy.nursery = { level = "warn", priority = -1 }
+clippy.cargo = { level = "warn", priority = -1 }
+clippy.multiple_crate_versions = "allow"
+# Trait implementations whose body happens not to await keep the trait's
+# `async fn` signature; returning `impl Future` from only those would make the
+# implementations less uniform.
+clippy.unused_async_trait_impl = "allow"
+
+# `filtrate`'s executor API is only on water-rs/cherenkov's dev, so
+# `mediax-processing/filtrate` builds through this patch, which crates.io drops.
+# Drop these entries once a filtrate release carries the new executor API.
+[patch.crates-io]
+filtrate = { git = "https://github.com/water-rs/cherenkov", branch = "dev" }
+filtrate-core = { git = "https://github.com/water-rs/cherenkov", branch = "dev" }
+filtrate-derive = { git = "https://github.com/water-rs/cherenkov", branch = "dev" }
+cherenkov-shader = { git = "https://github.com/water-rs/cherenkov", branch = "dev" }

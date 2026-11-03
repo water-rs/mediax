@@ -1,0 +1,18 @@
+name: Setup Linux native dependencies
+description: >
+  Installs the native libraries a Linux build of this workspace needs: video
+  (VA-API, GBM, EGL, nasm) and libclang for the bindgen-based crates. Every
+  Linux job needs the same list, so it lives here once.
+runs:
+  using: composite
+  steps:
+    - name: Install Linux dependencies
+      shell: bash
+      run: |
+        sudo apt-get -c "$GITHUB_WORKSPACE/.github/apt.conf" update
+        sudo apt-get -c "$GITHUB_WORKSPACE/.github/apt.conf" install -y \
+          libva-dev \
+          libgbm-dev \
+          libegl-dev \
+          nasm \
+          libclang-dev

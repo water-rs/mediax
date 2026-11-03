@@ -4,14 +4,14 @@ use crate::{
     CodecError, DecodePacket, DecodedPixelLayout, bitstream::NalStreamConverter,
     config::decoded_pixel_layout,
 };
+use mediax_core::{
+    ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
+};
 use ndk::media::media_codec::{MediaCodec, MediaCodecDirection};
 use ndk::media::media_format::MediaFormat;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::time::Duration;
-use waterkit_video_core::{
-    ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
-};
 
 const COLOR_FORMAT_YUV420_SEMIPLANAR: i32 = 0x15;
 const COLOR_FORMAT_YUV_P010: i32 = 0x36;

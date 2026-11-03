@@ -1,5 +1,6 @@
 use std::{path::Path, time::Duration};
 
+use mediax_core::Error;
 use quick_xml::{
     Reader, XmlVersion,
     escape::resolve_predefined_entity,
@@ -9,7 +10,6 @@ use subtp::{
     srt::{SrtTimestamp, SubRip},
     vtt::{VttBlock, VttTimestamp, WebVtt},
 };
-use waterkit_video_core::Error;
 
 const MPEG_TIMESTAMP_TIMESCALE: i128 = 90_000;
 const MPEG_TIMESTAMP_WRAP: i128 = 1_i128 << 33;

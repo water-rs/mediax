@@ -2,8 +2,8 @@ use std::{num::NonZeroUsize, time::Duration};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
+use mediax_core::Error;
 use url::Url;
-use waterkit_video_core::Error;
 use zenwave::{
     Method, StatusCode,
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -1105,11 +1105,11 @@ mod tests {
         )
         .with_header(
             HeaderName::from_static("authorization"),
-            HeaderValue::from_static("Bearer waterkit-test-token"),
+            HeaderValue::from_static("Bearer mediax-test-token"),
         )
         .with_header(
             HeaderName::from_static("cookie"),
-            HeaderValue::from_static("waterkit_session=test"),
+            HeaderValue::from_static("mediax_session=test"),
         )
     }
 

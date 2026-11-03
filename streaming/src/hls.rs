@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, num::NonZeroU64, time::Duration};
 
+use mediax_core::Error;
 use quick_m3u8::{
     HlsLine, Reader,
     config::ParsingOptions,
@@ -9,7 +10,6 @@ use quick_m3u8::{
     },
 };
 use url::Url;
-use waterkit_video_core::Error;
 
 use crate::{MediaByteRange, MediaRequest, StreamVariant, fetch_media};
 

@@ -1,4 +1,4 @@
-//! Engine-neutral types shared by the `WaterKit` video crate family.
+//! Engine-neutral types shared by the mediax video crate family.
 //!
 //! This crate intentionally contains no container parser, codec, network,
 //! graphics, audio-output, or UI dependency. It is suitable for applications,
@@ -28,7 +28,7 @@ macro_rules! ycbcr_modes {
         }
 
         /// WGSL fragment holding the YCbCr to RGB range and matrix math that
-        /// every `WaterKit` GPU colour converter shares.
+        /// every mediax GPU colour converter shares.
         ///
         /// It declares the [`ycbcr_mode`] constants and the conversion
         /// functions, but no bindings. A converter prepends it to its own
@@ -54,7 +54,7 @@ ycbcr_modes! {
     RANGE_FULL = 1,
 }
 
-/// Error returned by `WaterKit` video operations.
+/// Error returned by mediax video operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// An operating-system I/O operation failed.

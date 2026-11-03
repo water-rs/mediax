@@ -3,10 +3,10 @@ use std::{num::NonZeroU64, path::PathBuf};
 use async_channel::{Receiver, Sender};
 use async_fs::File;
 use futures::{AsyncWriteExt as _, FutureExt as _, StreamExt as _, select_biased};
+use mediax_core::Error;
 use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
-use waterkit_video_core::Error;
 
 use crate::{AssetCache, MediaRequest, atomic, fetch_media};
 
@@ -865,7 +865,7 @@ mod tests {
             }
         });
 
-        let root = std::env::temp_dir().join(format!("waterkit-offline-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("mediax-offline-{}", Uuid::new_v4()));
         let source = Url::parse(&format!("http://{address}/master.m3u8"))
             .expect("test source URL must be valid");
         let resources = ["first.m4s", "second.m4s"].map(|name| {
@@ -916,7 +916,7 @@ mod tests {
 
     #[test]
     fn cancellation_removes_persisted_package_state_without_contacting_network() {
-        let root = std::env::temp_dir().join(format!("waterkit-offline-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("mediax-offline-{}", Uuid::new_v4()));
         let source = Url::parse("https://waterui.dev/video/master.m3u8")
             .expect("test source URL must be valid");
         let resource = OfflineResource::new(MediaRequest::new(
@@ -948,7 +948,7 @@ mod tests {
 
     #[test]
     fn pause_resume_and_cancel_commands_produce_ordered_durable_state_transitions() {
-        let root = std::env::temp_dir().join(format!("waterkit-offline-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("mediax-offline-{}", Uuid::new_v4()));
         let source = Url::parse("https://waterui.dev/video/master.m3u8")
             .expect("test source URL must be valid");
         let resource = OfflineResource::new(MediaRequest::new(
