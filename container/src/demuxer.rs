@@ -17,8 +17,11 @@ type VideoError = Error;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SampleMeta {
-    pub decode_time: u64,
-    pub presentation_time: u64,
+    /// Decode time on the presentation timeline, in track ticks; negative
+    /// when the sample decodes before the presentation starts.
+    pub decode_time: i64,
+    /// Presentation time on the presentation timeline, in track ticks.
+    pub presentation_time: i64,
     pub duration: u32,
     pub is_keyframe: bool,
 }
@@ -171,7 +174,8 @@ impl VideoReader {
                 "missing video track metadata for track {video_track_id}"
             ))
         })?;
-        let indexed = index_track_samples(path_ref, track)?;
+        let timeline = MovieTimeline::read(path_ref)?;
+        let indexed = index_track_samples(path_ref, track, &timeline)?;
         let fragmented_samples = indexed
             .locations
             .map(|locations| {
@@ -233,7 +237,7 @@ impl VideoReader {
     ///
     /// Returns `(pts, duration, is_keyframe)` when the sample exists.
     #[must_use]
-    pub fn sample_info(&self, index: usize) -> Option<(u64, u32, bool)> {
+    pub fn sample_info(&self, index: usize) -> Option<(i64, u32, bool)> {
         self.sample_metas
             .get(index)
             .map(|meta| (meta.presentation_time, meta.duration, meta.is_keyframe))
@@ -242,17 +246,20 @@ impl VideoReader {
     /// Return estimated stream duration from the last sample PTS.
     #[must_use]
     pub fn duration(&self) -> Option<std::time::Duration> {
-        let presentation_end = self.sample_metas.iter().fold(0_u64, |end, meta| {
+        let presentation_end = self.sample_metas.iter().fold(0_i64, |end, meta| {
             end.max(
                 meta.presentation_time
-                    .saturating_add(u64::from(meta.duration)),
+                    .saturating_add(i64::from(meta.duration)),
             )
         });
         if self.timescale == 0 {
             return Some(std::time::Duration::ZERO);
         }
         Some(std::time::Duration::from_nanos(
-            presentation_end.saturating_mul(1_000_000_000) / u64::from(self.timescale),
+            presentation_end
+                .cast_unsigned()
+                .saturating_mul(1_000_000_000)
+                / u64::from(self.timescale),
         ))
     }
 
@@ -285,7 +292,7 @@ impl VideoReader {
     ///
     /// Returns an error when the sample index exceeds the MP4 reader range or
     /// when the underlying container reader fails to load the sample.
-    pub fn read_sample(&mut self) -> Result<Option<(Vec<u8>, u64, bool)>, VideoError> {
+    pub fn read_sample(&mut self) -> Result<Option<(Vec<u8>, i64, bool)>, VideoError> {
         if self.current_index >= self.sample_metas.len() {
             return Ok(None);
         }
@@ -330,7 +337,7 @@ impl VideoReader {
     /// Iterate over samples from the current position.
     pub fn samples(
         &mut self,
-    ) -> impl Iterator<Item = Result<(Vec<u8>, u64, bool), VideoError>> + '_ {
+    ) -> impl Iterator<Item = Result<(Vec<u8>, i64, bool), VideoError>> + '_ {
         std::iter::from_fn(move || match self.read_sample() {
             Ok(Some(sample)) => Some(Ok(sample)),
             Ok(None) => None,
@@ -490,11 +497,125 @@ pub struct IndexedTrackSamples {
 pub fn index_track_samples(
     path: &Path,
     track: &mp4::Mp4Track,
+    timeline: &MovieTimeline,
 ) -> Result<IndexedTrackSamples, VideoError> {
-    if track.trafs.is_empty() {
-        return index_progressive_samples(track);
+    let mut indexed = if track.trafs.is_empty() {
+        index_progressive_samples(track)?
+    } else {
+        index_fragment_samples(path, track)?
+    };
+    let offset = timeline.media_offset(track.track_id(), track.timescale())?;
+    for meta in &mut indexed.metas {
+        meta.decode_time = shift_ticks(meta.decode_time, offset)?;
+        meta.presentation_time = shift_ticks(meta.presentation_time, offset)?;
     }
-    index_fragment_samples(path, track)
+    Ok(indexed)
+}
+
+fn shift_ticks(ticks: i64, offset: i64) -> Result<i64, VideoError> {
+    ticks
+        .checked_add(offset)
+        .ok_or_else(|| VideoError::Container(String::from("MP4 timeline exceeds i64 ticks")))
+}
+
+/// `elst` `media_time` of an empty edit.
+pub const EMPTY_EDIT: i64 = -1;
+
+/// The edit lists of a movie, which place each track's media timeline on the
+/// presentation timeline.
+///
+/// A track's sample tables time its samples from its first decode time. Its
+/// `edts`/`elst` says where that is on the presentation timeline: leading
+/// empty edits delay the start and the media edit's `media_time` names the
+/// media time that presents first. Only that shape is read, as the
+/// [`Muxer`](crate::Muxer) and the common muxers write it: any number of
+/// leading empty edits followed by one edit at rate 1.
+#[derive(Debug)]
+pub struct MovieTimeline {
+    /// Ticks per second of the `elst` segment durations.
+    movie_timescale: u32,
+    /// Each track's edit list, by track id.
+    edits: std::collections::BTreeMap<u32, transmux::EditListBox>,
+}
+
+impl MovieTimeline {
+    /// Reads the edit lists out of the `moov` box of the file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file has no `moov` box or it is malformed.
+    pub fn read(path: &Path) -> Result<Self, VideoError> {
+        let movie = read_top_level_box(path, *b"moov")?
+            .ok_or_else(|| VideoError::Container(String::from("media has no moov box")))?;
+        Self::parse(&movie)
+    }
+
+    /// Reads the edit lists out of a whole `moov` box.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the box is malformed.
+    pub fn parse(movie: &[u8]) -> Result<Self, VideoError> {
+        let movie = transmux::MovieBox::parse(movie)
+            .map_err(|error| VideoError::Container(error.to_string()))?;
+        let edits = movie
+            .tracks
+            .iter()
+            .filter_map(|trak| {
+                let elst = trak.edts.as_ref()?.elst.as_ref()?;
+                Some((trak.tkhd.track_id, elst.clone()))
+            })
+            .collect();
+        Ok(Self {
+            movie_timescale: movie.mvhd.timescale,
+            edits,
+        })
+    }
+
+    /// Ticks to add to a media time of track `track_id` (in `timescale`) to
+    /// get its presentation time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an edit list that is not leading empty edits and
+    /// one media edit at rate 1, since any other timeline would be wrong.
+    pub fn media_offset(&self, track_id: u32, timescale: u32) -> Result<i64, VideoError> {
+        let Some(elst) = self.edits.get(&track_id) else {
+            return Ok(0);
+        };
+        let unsupported =
+            |reason: &str| VideoError::Unsupported(format!("track {track_id} edit list {reason}"));
+        let mut entries = elst.entries.iter();
+        let mut delay = 0_u64;
+        let media = loop {
+            match entries.next() {
+                Some(entry) if entry.media_time == EMPTY_EDIT => {
+                    delay = delay
+                        .checked_add(entry.segment_duration)
+                        .ok_or_else(|| unsupported("delays the track beyond u64 ticks"))?;
+                }
+                Some(entry) => break entry,
+                None => return Err(unsupported("has no media edit")),
+            }
+        };
+        if media.media_rate_integer != 1 || media.media_rate_fraction != 0 {
+            return Err(unsupported("plays media at a rate other than 1"));
+        }
+        if entries.next().is_some() {
+            return Err(unsupported("has edits after its media edit"));
+        }
+        if self.movie_timescale == 0 {
+            return Err(VideoError::Container(String::from(
+                "movie header has a zero timescale",
+            )));
+        }
+        // The delay is stored in movie ticks; round to the nearest track tick.
+        let movie_timescale = i128::from(self.movie_timescale);
+        let delay_ticks =
+            (i128::from(delay) * i128::from(timescale) + movie_timescale / 2) / movie_timescale;
+        i64::try_from(delay_ticks - i128::from(media.media_time))
+            .map_err(|_| unsupported("moves the track beyond i64 ticks"))
+    }
 }
 
 fn index_progressive_samples(track: &mp4::Mp4Track) -> Result<IndexedTrackSamples, VideoError> {
@@ -507,7 +628,7 @@ fn index_progressive_samples(track: &mp4::Mp4Track) -> Result<IndexedTrackSample
         ))
     })?;
     let mut metas = Vec::with_capacity(capacity);
-    let mut decode_time = 0_u64;
+    let mut decode_time = 0_i64;
     for entry in &track.trak.mdia.minf.stbl.stts.entries {
         for _ in 0..entry.sample_count {
             let sample_id = u32::try_from(metas.len())
@@ -524,9 +645,9 @@ fn index_progressive_samples(track: &mp4::Mp4Track) -> Result<IndexedTrackSample
                 is_keyframe: is_sync_sample(track, sample_id),
             });
             decode_time = decode_time
-                .checked_add(u64::from(entry.sample_delta))
+                .checked_add(i64::from(entry.sample_delta))
                 .ok_or_else(|| {
-                    VideoError::Container(String::from("MP4 decode timeline exceeds u64 ticks"))
+                    VideoError::Container(String::from("MP4 decode timeline exceeds i64 ticks"))
                 })?;
         }
     }
@@ -548,14 +669,11 @@ fn index_progressive_samples(track: &mp4::Mp4Track) -> Result<IndexedTrackSample
                         "MP4 ctts declares more samples than the sample table",
                     ))
                 })?;
-                meta.presentation_time = meta
-                    .decode_time
-                    .checked_add_signed(offset)
-                    .ok_or_else(|| {
-                        VideoError::Container(format!(
-                            "MP4 sample {sample_index} has a negative or overflowing presentation timestamp"
-                        ))
-                    })?;
+                meta.presentation_time = meta.decode_time.checked_add(offset).ok_or_else(|| {
+                    VideoError::Container(format!(
+                        "MP4 sample {sample_index} has an overflowing presentation timestamp"
+                    ))
+                })?;
                 sample_index = sample_index.saturating_add(1);
             }
         }
@@ -681,7 +799,7 @@ fn index_fragment_samples(
     let mut locations = stbl_sample_locations(track)?;
     let mut next_decode_time = metas
         .last()
-        .map(|meta| meta.decode_time + u64::from(meta.duration));
+        .map(|meta| meta.decode_time + i64::from(meta.duration));
     for span in spans.iter().filter(|span| span.kind == *b"moof") {
         let fragment = MovieFragmentBox::parse_body(&read_span_body(&mut file, span)?)
             .map_err(|error| VideoError::Container(error.to_string()))?;
@@ -729,7 +847,7 @@ fn index_fragment_samples(
 struct IndexedTrafSamples {
     samples: Vec<IndexedSample>,
     data_end: Option<u64>,
-    next_decode_time: u64,
+    next_decode_time: i64,
 }
 
 struct IndexedSample {
@@ -798,13 +916,18 @@ fn collect_traf_samples(
     extends: &transmux::MovieExtendsBox,
     defaults: &TrackExtendsBox,
     base_data_offset: u64,
-    next_decode_time: Option<u64>,
+    next_decode_time: Option<i64>,
     file_len: u64,
 ) -> Result<IndexedTrafSamples, VideoError> {
     let mut decode_time = traf
         .tfdt
         .as_ref()
-        .map(transmux::TrackFragmentBaseMediaDecodeTimeBox::base_media_decode_time)
+        .map(|tfdt| {
+            i64::try_from(tfdt.base_media_decode_time()).map_err(|_| {
+                VideoError::Container(String::from("fragment decode time exceeds i64 ticks"))
+            })
+        })
+        .transpose()?
         .or(next_decode_time)
         .unwrap_or(0);
     let default_duration = traf
@@ -846,10 +969,10 @@ fn collect_traf_samples(
                 )));
             }
             let presentation_time = decode_time
-                .checked_add_signed(sample.sample_composition_time_offset.unwrap_or(0))
+                .checked_add(sample.sample_composition_time_offset.unwrap_or(0))
                 .ok_or_else(|| {
                     VideoError::Container(String::from(
-                        "fragmented sample has a negative or overflowing presentation timestamp",
+                        "fragmented sample has an overflowing presentation timestamp",
                     ))
                 })?;
             samples.push(IndexedSample {
@@ -866,10 +989,10 @@ fn collect_traf_samples(
             });
             data_offset = data_end;
             decode_time = decode_time
-                .checked_add(u64::from(duration))
+                .checked_add(i64::from(duration))
                 .ok_or_else(|| {
                     VideoError::Container(String::from(
-                        "fragmented decode timeline exceeds u64 ticks",
+                        "fragmented decode timeline exceeds i64 ticks",
                     ))
                 })?;
         }
@@ -1591,7 +1714,7 @@ mod tests {
         assert_eq!(reader.duration(), Some(std::time::Duration::from_secs(56)));
 
         let expected = [
-            (48_000_u64, 50_000_u64, 1_000_u32, false, 0xA0_u8),
+            (48_000_i64, 50_000_i64, 1_000_u32, false, 0xA0_u8),
             (49_000, 49_000, 1_000, true, 0xA1),
             (50_000, 50_000, 1_500, true, 0xB0),
             (51_500, 51_500, 1_500, false, 0xB1),
@@ -1639,7 +1762,7 @@ mod tests {
         let mut reader = VideoReader::open(file.path()).expect("fragmented file must open");
 
         assert_eq!(reader.sample_count(), 2);
-        let expected = [(3_000_u64, true, 0xD0_u8), (3_900, false, 0xD1)];
+        let expected = [(3_000_i64, true, 0xD0_u8), (3_900, false, 0xD1)];
         for (index, &(pts, is_keyframe, byte)) in expected.iter().enumerate() {
             let (meta_pts, meta_duration, meta_keyframe) = reader
                 .sample_info(index)
@@ -1678,7 +1801,7 @@ mod tests {
         let mut reader = VideoReader::open(file.path()).expect("progressive file must open");
         assert_eq!(reader.sample_count(), 3);
         let expected = [
-            (0_u64, 1_000_u32, true, 0xE0_u8),
+            (0_i64, 1_000_u32, true, 0xE0_u8),
             (1_500, 1_000, false, 0xE1),
             (3_000, 1_000, false, 0xE2),
         ];
@@ -1709,7 +1832,7 @@ mod tests {
         // traf resets to 5000 via tfdt, and its second traf continues the
         // decode timeline while its bytes chain inside the same mdat.
         let expected = [
-            (0_u64, 0_u64, 1_000_u32, true, 0xF0_u8),
+            (0_i64, 0_i64, 1_000_u32, true, 0xF0_u8),
             (5_000, 5_000, 1_000, false, 0xF1),
             (6_000, 6_000, 1_000, true, 0xF2),
         ];
@@ -1738,7 +1861,7 @@ mod tests {
         let mut reader = VideoReader::open(file.path()).expect("fragmented file must open");
 
         assert_eq!(reader.sample_count(), 2);
-        let expected = [(0_u64, true, 0xE8_u8), (1_000, true, 0xE9)];
+        let expected = [(0_i64, true, 0xE8_u8), (1_000, true, 0xE9)];
         for (index, &(pts, is_keyframe, byte)) in expected.iter().enumerate() {
             let (meta_pts, meta_duration, meta_keyframe) = reader
                 .sample_info(index)
@@ -1764,7 +1887,7 @@ mod tests {
         assert_eq!(reader.sample_count(), 2);
         // Version 0 trun stores an unsigned u32 (0x8000_0000 widens to
         // 2147483648, not a negative offset); version 1 stores a signed i32.
-        let expected = [(2_147_484_648_u64, 0xC7_u8), (1_450, 0xC8)];
+        let expected = [(2_147_484_648_i64, 0xC7_u8), (1_450, 0xC8)];
         for (index, &(pts, byte)) in expected.iter().enumerate() {
             let (meta_pts, _, _) = reader
                 .sample_info(index)

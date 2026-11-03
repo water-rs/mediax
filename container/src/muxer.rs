@@ -27,11 +27,8 @@ use transmux::{
     StscEntry, SttsEntry, SyncSampleBox, TimeToSampleBox, TrackSpec, build_init_segment,
 };
 
+use crate::demuxer::EMPTY_EDIT;
 use crate::stream::{Codec, EncodedSample, TrackId, TrackInfo, TrackKind};
-
-/// Ticks per second of the movie header; track timelines keep their own
-/// timescales.
-const MOVIE_TIMESCALE: u32 = 1_000;
 
 /// `mdat` header: `size == 1` marks a 64-bit `largesize`, patched by
 /// [`Muxer::finish`] once the payload length is known.
@@ -39,9 +36,6 @@ const MDAT_HEADER_LEN: u64 = 16;
 
 /// Offset of the `largesize` field inside the `mdat` header.
 const MDAT_LARGESIZE_OFFSET: u64 = 8;
-
-/// `elst` `media_time` of an empty edit.
-const EMPTY_EDIT: i64 = -1;
 
 /// ISO/IEC 14496-1 object type indication of MPEG-4 audio.
 const OBJECT_TYPE_MPEG4_AUDIO: u8 = 0x40;
@@ -263,6 +257,23 @@ impl<W: Write + Seek> Muxer<W> {
         Ok(self.out)
     }
 
+    /// Ticks per second of the movie header: the least common multiple of the
+    /// track timescales, so an edit list expresses every track's start
+    /// exactly. Track timelines keep their own timescales.
+    fn movie_timescale(&self) -> Result<u32, Error> {
+        self.tracks
+            .values()
+            .try_fold(1_u32, |movie, track| {
+                let timescale = track.info.timescale().get();
+                (movie / gcd(movie, timescale)).checked_mul(timescale)
+            })
+            .ok_or_else(|| {
+                Error::Unsupported(String::from(
+                    "the track timescales have no common movie timescale that fits u32",
+                ))
+            })
+    }
+
     fn moov(&self) -> Result<Vec<u8>, Error> {
         if self.tracks.is_empty() {
             return Err(Error::Container(String::from(
@@ -274,14 +285,10 @@ impl<W: Write + Seek> Muxer<W> {
             .values()
             .map(MuxTrack::span)
             .collect::<Result<Vec<_>, _>>()?;
-        let movie_start = spans
-            .iter()
-            .map(|span| span.movie_start)
-            .min()
-            .unwrap_or_default();
+        let movie_timescale = self.movie_timescale()?;
 
         let specs: Vec<TrackSpec> = self.tracks.values().map(|t| t.spec.clone()).collect();
-        let init = build_init_segment(&specs, MOVIE_TIMESCALE).map_err(container_error)?;
+        let init = build_init_segment(&specs, movie_timescale).map_err(container_error)?;
         let mut moov = box_iter(&init)
             .scan(0_usize, |offset, step| {
                 let start = *offset;
@@ -300,7 +307,7 @@ impl<W: Write + Seek> Muxer<W> {
 
         let mut movie_duration = 0;
         for ((trak, track), span) in moov.tracks.iter_mut().zip(self.tracks.values()).zip(&spans) {
-            let presentation = span.presentation(movie_start)?;
+            let presentation = span.presentation(movie_timescale)?;
             movie_duration = movie_duration.max(presentation.duration);
             trak.tkhd.version = header_version(presentation.duration);
             trak.tkhd.duration = presentation.duration;
@@ -381,8 +388,6 @@ struct TrackSpan {
     /// `stts` deltas, one per sample.
     deltas: Vec<u32>,
     media_duration: u64,
-    /// `start` on the movie timeline.
-    movie_start: i64,
 }
 
 /// A track's placement on the movie timeline.
@@ -475,7 +480,6 @@ impl MuxTrack {
             end,
             media_duration: deltas.iter().map(|&delta| u64::from(delta)).sum(),
             deltas,
-            movie_start: rescale(start, timescale, MOVIE_TIMESCALE)?,
         })
     }
 
@@ -624,25 +628,30 @@ impl MuxTrack {
 }
 
 impl TrackSpan {
-    /// Places the track on the movie timeline that starts at `movie_start`.
+    /// Places the track on the movie timeline, which starts at zero and ticks
+    /// at `movie_timescale`.
     ///
     /// A late start becomes an empty edit and a composition lead-in (the
     /// presentation of the first sample after its decode time) becomes the
-    /// start of the media edit.
-    fn presentation(&self, movie_start: i64) -> Result<Presentation, Error> {
-        let empty = u64::try_from(self.movie_start - movie_start)
+    /// start of the media edit. Samples presenting before zero are pre-roll:
+    /// they are decoded but the edit starts at the media time that presents
+    /// at zero.
+    fn presentation(&self, movie_timescale: u32) -> Result<Presentation, Error> {
+        let shown = self.start.max(0);
+        let empty = u64::try_from(rescale(shown, self.timescale, movie_timescale)?)
             .map_err(|_| Error::Container(String::from("track starts before the movie")))?;
-        let media_time = self.start - self.first_decode;
+        let media_time = shown - self.first_decode;
         if empty == 0 && media_time == 0 {
             return Ok(Presentation {
-                duration: rescale_unsigned(self.media_duration, self.timescale)?,
+                duration: rescale_unsigned(self.media_duration, self.timescale, movie_timescale)?,
                 edits: None,
             });
         }
         let segment = rescale_unsigned(
-            u64::try_from(self.end - self.start)
+            u64::try_from(self.end - shown)
                 .map_err(|_| Error::Container(String::from("track ends before it starts")))?,
             self.timescale,
+            movie_timescale,
         )?;
         let mut entries = Vec::with_capacity(2);
         if empty > 0 {
@@ -885,10 +894,17 @@ fn rescale(ticks: i64, from: u32, to: u32) -> Result<i64, Error> {
         .map_err(|_| Error::Container(String::from("timestamp exceeds the movie timeline")))
 }
 
-fn rescale_unsigned(ticks: u64, timescale: u32) -> Result<u64, Error> {
-    let scaled = u128::from(ticks) * u128::from(MOVIE_TIMESCALE) / u128::from(timescale);
+fn rescale_unsigned(ticks: u64, from: u32, to: u32) -> Result<u64, Error> {
+    let scaled = u128::from(ticks) * u128::from(to) / u128::from(from);
     u64::try_from(scaled)
         .map_err(|_| Error::Container(String::from("duration exceeds the movie timeline")))
+}
+
+const fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }
 
 fn count_u32(count: usize) -> Result<u32, Error> {
