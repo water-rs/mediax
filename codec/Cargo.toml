@@ -88,12 +88,12 @@ jni.workspace = true
 ndk-context.workspace = true
 
 # VA-API is loaded with `dlopen` so a host without libva still builds and runs.
-# The encoder's tests also run against a mock driver on other hosts, which need
+# The encoder's tests also run against a mock driver on other unix hosts, which need
 # the loader as a dev-dependency.
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = { version = "0.9", default-features = false }
 
-[target.'cfg(not(target_os = "linux"))'.dev-dependencies]
+[target.'cfg(all(unix, not(target_os = "linux")))'.dev-dependencies]
 libloading = { version = "0.9", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]

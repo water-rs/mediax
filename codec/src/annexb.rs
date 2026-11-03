@@ -52,6 +52,12 @@ pub fn annex_b_nalus(data: &[u8]) -> Vec<(usize, usize)> {
 }
 
 /// Rewrites a length-prefixed access unit with start codes.
+#[cfg(any(
+    test,
+    mediax_hw_codec_apple,
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows
+))]
 pub fn length_prefixed_to_annex_b(
     sample: &[u8],
     nal_length_size: usize,
