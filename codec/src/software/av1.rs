@@ -92,11 +92,7 @@ const REALTIME_TILES_PER_THREAD: usize = 4;
 fn encoder_threads() -> Result<usize, CodecError> {
     std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
-        .map_err(|e| {
-            CodecError::InitializationFailed(format!(
-                "cannot size the AV1 encoder's thread pool: {e}"
-            ))
-        })
+        .map_err(|e| CodecError::InitializationFailed(e.to_string()))
 }
 
 /// rav1e takes its rate as an `i32` of bits per second.
