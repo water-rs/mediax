@@ -12,7 +12,6 @@ categories = ["multimedia::video", "parser-implementations"]
 
 [dependencies]
 mediax-core.workspace = true
-byteorder.workspace = true
 mp4.workspace = true
 bytes.workspace = true
 broadcast-common.workspace = true
@@ -21,6 +20,10 @@ quick-xml.workspace = true
 subtp.workspace = true
 
 [dev-dependencies]
+# Real encoded samples at test time: hardware H.264/H.265 where the host has
+# them, software AV1 everywhere.
+mediax-codec = { workspace = true, features = ["software-encode"] }
+hex.workspace = true
 tempfile = "3"
 
 [lints]

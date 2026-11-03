@@ -221,6 +221,69 @@ pub struct TrackInfo {
 }
 
 impl TrackInfo {
+    /// Describes a video track.
+    ///
+    /// `decoder_configuration` is the codec's configuration record (`avcC`,
+    /// `hvcC` or `av1C`), with or without its ISO BMFF box header.
+    #[must_use]
+    pub const fn video(
+        id: TrackId,
+        codec: Codec,
+        timescale: NonZeroU32,
+        decoder_configuration: Bytes,
+        dimensions: VideoDimensions,
+        color: VideoColorInfo,
+    ) -> Self {
+        Self {
+            id,
+            kind: TrackKind::Video,
+            timescale,
+            codec,
+            decoder_configuration,
+            video_dimensions: Some(dimensions),
+            video_color_info: Some(color),
+            audio_layout: None,
+            source_pid: None,
+            protection: None,
+        }
+    }
+
+    /// Describes an audio track.
+    ///
+    /// `decoder_configuration` is the raw `AudioSpecificConfig` for AAC.
+    #[must_use]
+    pub const fn audio(
+        id: TrackId,
+        codec: Codec,
+        timescale: NonZeroU32,
+        decoder_configuration: Bytes,
+        layout: AudioLayout,
+    ) -> Self {
+        Self {
+            id,
+            kind: TrackKind::Audio,
+            timescale,
+            codec,
+            decoder_configuration,
+            video_dimensions: None,
+            video_color_info: None,
+            audio_layout: Some(layout),
+            source_pid: None,
+            protection: None,
+        }
+    }
+
+    /// Replaces the color description of a video track.
+    ///
+    /// A demuxed track carries the conventional default for its height;
+    /// [`probe_mp4_color_info`](crate::probe_mp4_color_info) reads what the
+    /// file actually signals.
+    #[must_use]
+    pub const fn with_video_color_info(mut self, color: VideoColorInfo) -> Self {
+        self.video_color_info = Some(color);
+        self
+    }
+
     /// Rebinds this descriptor to a presentation-wide track identity.
     ///
     /// Segmented formats such as DASH may place independently numbered tracks
