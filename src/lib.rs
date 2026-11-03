@@ -22,11 +22,11 @@ pub use mediax_codec as codec;
 pub use mediax_container as container;
 #[cfg(feature = "container")]
 pub use mediax_container::{
-    EmbeddedSubtitleCodec, EmbeddedSubtitleCue, EmbeddedSubtitleTrack, MuxerCodecType, SubtitleCue,
-    TimedMetadata, VideoFormat, VideoReader, VideoWriter, active_subtitle_text,
-    decode_cmaf_subtitle_sample, embedded_subtitle_tracks, parse_hls_webvtt_segment,
-    parse_subrip_document, parse_subtitles_from_path, parse_ttml_document, parse_webvtt_document,
-    probe_mp4_color_info, read_embedded_subtitle_cues,
+    ContainerFormat, EmbeddedSubtitleCodec, EmbeddedSubtitleCue, EmbeddedSubtitleTrack, Muxer,
+    SubtitleCue, TimedMetadata, VideoReader, active_subtitle_text, decode_cmaf_subtitle_sample,
+    embedded_subtitle_tracks, parse_hls_webvtt_segment, parse_subrip_document,
+    parse_subtitles_from_path, parse_ttml_document, parse_webvtt_document, probe_mp4_color_info,
+    read_embedded_subtitle_cues,
 };
 
 #[cfg(feature = "streaming")]

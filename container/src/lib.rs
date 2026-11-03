@@ -22,7 +22,7 @@ pub use mediax_core::{
     CommonEncryptionScheme, EncryptionSubsample, Error, ProtectionInitData, SampleEncryption,
     TrackProtection,
 };
-pub use muxer::{CodecType as MuxerCodecType, VideoFormat, VideoWriter};
+pub use muxer::{ContainerFormat, Muxer};
 pub use progressive::{ProgressiveTrack, ProgressiveTrackReader};
 pub use stream::{
     AudioLayout, CmafChunkDemuxer, CmafDemuxer, CmafInitialization, CmafMediaSegment, Codec,
