@@ -147,9 +147,18 @@ impl Av1Encoder {
                         .frames_in(interval)
                         .min(MAX_KEY_FRAME_INTERVAL)
                 });
+        let threads = if realtime {
+            std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
+        } else {
+            4
+        };
         let settings = EncoderConfig {
             width,
             height,
+            // In low-latency mode rav1e parallelises a frame only across its
+            // tiles, so a realtime frame gets one tile per thread; offline
+            // encoding keeps rav1e's own tiling.
+            tiles: if realtime { threads } else { 0 },
             bit_depth: 8,
             chroma_sampling: ChromaSampling::Cs420,
             time_base: Rational::new(
@@ -173,11 +182,6 @@ impl Av1Encoder {
             }),
             mastering_display: None,
             ..Default::default()
-        };
-        let threads = if realtime {
-            std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
-        } else {
-            4
         };
         let ctx = Config::new()
             .with_encoder_config(settings.clone())
@@ -883,7 +887,7 @@ mod encoder_tests {
         tracing::info!(
             median = ?latencies[latencies.len() / 2],
             max = ?latencies[latencies.len() - 1],
-            "AV1 rav1e 320x240 Realtime latency (dev profile)"
+            "AV1 rav1e 320x240 Realtime latency"
         );
     }
 
