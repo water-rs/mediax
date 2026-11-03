@@ -138,7 +138,8 @@ fn encode(codec: EncoderCodec) -> Option<EncodedVideo> {
         let options = FrameOptions {
             keyframe: index == 0 || index == FRAMES / 2,
         };
-        for packet in encoder.encode_nv12(&nv12_frame(index), options) {
+        let presentation_time = std::time::Duration::from_secs(index as u64) / 30;
+        for packet in encoder.encode_nv12(&nv12_frame(index), presentation_time, options) {
             packets.push(packet.expect("encode frame"));
         }
     }
@@ -621,7 +622,8 @@ fn late_audio_start_becomes_an_empty_edit() {
         .entries;
     assert_eq!(edits.len(), 2);
     assert_eq!(
-        edits[0].segment_duration, 500,
+        edits[0].segment_duration * 2,
+        u64::from(reader.moov.mvhd.timescale),
         "half a second in movie ticks"
     );
     assert_eq!(edits[1].media_time, 0);
@@ -629,6 +631,200 @@ fn late_audio_start_becomes_an_empty_edit() {
         reader.tracks()[&1].trak.edts.is_none(),
         "the track that starts the movie needs no edit"
     );
+}
+
+/// `samples` moved by `ticks` on both clocks.
+fn shifted(samples: &[EncodedSample], ticks: i64) -> Vec<EncodedSample> {
+    samples
+        .iter()
+        .map(|sample| {
+            let moved = |at: MediaTime| time(at.ticks() + ticks, at.timescale().get());
+            EncodedSample::new(
+                sample.track_id(),
+                moved(sample.decode_time()),
+                moved(sample.presentation_time()),
+                sample.duration(),
+                sample.is_keyframe(),
+                sample.data().clone(),
+            )
+        })
+        .collect()
+}
+
+/// Reads back what `write` stored: every video and audio track's samples.
+fn read_all(path: &Path) -> Vec<Vec<EncodedSample>> {
+    let mut tracks = read(path, TrackKind::Video);
+    tracks.extend(read(path, TrackKind::Audio));
+    tracks.into_iter().map(|(_, samples)| samples).collect()
+}
+
+#[test]
+fn negative_decode_offsets_read_back_as_written() {
+    let video = av1();
+    let file = output("negative-decode.mp4");
+    // A reordering encoder: the first sample decodes a frame before the
+    // presentation starts at zero.
+    let samples = shifted(&video.samples(1, Some([0, 3, 1, 2]), 1), -FRAME_TICKS);
+    assert_eq!(samples[0].decode_time().ticks(), -FRAME_TICKS);
+    assert_eq!(samples[0].presentation_time().ticks(), 0);
+    write(
+        &file.path,
+        ContainerFormat::Mp4,
+        vec![(video.track(1, bt709()), samples.clone())],
+    );
+    let (_, read_back) = read(&file.path, TrackKind::Video).remove(0);
+    assert_samples(&read_back, &samples);
+}
+
+#[test]
+fn late_audio_start_reads_back_as_written() {
+    let video = av1();
+    let file = output("late-audio-read.mp4");
+    let video_samples = video.samples(1, None, 0);
+    let audio_samples = aac_samples(2, i64::from(AAC_SAMPLE_RATE) / 2);
+    write(
+        &file.path,
+        ContainerFormat::Mp4,
+        vec![
+            (video.track(1, bt709()), video_samples.clone()),
+            (aac_track(2), audio_samples.clone()),
+        ],
+    );
+    let tracks = read_all(&file.path);
+    assert_samples(&tracks[0], &video_samples);
+    assert_samples(&tracks[1], &audio_samples);
+}
+
+#[test]
+fn pre_roll_before_zero_reads_back_as_written() {
+    let video = av1();
+    let file = output("pre-roll.mp4");
+    // Encoder priming: the first AAC packet presents one frame before zero,
+    // and the reordered video decodes a frame before it presents at zero.
+    let video_samples = shifted(&video.samples(1, Some([0, 3, 1, 2]), 1), -FRAME_TICKS);
+    let audio_samples = aac_samples(2, -AAC_FRAME_TICKS);
+    assert_eq!(
+        audio_samples[0].presentation_time().ticks(),
+        -AAC_FRAME_TICKS
+    );
+    write(
+        &file.path,
+        ContainerFormat::Mp4,
+        vec![
+            (video.track(1, bt709()), video_samples.clone()),
+            (aac_track(2), audio_samples.clone()),
+        ],
+    );
+    let tracks = read_all(&file.path);
+    assert_samples(&tracks[0], &video_samples);
+    assert_samples(&tracks[1], &audio_samples);
+}
+
+/// Replaces the edit list of the `track`th track of the file at `path`,
+/// whose `moov` is its last box, with the entries `edits` builds from the
+/// movie timescale.
+fn replace_edits(path: &Path, track: usize, edits: impl FnOnce(u32) -> Vec<EditListEntry>) {
+    let mut bytes = std::fs::read(path).expect("read file");
+    let movie_span = crate::isobmff::scan_top_level_boxes(path)
+        .expect("scan boxes")
+        .into_iter()
+        .find(|span| span.kind == *b"moov")
+        .expect("moov box");
+    let offset = usize::try_from(movie_span.offset).expect("offset fits usize");
+    let mut movie = MovieBox::parse(&bytes[offset..]).expect("parse moov");
+    movie.tracks[track].edts = Some(EditBox::new(
+        Some(EditListBox {
+            version: 0,
+            flags: 0,
+            entries: edits(movie.mvhd.timescale),
+        }),
+        Vec::new(),
+    ));
+    bytes.truncate(offset);
+    let mut moov = vec![0; movie.serialized_len()];
+    let written = movie.serialize_into(&mut moov).expect("serialize moov");
+    bytes.extend_from_slice(&moov[..written]);
+    std::fs::write(path, bytes).expect("write file");
+}
+
+const fn edit(segment_duration: u64, media_time: i64, rate: i16, fraction: i16) -> EditListEntry {
+    EditListEntry {
+        segment_duration,
+        media_time,
+        media_rate_integer: rate,
+        media_rate_fraction: fraction,
+    }
+}
+
+/// A one-track file of samples that start at zero, without edits.
+fn plain_video(name: &str) -> (Output, Vec<EncodedSample>) {
+    let video = av1();
+    let file = output(name);
+    let samples = video.samples(1, None, 0);
+    write(
+        &file.path,
+        ContainerFormat::Mp4,
+        vec![(video.track(1, bt709()), samples.clone())],
+    );
+    (file, samples)
+}
+
+#[test]
+fn a_single_edit_from_another_muxer_moves_the_timeline() {
+    // The shape ffmpeg and AVFoundation write for a reordering encoder: one
+    // edit that starts two frames into the media.
+    let (file, samples) = plain_video("single-edit.mp4");
+    replace_edits(&file.path, 0, |movie| {
+        vec![edit(u64::from(movie), 2 * FRAME_TICKS, 1, 0)]
+    });
+    let (_, read_back) = read(&file.path, TrackKind::Video).remove(0);
+    assert_samples(&read_back, &shifted(&samples, -2 * FRAME_TICKS));
+}
+
+#[test]
+fn a_leading_empty_edit_delays_the_track() {
+    let (file, samples) = plain_video("empty-edit.mp4");
+    // Half a second of nothing, then the media from its second frame.
+    replace_edits(&file.path, 0, |movie| {
+        vec![
+            edit(u64::from(movie) / 4, EMPTY_EDIT, 1, 0),
+            edit(u64::from(movie), FRAME_TICKS, 1, 0),
+        ]
+    });
+    let (_, read_back) = read(&file.path, TrackKind::Video).remove(0);
+    let delay = i64::from(VIDEO_TIMESCALE) / 4;
+    assert_samples(&read_back, &shifted(&samples, delay - FRAME_TICKS));
+}
+
+#[test]
+fn unreadable_edit_lists_are_errors() {
+    type Edits = fn(u64) -> Vec<EditListEntry>;
+    let cases: [(&str, Edits); 5] = [
+        ("two media edits", |movie| {
+            vec![edit(movie, 0, 1, 0), edit(movie, 0, 1, 0)]
+        }),
+        ("rate two", |movie| vec![edit(movie, 0, 2, 0)]),
+        ("fractional rate", |movie| vec![edit(movie, 0, 1, 0x4000)]),
+        ("only an empty edit", |movie| {
+            vec![edit(movie, EMPTY_EDIT, 1, 0)]
+        }),
+        ("an empty edit after the media", |movie| {
+            vec![edit(movie, 0, 1, 0), edit(movie, EMPTY_EDIT, 1, 0)]
+        }),
+    ];
+    for (name, entries) in cases {
+        let (file, _) = plain_video("bad-edit.mp4");
+        replace_edits(&file.path, 0, |movie| entries(u64::from(movie)));
+        for result in [
+            ProgressiveTrackReader::open(&file.path, TrackKind::Video).map(|_| ()),
+            crate::VideoReader::open(&file.path).map(|_| ()),
+        ] {
+            assert!(
+                matches!(result, Err(Error::Unsupported(_))),
+                "{name}: {result:?}"
+            );
+        }
+    }
 }
 
 /// A file read through the demuxer and written back sample for sample keeps

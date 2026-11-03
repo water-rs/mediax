@@ -36,6 +36,11 @@ const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 const FPS: u32 = 30;
 
+/// The presentation time of frame `index` at [`FPS`].
+fn frame_time(index: usize) -> Duration {
+    Duration::from_secs(index as u64) / FPS
+}
+
 fn nz(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).expect("test value is non-zero")
 }
@@ -192,7 +197,14 @@ fn realtime_nv12_keyframe_request_yields_an_idr_on_that_frame() {
         let frame = nv12_frame(WIDTH, HEIGHT, index);
         let keyframe = index == 30;
         let started = Instant::now();
-        let packet = one_packet(encoder.encode_nv12(&frame, FrameOptions { keyframe }));
+        let packet =
+            one_packet(encoder.encode_nv12(&frame, frame_time(index), FrameOptions { keyframe }));
+        assert_eq!(packet.presentation_time, frame_time(index));
+        assert_eq!(
+            packet.decode_time_nanos,
+            i64::try_from(frame_time(index).as_nanos()).unwrap(),
+            "realtime decodes each frame at its presentation time"
+        );
         latencies.push(started.elapsed());
 
         let types = nal_types(&packet, false);
@@ -210,6 +222,47 @@ fn realtime_nv12_keyframe_request_yields_an_idr_on_that_frame() {
         }
     }
     report_latency("H.264 NV12 1280x720 Realtime 2 Mbps", &mut latencies);
+}
+
+/// The offline profile lets `VideoToolbox` reorder frames: packets leave in
+/// decode order, each carrying its own frame's presentation time, and decode
+/// times advance one step per packet.
+#[test]
+fn offline_profile_reorders_and_packets_carry_their_frames_times() {
+    let mut settings = config(h264(BitstreamFormat::LengthPrefixed), 640, 360, 1_500_000);
+    settings.profile = EncoderProfile::Offline;
+    let mut encoder = Encoder::new(settings).expect("encoder");
+    let frames = 30;
+    let mut packets = Vec::new();
+    for index in 0..frames {
+        let frame = nv12_frame(640, 360, index);
+        for packet in encoder.encode_nv12(&frame, frame_time(index), FrameOptions::default()) {
+            packets.push(packet.expect("encode succeeds"));
+        }
+    }
+    packets.extend(encoder.flush().expect("flush"));
+
+    let mut presented: Vec<_> = packets
+        .iter()
+        .map(|packet| packet.presentation_time)
+        .collect();
+    assert!(
+        presented.windows(2).any(|pair| pair[1] < pair[0]),
+        "B-frames put some packet ahead of an earlier-presented one"
+    );
+    presented.sort();
+    let expected: Vec<_> = (0..frames).map(frame_time).collect();
+    assert_eq!(
+        presented, expected,
+        "every frame comes out once, with its time"
+    );
+    assert!(
+        packets
+            .windows(2)
+            .all(|pair| pair[0].decode_time_nanos < pair[1].decode_time_nanos),
+        "decode time advances"
+    );
+    assert!(packets[0].keyframe);
 }
 
 #[test]
@@ -233,10 +286,17 @@ fn set_bitrate_mid_stream_is_accepted() {
             let frame = nv12_frame(WIDTH, HEIGHT, phase * 45 + index);
             // At a starved rate the low-latency controller may skip a frame.
             let packets = encoder
-                .encode_nv12(&frame, FrameOptions::default())
+                .encode_nv12(
+                    &frame,
+                    frame_time(phase * 45 + index),
+                    FrameOptions::default(),
+                )
                 .collect::<Result<Vec<_>, _>>()
                 .expect("encode succeeds");
             assert!(packets.len() <= 1, "at most one packet per frame");
+            for packet in &packets {
+                assert_eq!(packet.presentation_time, frame_time(phase * 45 + index));
+            }
             dropped[phase] += 1 - packets.len();
             bytes[phase] += packets
                 .iter()
@@ -267,7 +327,12 @@ fn bgra_pixel_buffer_sequence_encodes_with_keyframe_on_request() {
         let buffer = bgra_buffer(960, 540, index);
         let keyframe = index == 20;
         let started = Instant::now();
-        let packet = one_packet(encoder.encode_pixel_buffer(&buffer, FrameOptions { keyframe }));
+        let packet = one_packet(encoder.encode_pixel_buffer(
+            &buffer,
+            frame_time(index),
+            FrameOptions { keyframe },
+        ));
+        assert_eq!(packet.presentation_time, frame_time(index));
         latencies.push(started.elapsed());
         let is_idr = nal_types(&packet, false).contains(&5);
         assert_eq!(is_idr, index == 0 || keyframe, "frame {index}");
@@ -285,7 +350,7 @@ fn pixel_buffer_of_another_size_is_rejected() {
         Encoder::new(config(h264(BitstreamFormat::AnnexB), 640, 360, 1_000_000)).expect("encoder");
     let buffer = bgra_buffer(320, 180, 0);
     let result = encoder
-        .encode_pixel_buffer(&buffer, FrameOptions::default())
+        .encode_pixel_buffer(&buffer, Duration::ZERO, FrameOptions::default())
         .next()
         .expect("an error is yielded");
     assert!(
@@ -300,9 +365,11 @@ fn decode_round_trip(codec: EncoderCodec, codec_type: CodecType, hevc: bool) {
     let mut packets = Vec::new();
     for index in 0..frames {
         let frame = nv12_frame(width, height, index);
-        packets.push(one_packet(
-            encoder.encode_nv12(&frame, FrameOptions::default()),
-        ));
+        packets.push(one_packet(encoder.encode_nv12(
+            &frame,
+            frame_time(index),
+            FrameOptions::default(),
+        )));
     }
     let record = encoder
         .codec_config()
@@ -355,6 +422,7 @@ fn hevc_annex_b_keyframe_leads_with_vps_sps_pps() {
         let frame = nv12_frame(640, 360, index);
         let packet = one_packet(encoder.encode_nv12(
             &frame,
+            frame_time(index),
             FrameOptions {
                 keyframe: index == 5,
             },
@@ -378,14 +446,22 @@ fn length_prefixed_output_has_no_start_codes_and_flags_keyframes() {
         1_000_000,
     ))
     .expect("encoder");
-    let first = one_packet(encoder.encode_nv12(&nv12_frame(640, 360, 0), FrameOptions::default()));
+    let first = one_packet(encoder.encode_nv12(
+        &nv12_frame(640, 360, 0),
+        frame_time(0),
+        FrameOptions::default(),
+    ));
     assert!(first.keyframe);
     let length = u32::from_be_bytes(first.data[..4].try_into().unwrap()) as usize;
     assert!(
         length + 4 <= first.data.len(),
         "first NAL length fits the sample"
     );
-    let second = one_packet(encoder.encode_nv12(&nv12_frame(640, 360, 1), FrameOptions::default()));
+    let second = one_packet(encoder.encode_nv12(
+        &nv12_frame(640, 360, 1),
+        frame_time(1),
+        FrameOptions::default(),
+    ));
     assert!(!second.keyframe);
 }
 
@@ -404,8 +480,11 @@ fn requested_h264_profile_and_level_reach_the_sps() {
         };
         let mut encoder = Encoder::new(config(EncoderCodec::H264(settings), 640, 360, 1_000_000))
             .expect("encoder");
-        let packet =
-            one_packet(encoder.encode_nv12(&nv12_frame(640, 360, 0), FrameOptions::default()));
+        let packet = one_packet(encoder.encode_nv12(
+            &nv12_frame(640, 360, 0),
+            frame_time(0),
+            FrameOptions::default(),
+        ));
         let (start, _) = annex_b_nalus(&packet.data)[0];
         // SPS NAL: header, profile_idc, constraint flags, level_idc.
         let sps = &packet.data[start..start + 4];
@@ -471,7 +550,8 @@ fn jpeg_decodes_to_a_pixel_buffer_the_encoder_takes() {
     let mut encoder =
         Encoder::new(config(h264(BitstreamFormat::AnnexB), 640, 480, 2_000_000)).expect("encoder");
     let started = Instant::now();
-    let packet = one_packet(encoder.encode_pixel_buffer(&buffer, FrameOptions::default()));
+    let packet =
+        one_packet(encoder.encode_pixel_buffer(&buffer, frame_time(0), FrameOptions::default()));
     crate::init_test_tracing();
     tracing::info!(
         ?decode,

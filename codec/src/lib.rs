@@ -980,19 +980,29 @@ impl Encoder {
 
     /// Encode a frame from NV12 data.
     ///
-    /// `options.keyframe` makes this frame an IDR (a random access point).
-    /// Returns a streaming iterator yielding the finished packets.
-    pub fn encode_nv12(&mut self, data: &[u8], options: FrameOptions) -> EncodeStream {
-        EncodeStream::new(self.encode_nv12_inner(data, options))
+    /// `presentation_time` is the frame's presentation time; the packet that
+    /// encodes it reports the same time (see [`EncodedPacket`]). A frame the
+    /// encoder drops yields no packet. `options.keyframe` makes this frame an
+    /// IDR (a random access point). Returns a streaming iterator yielding the
+    /// packets finished by this call, which with a reordering or lookahead
+    /// encoder belong to earlier frames than the one submitted.
+    pub fn encode_nv12(
+        &mut self,
+        data: &[u8],
+        presentation_time: Duration,
+        options: FrameOptions,
+    ) -> EncodeStream {
+        EncodeStream::new(self.encode_nv12_inner(data, presentation_time, options))
     }
 
     #[cfg(not(any(mediax_hw_codec, mediax_hw_codec_vaapi, mediax_av1_software_encode)))]
     fn encode_nv12_inner(
         &self,
         data: &[u8],
+        presentation_time: Duration,
         options: FrameOptions,
     ) -> Result<Vec<EncodedPacket>, CodecError> {
-        let _ = (data, options);
+        let _ = (data, presentation_time, options);
         match self.inner {
             #[cfg(target_arch = "wasm32")]
             EncoderInner::Unsupported => Err(CodecError::Unsupported(String::from(
@@ -1005,23 +1015,24 @@ impl Encoder {
     fn encode_nv12_inner(
         &mut self,
         data: &[u8],
+        presentation_time: Duration,
         options: FrameOptions,
     ) -> Result<Vec<EncodedPacket>, CodecError> {
         match self.inner {
             #[cfg(mediax_hw_codec_apple)]
-            EncoderInner::Apple(ref mut enc) => enc.encode_nv12(data, options),
+            EncoderInner::Apple(ref mut enc) => enc.encode_nv12(data, presentation_time, options),
 
             #[cfg(mediax_hw_codec_android)]
-            EncoderInner::Android(ref mut enc) => enc.encode_nv12(data, options),
+            EncoderInner::Android(ref mut enc) => enc.encode_nv12(data, presentation_time, options),
 
             #[cfg(mediax_hw_codec_windows)]
-            EncoderInner::Windows(ref mut enc) => enc.encode_nv12(data, options),
+            EncoderInner::Windows(ref mut enc) => enc.encode_nv12(data, presentation_time, options),
 
             #[cfg(mediax_hw_codec_vaapi)]
-            EncoderInner::Vaapi(ref mut enc) => enc.encode_nv12(data, options),
+            EncoderInner::Vaapi(ref mut enc) => enc.encode_nv12(data, presentation_time, options),
 
             #[cfg(mediax_av1_software_encode)]
-            EncoderInner::Av1(ref mut enc) => enc.encode_nv12(data, options),
+            EncoderInner::Av1(ref mut enc) => enc.encode_nv12(data, presentation_time, options),
         }
     }
 
@@ -1037,19 +1048,23 @@ impl Encoder {
     pub fn encode_pixel_buffer(
         &mut self,
         buffer: &objc2_core_video::CVPixelBuffer,
+        presentation_time: Duration,
         options: FrameOptions,
     ) -> EncodeStream {
-        EncodeStream::new(self.encode_pixel_buffer_inner(buffer, options))
+        EncodeStream::new(self.encode_pixel_buffer_inner(buffer, presentation_time, options))
     }
 
     #[cfg(mediax_hw_codec_apple)]
     fn encode_pixel_buffer_inner(
         &mut self,
         buffer: &objc2_core_video::CVPixelBuffer,
+        presentation_time: Duration,
         options: FrameOptions,
     ) -> Result<Vec<EncodedPacket>, CodecError> {
         match self.inner {
-            EncoderInner::Apple(ref mut enc) => enc.encode_pixel_buffer(buffer, options),
+            EncoderInner::Apple(ref mut enc) => {
+                enc.encode_pixel_buffer(buffer, presentation_time, options)
+            }
             #[cfg(mediax_av1_software_encode)]
             EncoderInner::Av1(_) => Err(CodecError::Unsupported(
                 "pixel-buffer encoding is not supported for AV1".into(),
@@ -1059,23 +1074,25 @@ impl Encoder {
 
     /// Drain frames the encoder still holds after the last `encode_nv12`.
     ///
-    /// `VideoToolbox` and `MediaCodec` emit bitstream synchronously per
-    /// frame, so flushing them yields no packets. The Media Foundation
-    /// encoder buffers frames for lookahead and only emits its tail here, and
-    /// the software AV1 encoder queues input internally and emits the held
-    /// frames here as well; each returned packet is one encoded frame.
+    /// `MediaCodec` and VA-API emit bitstream synchronously per frame, so
+    /// flushing them yields no packets. `VideoToolbox` in the offline profile
+    /// reorders frames and emits the tail here, the Media Foundation encoder
+    /// buffers frames for lookahead and only emits its tail here, and the
+    /// software AV1 encoder queues input internally and emits the held frames
+    /// here as well; each returned packet is one encoded frame.
     ///
     /// # Errors
     /// Returns [`CodecError::EncodingFailed`] when the drain fails.
     #[cfg_attr(
         not(any(
             mediax_av1_software_encode,
+            mediax_hw_codec_apple,
             mediax_hw_codec_windows,
             target_arch = "wasm32"
         )),
         expect(
             clippy::missing_const_for_fn,
-            reason = "only the software AV1, Windows and wasm32 arms are non-const; the other hardware-only builds reduce to `Ok(Vec::new())`"
+            reason = "only the software AV1, Apple, Windows and wasm32 arms are non-const; the other hardware-only builds reduce to `Ok(Vec::new())`"
         )
     )]
     pub fn flush(&mut self) -> Result<Vec<EncodedPacket>, CodecError> {
@@ -1085,7 +1102,7 @@ impl Encoder {
                 "video encoding is not supported by mediax-codec on WebAssembly",
             ))),
             #[cfg(mediax_hw_codec_apple)]
-            EncoderInner::Apple(_) => Ok(Vec::new()),
+            EncoderInner::Apple(ref mut enc) => enc.flush(),
             #[cfg(mediax_hw_codec_android)]
             EncoderInner::Android(_) => Ok(Vec::new()),
             #[cfg(mediax_hw_codec_windows)]

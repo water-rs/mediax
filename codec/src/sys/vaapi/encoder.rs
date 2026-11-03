@@ -32,8 +32,9 @@ use super::{
 use crate::{
     Bitrate, CodecError, EncodedPacket, EncoderCodec, EncoderConfig, EncoderProfile, FrameOptions,
     H264Profile, H264Settings, annexb::AnnexBPackets, bitstream::build_h264_avcc_from_annex_b,
+    encoder_config::signed_nanos,
 };
-use std::{ffi::c_int, path::Path, ptr, rc::Rc, slice};
+use std::{ffi::c_int, path::Path, ptr, rc::Rc, slice, time::Duration};
 
 /// The input surface plus the two reconstruction surfaces that alternate as
 /// reference and target.
@@ -250,7 +251,9 @@ impl VaapiEncoder {
 
     /// Encodes one tightly packed NV12 frame of the configured size.
     ///
-    /// `options.keyframe` makes it an IDR picture. A failed call makes the
+    /// The packet reports `presentation_time` and a zero decode delay: the
+    /// encoder is low-delay I/P, so frames are coded in presentation order and
+    /// none is dropped. `options.keyframe` makes it an IDR picture. A failed call makes the
     /// next frame an IDR, as the reference is then unknown.
     ///
     /// # Errors
@@ -260,6 +263,7 @@ impl VaapiEncoder {
     pub fn encode_nv12(
         &mut self,
         data: &[u8],
+        presentation_time: Duration,
         options: FrameOptions,
     ) -> Result<Vec<EncodedPacket>, CodecError> {
         let expected = self.stream.frame_bytes();
@@ -275,7 +279,11 @@ impl VaapiEncoder {
             ));
         }
         match self.encode_access_unit(data, options) {
-            Ok(access_unit) => Ok(vec![self.packets.packet(access_unit)?]),
+            Ok(access_unit) => Ok(vec![self.packets.packet(
+                access_unit,
+                presentation_time,
+                signed_nanos(presentation_time)?,
+            )?]),
             Err(error) => {
                 self.sequencer.restart();
                 Err(error.at_encode())
