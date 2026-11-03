@@ -81,16 +81,20 @@ mod color;
 mod config;
 mod encoder_config;
 mod frame;
-#[cfg(all(feature = "fuzzing", mediax_hw_codec_vaapi))]
+#[cfg(any(all(feature = "fuzzing", mediax_hw_codec_vaapi), all(test, unix)))]
 #[doc(hidden)]
 pub mod fuzzing;
 #[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
 mod h264;
+#[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
+mod h265;
 pub mod image;
 #[cfg(target_os = "android")]
 pub(crate) mod image_android;
 #[cfg(target_vendor = "apple")]
 mod image_apple;
+#[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
+mod rbsp;
 mod software;
 mod sys;
 
@@ -355,7 +359,9 @@ enum DecoderInner {
     #[cfg(mediax_hw_codec_windows)]
     Windows(sys::windows::WindowsDecoder),
     #[cfg(mediax_hw_codec_vaapi)]
-    Vaapi(Box<sys::vaapi::VaapiDecoder>),
+    VaapiH264(Box<sys::vaapi::H264Decoder>),
+    #[cfg(mediax_hw_codec_vaapi)]
+    VaapiH265(Box<sys::vaapi::HevcDecoder>),
     #[cfg(mediax_av1_software)]
     Av1(software::av1::Av1Decoder),
 }
@@ -403,14 +409,9 @@ impl Decoder {
 
             match codec {
                 #[cfg(mediax_hw_codec_vaapi)]
-                CodecType::H264 => Ok(Self {
-                    inner: sys::vaapi::open_decoder(config)?,
+                CodecType::H264 | CodecType::H265 => Ok(Self {
+                    inner: sys::vaapi::open_decoder(codec, config)?,
                 }),
-
-                #[cfg(mediax_hw_codec_vaapi)]
-                CodecType::H265 => Err(CodecError::Unsupported(
-                    "H.265 decoding over VA-API is not implemented".into(),
-                )),
 
                 #[cfg(mediax_hw_codec_apple)]
                 CodecType::H264 | CodecType::H265 => Ok(Self {
@@ -520,10 +521,9 @@ impl Decoder {
             }
 
             #[cfg(mediax_hw_codec_vaapi)]
-            DecoderInner::Vaapi(ref mut dec) => dec
-                .decode(packet.data(), timestamp_ns(packet.presentation_time()))
-                .map(vaapi_frames)
-                .map_err(sys::vaapi::VaapiError::at_decode),
+            DecoderInner::VaapiH264(ref mut dec) => vaapi_decode(&mut **dec, packet),
+            #[cfg(mediax_hw_codec_vaapi)]
+            DecoderInner::VaapiH265(ref mut dec) => vaapi_decode(&mut **dec, packet),
 
             #[cfg(mediax_av1_software)]
             DecoderInner::Av1(ref mut dec) => {
@@ -619,10 +619,9 @@ impl Decoder {
                 })
                 .collect()),
             #[cfg(mediax_hw_codec_vaapi)]
-            DecoderInner::Vaapi(ref mut decoder) => decoder
-                .drain()
-                .map(vaapi_frames)
-                .map_err(sys::vaapi::VaapiError::at_decode),
+            DecoderInner::VaapiH264(ref mut decoder) => vaapi_drain(&mut **decoder),
+            #[cfg(mediax_hw_codec_vaapi)]
+            DecoderInner::VaapiH265(ref mut decoder) => vaapi_drain(&mut **decoder),
             #[cfg(mediax_av1_software)]
             DecoderInner::Av1(ref mut decoder) => Ok(decoder
                 .drain()?
@@ -749,23 +748,9 @@ impl Decoder {
             }
 
             #[cfg(mediax_hw_codec_vaapi)]
-            DecoderInner::Vaapi(ref mut dec) => {
-                let pictures = dec
-                    .decode(packet.data(), timestamp_ns(packet.presentation_time()))
-                    .map_err(sys::vaapi::VaapiError::at_decode)?;
-                copy_frames_to_buffer(
-                    pictures.into_iter().map(|picture| {
-                        (
-                            picture.data,
-                            picture.width,
-                            picture.height,
-                            picture.timestamp_ns,
-                            DecodedPixelLayout::Nv12,
-                        )
-                    }),
-                    output,
-                )
-            }
+            DecoderInner::VaapiH264(ref mut dec) => vaapi_decode_into(&mut **dec, packet, output),
+            #[cfg(mediax_hw_codec_vaapi)]
+            DecoderInner::VaapiH265(ref mut dec) => vaapi_decode_into(&mut **dec, packet, output),
 
             #[cfg(mediax_av1_software)]
             DecoderInner::Av1(ref mut dec) => {
@@ -787,6 +772,53 @@ fn timestamp_ns(time: Duration) -> u64 {
     u64::try_from(time.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Decodes a packet on a VA-API decoder.
+#[cfg(mediax_hw_codec_vaapi)]
+fn vaapi_decode(
+    decoder: &mut impl sys::vaapi::VaapiDecoder,
+    packet: DecodePacket<'_>,
+) -> Result<Vec<DecodedFrame>, CodecError> {
+    decoder
+        .decode(packet.data(), timestamp_ns(packet.presentation_time()))
+        .map(vaapi_frames)
+        .map_err(sys::vaapi::VaapiError::at_decode)
+}
+
+/// Drains a VA-API decoder.
+#[cfg(mediax_hw_codec_vaapi)]
+fn vaapi_drain(
+    decoder: &mut impl sys::vaapi::VaapiDecoder,
+) -> Result<Vec<DecodedFrame>, CodecError> {
+    decoder
+        .drain()
+        .map(vaapi_frames)
+        .map_err(sys::vaapi::VaapiError::at_decode)
+}
+
+/// Decodes a packet on a VA-API decoder into a caller's buffer.
+#[cfg(mediax_hw_codec_vaapi)]
+fn vaapi_decode_into(
+    decoder: &mut impl sys::vaapi::VaapiDecoder,
+    packet: DecodePacket<'_>,
+    output: &mut [u8],
+) -> Result<Vec<FrameInfo>, CodecError> {
+    let pictures = decoder
+        .decode(packet.data(), timestamp_ns(packet.presentation_time()))
+        .map_err(sys::vaapi::VaapiError::at_decode)?;
+    copy_frames_to_buffer(
+        pictures.into_iter().map(|picture| {
+            (
+                picture.data,
+                picture.width,
+                picture.height,
+                picture.timestamp_ns,
+                picture.layout,
+            )
+        }),
+        output,
+    )
+}
+
 /// Wraps the frames of the VA-API decoder.
 #[cfg(mediax_hw_codec_vaapi)]
 fn vaapi_frames(pictures: Vec<sys::vaapi::DecodedPicture>) -> Vec<DecodedFrame> {
@@ -798,7 +830,7 @@ fn vaapi_frames(pictures: Vec<sys::vaapi::DecodedPicture>) -> Vec<DecodedFrame> 
                 picture.width,
                 picture.height,
                 picture.timestamp_ns,
-                DecodedPixelLayout::Nv12,
+                picture.layout,
                 None,
             )
         })

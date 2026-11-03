@@ -5,13 +5,14 @@ use super::{
     VaapiError,
     api::Api,
     types::{
-        VA_FOURCC_NV12, VA_INVALID_ID, VA_PROGRESSIVE, VA_RT_FORMAT_YUV420,
-        VA_STATUS_ERROR_UNSUPPORTED_PROFILE, VA_STATUS_SUCCESS, VA_SURFACE_ATTRIB_SETTABLE,
-        VABufferID, VAConfigID, VAContextID, VADisplay, VAGenericValue, VAGenericValueTypeInteger,
-        VAGenericValueUnion, VAImage, VAImageFormat, VAStatus, VASurfaceAttrib,
-        VASurfaceAttribPixelFormat, VASurfaceID,
+        VA_FOURCC_NV12, VA_FOURCC_P010, VA_INVALID_ID, VA_PROGRESSIVE, VA_RT_FORMAT_YUV420,
+        VA_RT_FORMAT_YUV420_10, VA_STATUS_ERROR_UNSUPPORTED_PROFILE, VA_STATUS_SUCCESS,
+        VA_SURFACE_ATTRIB_SETTABLE, VABufferID, VAConfigID, VAContextID, VADisplay, VAGenericValue,
+        VAGenericValueTypeInteger, VAGenericValueUnion, VAImage, VAImageFormat, VAStatus,
+        VASurfaceAttrib, VASurfaceAttribPixelFormat, VASurfaceID,
     },
 };
+use crate::DecodedPixelLayout;
 use std::{
     ffi::{CStr, c_int, c_void},
     fs::File,
@@ -153,16 +154,52 @@ impl Drop for Config {
     }
 }
 
-/// NV12 surfaces of one size.
+/// How the samples of a surface or an image are stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleFormat {
+    /// The image fourcc.
+    pub fourcc: u32,
+    /// The render target format of surfaces.
+    pub rt_format: u32,
+    /// The bytes of a luma sample.
+    pub bytes_per_sample: usize,
+    /// The name, for messages.
+    pub name: &'static str,
+    /// The layout frames read back have.
+    pub layout: DecodedPixelLayout,
+}
+
+impl SampleFormat {
+    /// 8-bit 4:2:0 with interleaved chroma.
+    pub const NV12: Self = Self {
+        fourcc: VA_FOURCC_NV12,
+        rt_format: VA_RT_FORMAT_YUV420,
+        bytes_per_sample: 1,
+        name: "NV12",
+        layout: DecodedPixelLayout::Nv12,
+    };
+    /// 10-bit 4:2:0 with interleaved chroma, in the high bits of 16-bit
+    /// samples.
+    pub const P010: Self = Self {
+        fourcc: VA_FOURCC_P010,
+        rt_format: VA_RT_FORMAT_YUV420_10,
+        bytes_per_sample: 2,
+        name: "P010",
+        layout: DecodedPixelLayout::P010,
+    };
+}
+
+/// Surfaces of one size and sample format.
 pub struct Surfaces {
     device: Rc<Device>,
     pub ids: Vec<VASurfaceID>,
 }
 
 impl Surfaces {
-    /// Creates `count` NV12 surfaces of `width` by `height` samples.
+    /// Creates `count` surfaces of `width` by `height` samples.
     pub fn create(
         device: &Rc<Device>,
+        format: SampleFormat,
         width: u32,
         height: u32,
         count: usize,
@@ -173,7 +210,7 @@ impl Surfaces {
             value: VAGenericValue {
                 type_: VAGenericValueTypeInteger,
                 value: VAGenericValueUnion {
-                    i: i32::from_ne_bytes(VA_FOURCC_NV12.to_ne_bytes()),
+                    i: i32::from_ne_bytes(format.fourcc.to_ne_bytes()),
                 },
             },
         };
@@ -183,7 +220,7 @@ impl Surfaces {
         let status = unsafe {
             (device.api.create_surfaces)(
                 device.display,
-                VA_RT_FORMAT_YUV420,
+                format.rt_format,
                 width,
                 height,
                 ids.as_mut_ptr(),
@@ -293,8 +330,13 @@ pub struct Image {
 }
 
 impl Image {
-    /// Creates an NV12 image of `width` by `height` samples.
-    pub fn create(device: &Rc<Device>, width: u32, height: u32) -> Result<Self, VaapiError> {
+    /// Creates an image of `width` by `height` samples.
+    pub fn create(
+        device: &Rc<Device>,
+        format: SampleFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, VaapiError> {
         // SAFETY: the display is initialised.
         let capacity = unsafe { (device.api.max_num_image_formats)(device.display) };
         let mut formats =
@@ -309,9 +351,9 @@ impl Image {
             .get(..usize::try_from(count).unwrap_or_default())
             .unwrap_or_default()
             .iter()
-            .find(|format| format.fourcc == VA_FOURCC_NV12)
+            .find(|candidate| candidate.fourcc == format.fourcc)
             .copied()
-            .ok_or(VaapiError::NoNv12ImageFormat)?;
+            .ok_or(VaapiError::NoImageFormat(format.name))?;
         let width =
             c_int::try_from(width).map_err(|_| VaapiError::SizeOutOfRange("frame width"))?;
         let height =

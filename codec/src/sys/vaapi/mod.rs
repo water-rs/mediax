@@ -1,4 +1,4 @@
-//! Linux hardware H.264 encoding and decoding through VA-API.
+//! Linux hardware H.264 encoding and H.264 and H.265 decoding through VA-API.
 //!
 //! libva is loaded with `dlopen` when a codec is created, so a host without
 //! it builds and runs, and the constructor reports why there is no codec. The
@@ -16,19 +16,24 @@ pub mod double;
 #[cfg(any(test, mediax_hw_codec_vaapi))]
 mod encoder;
 mod headers;
+mod hevc;
+#[cfg(test)]
+mod hevc_tests;
 mod plan;
+mod target;
 #[cfg(test)]
 mod tests;
 mod types;
 
-#[cfg(mediax_hw_codec_vaapi)]
-pub use decoder::DecodedPicture;
-#[cfg(mediax_hw_codec_vaapi)]
-pub use decoder::VaapiDecoder;
+pub use decoder::H264Decoder;
 #[cfg(mediax_hw_codec_vaapi)]
 pub use encoder::VaapiEncoder;
+pub use hevc::HevcDecoder;
+pub use target::DecodedPicture;
 
-use crate::{CodecError, FrameRate, H264Level, H264Profile, h264::H264Error};
+#[cfg(mediax_hw_codec_vaapi)]
+use crate::CodecType;
+use crate::{CodecError, FrameRate, H264Level, H264Profile, h264::H264Error, h265::H265Error};
 use plan::RateControlMode;
 use thiserror::Error;
 
@@ -92,20 +97,25 @@ pub enum VaapiError {
     /// The encode entry point does not take 4:2:0 8-bit surfaces.
     #[error("the driver's H.264 codec does not support the YUV 4:2:0 render target format")]
     UnsupportedRtFormat,
-    /// The driver offers no H.264 decode entry point.
-    #[error(
-        "the driver has no H.264 decode entry point (VAEntrypointVLD) for the stream's profile"
-    )]
+    /// The driver offers no decode entry point for the stream's codec and
+    /// profile.
+    #[error("the driver has no decode entry point (VAEntrypointVLD) for the stream's profile")]
     NoDecodeEntrypoint,
     /// Every surface holds a frame, which a conforming stream cannot cause.
     #[error("every decoding surface holds a frame")]
     NoFreeSurface,
+    /// The picture buffer output a frame that was never decoded, a bug.
+    #[error("output of a frame that was never decoded")]
+    NeverDecoded,
     /// A sample cannot be split into NAL units.
     #[error("malformed sample framing: {0}")]
     Framing(String),
-    /// The stream is malformed or uses a feature the decoder lacks.
+    /// The H.264 stream is malformed or uses a feature the decoder lacks.
     #[error(transparent)]
     Stream(#[from] H264Error),
+    /// The H.265 stream is malformed or uses a feature the decoder lacks.
+    #[error(transparent)]
+    Hevc(#[from] H265Error),
     /// The encode entry point lacks the rate control mode.
     #[error("the driver's H.264 encoder does not support {0} rate control")]
     UnsupportedRateControl(RateControlMode),
@@ -121,9 +131,9 @@ pub enum VaapiError {
     /// The encode entry point cannot hold a reference frame.
     #[error("the driver's H.264 encoder keeps no reference frame")]
     NoReferenceFrames,
-    /// The driver has no NV12 image format to upload frames through.
-    #[error("the driver has no NV12 image format")]
-    NoNv12ImageFormat,
+    /// The driver has no image format to move frames through.
+    #[error("the driver has no {0} image format")]
+    NoImageFormat(&'static str),
     /// The stream does not fit the requested level.
     #[error("{width}x{height} at this frame rate exceeds the limits of H.264 level {level:?}")]
     LevelExceeded {
@@ -149,8 +159,8 @@ pub enum VaapiError {
     /// The coded buffer cannot be an H.264 access unit.
     #[error("the driver produced an invalid coded buffer: {0}")]
     CodedBuffer(&'static str),
-    /// Only H.264 is implemented.
-    #[error("{0} encoding over VA-API is not implemented")]
+    /// The codec is not implemented in this direction.
+    #[error("{0} over VA-API is not implemented")]
     UnsupportedCodec(&'static str),
     /// A P picture was planned with no reference picture, a bug.
     #[error("a P picture was planned before any picture was coded")]
@@ -185,11 +195,12 @@ impl VaapiError {
                 | Self::UnsupportedRateControl(_)
                 | Self::UnsupportedPackedHeaders { .. }
                 | Self::NoReferenceFrames
-                | Self::NoNv12ImageFormat
+                | Self::NoImageFormat(_)
                 | Self::LevelExceeded { .. }
                 | Self::FrameRateOutOfRange(_)
                 | Self::UnsupportedCodec(_)
         ) || matches!(self, Self::Stream(error) if error.is_unsupported())
+            || matches!(self, Self::Hevc(error) if error.is_unsupported())
     }
 
     /// Converts the error of encoder construction.
@@ -230,12 +241,72 @@ pub fn open_encoder(config: &crate::EncoderConfig) -> Result<crate::EncoderInner
         .map_err(VaapiError::at_open)
 }
 
-/// Opens an H.264 decoder on the first render node that can decode it.
+/// What the H.264 and H.265 decoders share: access units in, frames out in
+/// output order.
+pub trait VaapiDecoder {
+    /// Decodes one access unit and returns the frames the picture buffer
+    /// outputs because of it, in output order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`VaapiError`] when the stream is malformed or uses an
+    /// unsupported feature, or the driver fails.
+    fn decode(
+        &mut self,
+        sample: &[u8],
+        timestamp_ns: u64,
+    ) -> Result<Vec<DecodedPicture>, VaapiError>;
+
+    /// Outputs every frame still waiting in the picture buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`VaapiError`] when a picture cannot be completed or read.
+    fn drain(&mut self) -> Result<Vec<DecodedPicture>, VaapiError>;
+}
+
+impl VaapiDecoder for H264Decoder {
+    fn decode(
+        &mut self,
+        sample: &[u8],
+        timestamp_ns: u64,
+    ) -> Result<Vec<DecodedPicture>, VaapiError> {
+        Self::decode(self, sample, timestamp_ns)
+    }
+
+    fn drain(&mut self) -> Result<Vec<DecodedPicture>, VaapiError> {
+        Self::drain(self)
+    }
+}
+
+impl VaapiDecoder for HevcDecoder {
+    fn decode(
+        &mut self,
+        sample: &[u8],
+        timestamp_ns: u64,
+    ) -> Result<Vec<DecodedPicture>, VaapiError> {
+        Self::decode(self, sample, timestamp_ns)
+    }
+
+    fn drain(&mut self) -> Result<Vec<DecodedPicture>, VaapiError> {
+        Self::drain(self)
+    }
+}
+
+/// Opens a decoder of `codec` on the first render node that can decode it.
 ///
-/// `config` is the `avcC` record of length-prefixed samples.
+/// `config` is the `avcC` or `hvcC` record of length-prefixed samples.
 #[cfg(mediax_hw_codec_vaapi)]
-pub fn open_decoder(config: Option<&[u8]>) -> Result<crate::DecoderInner, CodecError> {
-    VaapiDecoder::new(config)
-        .map(|decoder| crate::DecoderInner::Vaapi(Box::new(decoder)))
-        .map_err(VaapiError::at_open)
+pub fn open_decoder(
+    codec: CodecType,
+    config: Option<&[u8]>,
+) -> Result<crate::DecoderInner, CodecError> {
+    match codec {
+        CodecType::H264 => H264Decoder::new(config)
+            .map(|decoder| crate::DecoderInner::VaapiH264(Box::new(decoder))),
+        CodecType::H265 => HevcDecoder::new(config)
+            .map(|decoder| crate::DecoderInner::VaapiH265(Box::new(decoder))),
+        CodecType::Av1 => Err(VaapiError::UnsupportedCodec("AV1 decoding")),
+    }
+    .map_err(VaapiError::at_open)
 }

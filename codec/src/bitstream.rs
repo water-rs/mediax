@@ -382,7 +382,7 @@ pub fn build_h264_avcc_from_annex_b(bitstream: &[u8]) -> Option<Vec<u8>> {
 /// (type 33) and PPS (type 34) units. Profile/tier/level and the temporal
 /// layer fields are read out of the first SPS; the record is `None` when any
 /// of the three parameter sets is missing.
-#[cfg(mediax_hw_codec_windows)]
+#[cfg(any(all(test, unix), mediax_hw_codec_windows))]
 pub fn build_h265_hvcc_from_annex_b(bitstream: &[u8]) -> Option<Vec<u8>> {
     let mut vps_nalus: Vec<&[u8]> = Vec::new();
     let mut sps_nalus: Vec<&[u8]> = Vec::new();

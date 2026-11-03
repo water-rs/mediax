@@ -21,13 +21,18 @@
 use super::{
     api::Api,
     types::{
-        VA_FOURCC_NV12, VA_RT_FORMAT_YUV420, VA_STATUS_ERROR_UNSUPPORTED_PROFILE,
+        VA_FOURCC_NV12, VA_FOURCC_P010, VA_HEVC_REF_INVALID, VA_PICTURE_HEVC_INVALID,
+        VA_PICTURE_HEVC_LONG_TERM_REFERENCE, VA_PICTURE_HEVC_RPS_LT_CURR,
+        VA_PICTURE_HEVC_RPS_ST_CURR_AFTER, VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE, VA_RT_FORMAT_YUV420,
+        VA_RT_FORMAT_YUV420_10, VA_SLICE_DATA_FLAG_ALL, VA_STATUS_ERROR_UNSUPPORTED_PROFILE,
         VA_STATUS_SUCCESS, VABufferID, VAConfigAttrib, VAConfigAttribRTFormat, VAConfigID,
-        VAContextID, VADisplay, VAEntrypointVLD, VAIQMatrixBufferH264, VAIQMatrixBufferType,
-        VAImage, VAImageFormat, VAImageID, VAPictureParameterBufferH264,
-        VAPictureParameterBufferType, VAProfileH264ConstrainedBaseline, VAProfileH264High,
-        VAProfileH264Main, VASliceDataBufferType, VASliceParameterBufferH264,
-        VASliceParameterBufferType, VAStatus, VASurfaceAttrib, VASurfaceID,
+        VAContextID, VADisplay, VAEntrypointVLD, VAIQMatrixBufferH264, VAIQMatrixBufferHEVC,
+        VAIQMatrixBufferType, VAImage, VAImageFormat, VAImageID, VAPictureParameterBufferH264,
+        VAPictureParameterBufferHEVC, VAPictureParameterBufferType,
+        VAProfileH264ConstrainedBaseline, VAProfileH264High, VAProfileH264Main, VAProfileHEVCMain,
+        VAProfileHEVCMain10, VASliceDataBufferType, VASliceParameterBufferH264,
+        VASliceParameterBufferHEVC, VASliceParameterBufferType, VAStatus, VASurfaceAttrib,
+        VASurfaceID,
     },
 };
 use std::{
@@ -95,13 +100,55 @@ impl std::fmt::Debug for Picture {
     }
 }
 
+/// A picture submitted by the H.265 decoder.
+#[derive(Clone)]
+pub struct HevcPicture {
+    /// The surface decoded into.
+    pub target: VASurfaceID,
+    /// The picture parameters.
+    pub parameters: VAPictureParameterBufferHEVC,
+    /// The scaling lists, when the picture sent them.
+    #[cfg(test)]
+    pub scaling: Option<VAIQMatrixBufferHEVC>,
+    /// Each slice segment's parameters and data.
+    pub slices: Vec<(VASliceParameterBufferHEVC, Vec<u8>)>,
+    /// The fill value the surface got.
+    pub fill: u8,
+}
+
+impl std::fmt::Debug for HevcPicture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HevcPicture")
+            .field("target", &self.target)
+            .field("slices", &self.slices.len())
+            .field("fill", &self.fill)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The codec of the config last created.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Codec {
+    #[default]
+    H264,
+    Hevc,
+}
+
 #[derive(Default)]
 struct State {
     log: Vec<&'static str>,
     fail_on: Option<(&'static str, VAStatus)>,
     profiles: Vec<c_int>,
     config_profiles: Vec<c_int>,
+    codec: Codec,
+    /// The render target format the config last created asked for.
+    config_rt_format: u32,
     rt_format: u32,
+    /// The bytes of a sample of the surfaces last created.
+    sample_bytes: usize,
+    hevc_pictures: Vec<HevcPicture>,
+    submitted_hevc: Option<HevcPicture>,
     next_id: u32,
     live_surfaces: HashMap<VASurfaceID, u8>,
     surface_size: (u32, u32),
@@ -138,7 +185,8 @@ impl Default for Driver {
 }
 
 impl Driver {
-    /// A driver that decodes Constrained Baseline, Main and High.
+    /// A driver that decodes H.264 Constrained Baseline, Main and High and
+    /// H.265 Main and Main 10.
     #[must_use]
     pub fn new() -> Self {
         let pointer = Box::into_raw(Box::new(State {
@@ -146,8 +194,11 @@ impl Driver {
                 VAProfileH264ConstrainedBaseline,
                 VAProfileH264Main,
                 VAProfileH264High,
+                VAProfileHEVCMain,
+                VAProfileHEVCMain10,
             ],
-            rt_format: VA_RT_FORMAT_YUV420,
+            rt_format: VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10,
+            sample_bytes: 1,
             ..State::default()
         }));
         DISPLAY.with(|display| display.set(pointer));
@@ -215,6 +266,12 @@ impl Driver {
     #[must_use]
     pub fn pictures(&self) -> &[Picture] {
         &self.state().pictures
+    }
+
+    /// The H.265 pictures submitted so far.
+    #[must_use]
+    pub fn hevc_pictures(&self) -> &[HevcPicture] {
+        &self.state().hevc_pictures
     }
 
     /// The surfaces created and not yet destroyed, with their fill values.
@@ -383,11 +440,21 @@ unsafe extern "C" fn create_config(
         assert_eq!(entrypoint, VAEntrypointVLD);
         assert_eq!(count, 1);
         state.config_profiles.push(profile);
+        state.codec = if matches!(profile, VAProfileHEVCMain | VAProfileHEVCMain10) {
+            Codec::Hevc
+        } else {
+            Codec::H264
+        };
+        state.config_rt_format = if profile == VAProfileHEVCMain10 {
+            VA_RT_FORMAT_YUV420_10
+        } else {
+            VA_RT_FORMAT_YUV420
+        };
         // SAFETY: one attribute, as asserted.
         let attribute = unsafe { *attributes };
         assert_eq!(
             (attribute.type_, attribute.value),
-            (VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420)
+            (VAConfigAttribRTFormat, state.config_rt_format)
         );
         // SAFETY: a live local.
         unsafe { *id = fresh_id(state) };
@@ -413,12 +480,18 @@ unsafe extern "C" fn create_surfaces(
         if u64::from(width) * u64::from(height) > MAX_SURFACE_SAMPLES {
             return STATUS_RESOLUTION_NOT_SUPPORTED;
         }
-        assert_eq!(format, VA_RT_FORMAT_YUV420);
         assert_eq!(attribute_count, 1);
         // SAFETY: one attribute, as asserted.
         let attribute = unsafe { *attributes };
         // SAFETY: the decoder stored the integer member.
-        assert_eq!(unsafe { attribute.value.value.i }, 0x3231_564E);
+        let fourcc = unsafe { attribute.value.value.i }.cast_unsigned();
+        // The surfaces are of the format the config was created for.
+        assert_eq!(format, state.config_rt_format);
+        state.sample_bytes = match (format, fourcc) {
+            (VA_RT_FORMAT_YUV420, VA_FOURCC_NV12) => 1,
+            (VA_RT_FORMAT_YUV420_10, VA_FOURCC_P010) => 2,
+            other => panic!("surfaces of {other:x?}"),
+        };
         state.surface_size = (width, height);
         state.surface_count = count as usize;
         for index in 0..count {
@@ -557,59 +630,226 @@ unsafe extern "C" fn render_picture(
 ) -> VAStatus {
     with_state(display, "vaRenderPicture", |state| {
         let target = state.begun.expect("rendering happens inside a picture");
-        let mut parameters = None;
-        let mut scaling: Option<VAIQMatrixBufferH264> = None;
-        let mut slices: Vec<(VASliceParameterBufferH264, Vec<u8>)> = Vec::new();
-        let mut pending: Option<VASliceParameterBufferH264> = None;
-        for index in 0..usize::try_from(count).unwrap() {
-            // SAFETY: the decoder passes `count` ids.
-            let id = unsafe { *ids.add(index) };
-            let (kind, bytes) = &state.buffers[&id];
-            match *kind {
-                VAPictureParameterBufferType => parameters = Some(read(bytes)),
-                VAIQMatrixBufferType => scaling = Some(read(bytes)),
-                VASliceParameterBufferType => {
-                    assert!(pending.is_none(), "slice data follows its parameters");
-                    pending = Some(read(bytes));
-                }
-                VASliceDataBufferType => {
-                    let parameter = pending.take().expect("slice data has parameters");
-                    assert_eq!(parameter.slice_data_size as usize, bytes.len());
-                    assert_eq!(parameter.slice_data_offset, 0);
-                    slices.push((parameter, bytes.clone()));
-                }
-                other => panic!("unexpected buffer type {other}"),
-            }
+        let buffers: Vec<(u32, Vec<u8>)> = (0..usize::try_from(count).unwrap())
+            .map(|index| {
+                // SAFETY: the decoder passes `count` ids.
+                let id = unsafe { *ids.add(index) };
+                state.buffers[&id].clone()
+            })
+            .collect();
+        match state.codec {
+            Codec::H264 => render_h264(state, target, &buffers),
+            Codec::Hevc => render_hevc(state, target, &buffers),
         }
-        assert!(pending.is_none(), "every slice has data");
-        assert!(scaling.is_some(), "a picture has scaling lists");
-        state.submitted = Some(Picture {
-            target,
-            parameters: parameters.expect("a picture has parameters"),
-            #[cfg(test)]
-            scaling: scaling.expect("checked above"),
-            slices,
-            fill: 0,
-        });
         VA_STATUS_SUCCESS
     })
+}
+
+fn render_h264(state: &mut State, target: VASurfaceID, buffers: &[(u32, Vec<u8>)]) {
+    let mut parameters = None;
+    let mut scaling: Option<VAIQMatrixBufferH264> = None;
+    let mut slices: Vec<(VASliceParameterBufferH264, Vec<u8>)> = Vec::new();
+    let mut pending: Option<VASliceParameterBufferH264> = None;
+    for (kind, bytes) in buffers {
+        match *kind {
+            VAPictureParameterBufferType => parameters = Some(read(bytes)),
+            VAIQMatrixBufferType => scaling = Some(read(bytes)),
+            VASliceParameterBufferType => {
+                assert!(pending.is_none(), "slice data follows its parameters");
+                pending = Some(read(bytes));
+            }
+            VASliceDataBufferType => {
+                let parameter = pending.take().expect("slice data has parameters");
+                assert_eq!(parameter.slice_data_size as usize, bytes.len());
+                assert_eq!(parameter.slice_data_offset, 0);
+                slices.push((parameter, bytes.clone()));
+            }
+            other => panic!("unexpected buffer type {other}"),
+        }
+    }
+    assert!(pending.is_none(), "every slice has data");
+    assert!(scaling.is_some(), "a picture has scaling lists");
+    state.submitted = Some(Picture {
+        target,
+        parameters: parameters.expect("a picture has parameters"),
+        #[cfg(test)]
+        scaling: scaling.expect("checked above"),
+        slices,
+        fill: 0,
+    });
+}
+
+/// The `VAPictureHEVC` flags a driver accepts.
+const HEVC_FLAGS: u32 = VA_PICTURE_HEVC_INVALID
+    | VA_PICTURE_HEVC_LONG_TERM_REFERENCE
+    | VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE
+    | VA_PICTURE_HEVC_RPS_ST_CURR_AFTER
+    | VA_PICTURE_HEVC_RPS_LT_CURR;
+
+/// Validates the buffers of an H.265 picture the way a driver would.
+#[allow(clippy::too_many_lines, reason = "one check after another")]
+fn render_hevc(state: &mut State, target: VASurfaceID, buffers: &[(u32, Vec<u8>)]) {
+    let mut parameters: Option<VAPictureParameterBufferHEVC> = None;
+    let mut scaling: Option<VAIQMatrixBufferHEVC> = None;
+    let mut slices: Vec<(VASliceParameterBufferHEVC, Vec<u8>)> = Vec::new();
+    let mut pending: Option<VASliceParameterBufferHEVC> = None;
+    for (kind, bytes) in buffers {
+        match *kind {
+            VAPictureParameterBufferType => {
+                assert!(parameters.is_none() && slices.is_empty());
+                parameters = Some(read(bytes));
+            }
+            VAIQMatrixBufferType => {
+                assert!(scaling.is_none() && slices.is_empty());
+                scaling = Some(read(bytes));
+            }
+            VASliceParameterBufferType => {
+                assert!(pending.is_none(), "slice data follows its parameters");
+                pending = Some(read(bytes));
+            }
+            VASliceDataBufferType => {
+                let parameter = pending.take().expect("slice data has parameters");
+                assert_eq!(parameter.slice_data_size as usize, bytes.len());
+                assert_eq!(parameter.slice_data_offset, 0);
+                assert_eq!(parameter.slice_data_flag, VA_SLICE_DATA_FLAG_ALL);
+                assert!(
+                    (2..parameter.slice_data_size).contains(&parameter.slice_data_byte_offset),
+                    "the slice data starts after the NAL unit header and inside the unit"
+                );
+                slices.push((parameter, bytes.clone()));
+            }
+            other => panic!("unexpected buffer type {other}"),
+        }
+    }
+    assert!(pending.is_none(), "every slice has data");
+    let picture = parameters.expect("a picture has parameters");
+    assert!(!slices.is_empty(), "a picture has slices");
+    assert_eq!(picture.CurrPic.picture_id, target);
+    assert_eq!(picture.CurrPic.flags, 0);
+    assert_eq!(
+        (
+            u32::from(picture.pic_width_in_luma_samples),
+            u32::from(picture.pic_height_in_luma_samples)
+        ),
+        state.surface_size,
+        "the picture is the size of the surfaces"
+    );
+    assert_eq!(
+        usize::from(picture.bit_depth_luma_minus8) / 2 + 1,
+        state.sample_bytes,
+        "the bit depth is the surfaces'"
+    );
+    assert_eq!(
+        picture.bit_depth_luma_minus8,
+        picture.bit_depth_chroma_minus8
+    );
+    assert_eq!(
+        picture.pic_fields & 0b111,
+        1,
+        "4:2:0 without separate planes"
+    );
+    // The scaling lists go with the flag that enables them.
+    assert_eq!(
+        scaling.is_some(),
+        picture.pic_fields & (1 << 4) != 0,
+        "scaling lists are sent exactly when they are enabled"
+    );
+    let mut valid = Vec::new();
+    for (index, reference) in picture.ReferenceFrames.iter().enumerate() {
+        assert_eq!(reference.flags & !HEVC_FLAGS, 0);
+        if reference.flags & VA_PICTURE_HEVC_INVALID != 0 {
+            continue;
+        }
+        assert_ne!(
+            state.live_surfaces.get(&reference.picture_id).copied(),
+            Some(0),
+            "a reference is a decoded surface"
+        );
+        assert_ne!(reference.picture_id, target);
+        valid.push(index);
+    }
+    // The valid entries come first.
+    assert!(
+        valid
+            .iter()
+            .enumerate()
+            .all(|(position, &index)| position == index)
+    );
+    let last = slices.len() - 1;
+    for (position, (slice, _)) in slices.iter().enumerate() {
+        assert_eq!(
+            slice.LongSliceFlags & 1 != 0,
+            position == last,
+            "exactly the last slice segment ends the picture"
+        );
+        let slice_type = (slice.LongSliceFlags >> 2) & 3;
+        assert!(slice_type <= 2);
+        let lists = match slice_type {
+            0 => 2,
+            1 => 1,
+            _ => 0,
+        };
+        for (list, entries) in slice.RefPicList.iter().enumerate() {
+            let active = if list == 0 {
+                slice.num_ref_idx_l0_active_minus1
+            } else {
+                slice.num_ref_idx_l1_active_minus1
+            };
+            for (entry_index, &entry) in entries.iter().enumerate() {
+                if list < lists && entry_index <= usize::from(active) {
+                    assert!(
+                        usize::from(entry) < valid.len(),
+                        "an active reference names a reference frame"
+                    );
+                } else {
+                    assert_eq!(entry, VA_HEVC_REF_INVALID);
+                }
+            }
+        }
+        if slice.collocated_ref_idx != VA_HEVC_REF_INVALID {
+            assert!(slice_type != 2 && slice.LongSliceFlags & (1 << 10) != 0);
+        }
+    }
+    state.submitted_hevc = Some(HevcPicture {
+        target,
+        parameters: picture,
+        #[cfg(test)]
+        scaling,
+        slices,
+        fill: 0,
+    });
 }
 
 unsafe extern "C" fn end_picture(display: VADisplay, _context: VAContextID) -> VAStatus {
     // A picture ends whether or not the call fails.
     // SAFETY: the decoder passes the pointer `Driver::new` made as display.
-    let (begun, submitted) = {
+    let (begun, submitted, submitted_hevc) = {
         let state = unsafe { &mut *display.cast::<State>() };
-        (state.begun.take(), state.submitted.take())
+        (
+            state.begun.take(),
+            state.submitted.take(),
+            state.submitted_hevc.take(),
+        )
     };
     with_state(display, "vaEndPicture", |state| {
         let target = begun.expect("a picture was begun");
-        let mut picture = submitted.expect("a picture was rendered");
-        assert_eq!(picture.target, target);
-        assert_eq!(picture.parameters.CurrPic.picture_id, target);
-        picture.fill = fill_of(state.pictures.len() + 1);
-        state.live_surfaces.insert(target, picture.fill);
-        state.pictures.push(picture);
+        match state.codec {
+            Codec::H264 => {
+                let mut picture = submitted.expect("a picture was rendered");
+                assert_eq!(picture.target, target);
+                assert_eq!(picture.parameters.CurrPic.picture_id, target);
+                picture.fill = fill_of(state.pictures.len() + 1);
+                state.live_surfaces.insert(target, picture.fill);
+                state.pictures.push(picture);
+            }
+            Codec::Hevc => {
+                let mut picture = submitted_hevc.expect("a picture was rendered");
+                assert_eq!(picture.target, target);
+                picture.fill = fill_of(state.hevc_pictures.len() + 1);
+                state.live_surfaces.insert(target, picture.fill);
+                state.hevc_pictures.push(picture);
+            }
+        }
         VA_STATUS_SUCCESS
     })
 }
@@ -642,7 +882,12 @@ unsafe extern "C" fn query_image_formats(
                 bits_per_pixel: 12,
                 ..VAImageFormat::default()
             };
-            *count = 2;
+            *formats.add(2) = VAImageFormat {
+                fourcc: VA_FOURCC_P010,
+                bits_per_pixel: 24,
+                ..VAImageFormat::default()
+            };
+            *count = 3;
         }
         VA_STATUS_SUCCESS
     })
@@ -662,9 +907,18 @@ unsafe extern "C" fn create_image(
             "the image is the coded size"
         );
         // SAFETY: a live local.
-        assert_eq!(unsafe { (*format).fourcc }, VA_FOURCC_NV12);
+        let fourcc = unsafe { (*format).fourcc };
+        assert_eq!(
+            fourcc,
+            if state.sample_bytes == 2 {
+                VA_FOURCC_P010
+            } else {
+                VA_FOURCC_NV12
+            },
+            "the image is in the format of the surfaces"
+        );
         let (width_samples, height_samples) = (width as usize, height as usize);
-        let pitch = width_samples + PITCH_PADDING;
+        let pitch = width_samples * state.sample_bytes + PITCH_PADDING;
         let size = pitch * height_samples * 3 / 2;
         state.image_data = vec![0xEE; size];
         state.image_size = (width, height);
@@ -728,16 +982,30 @@ unsafe extern "C" fn get_image(
         let fill = state.live_surfaces[&surface];
         assert_ne!(fill, 0, "only decoded surfaces are read");
         let (width, height) = (width as usize, height as usize);
-        let pitch = width + PITCH_PADDING;
+        let bytes = state.sample_bytes;
+        let pitch = width * bytes + PITCH_PADDING;
+        // A 10-bit sample is the 8-bit one in the top bits of a
+        // little-endian 16-bit word.
+        let mut put = |offset: usize, value: u8| {
+            if bytes == 2 {
+                state.image_data[offset] = 0;
+                state.image_data[offset + 1] = value;
+            } else {
+                state.image_data[offset] = value;
+            }
+        };
         for row in 0..height {
             for column in 0..width {
-                state.image_data[row * pitch + column] = luma(fill, column, row);
+                put(row * pitch + column * bytes, luma(fill, column, row));
             }
         }
         let chroma_base = pitch * height;
         for row in 0..height / 2 {
             for column in 0..width {
-                state.image_data[chroma_base + row * pitch + column] = chroma(fill, column, row);
+                put(
+                    chroma_base + row * pitch + column * bytes,
+                    chroma(fill, column, row),
+                );
             }
         }
         VA_STATUS_SUCCESS

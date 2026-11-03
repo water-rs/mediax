@@ -40,7 +40,7 @@ at all; decoded planes come out through `DecodedFrame::copy_to_buffer` and
 | **macOS/iOS** | VideoToolbox |
 | **Android** | MediaCodec (NDK/JNI) |
 | **Windows** | Media Foundation |
-| **Linux** | VA-API H.264 encode and progressive Baseline/Main/High decode (#6); rav1d / rav1e for AV1 |
+| **Linux** | VA-API H.264 encode, progressive H.264 Baseline/Main/High and H.265 Main/Main 10 decode (#6); rav1d / rav1e for AV1 |
 
 ## Usage
 

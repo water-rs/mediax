@@ -4,7 +4,8 @@ use super::{
     VaapiError,
     api::Api,
     device::{
-        Buffer, Config, Context, Device, Image, PictureBuffers, Surfaces, render_nodes, to_usize,
+        Buffer, Config, Context, Device, Image, PictureBuffers, SampleFormat, Surfaces,
+        render_nodes, to_usize,
     },
     headers::{
         FrameKind, LOG2_MAX_FRAME_NUM, LOG2_MAX_POC_LSB, MACROBLOCK, MAX_NUM_REF_FRAMES,
@@ -61,8 +62,8 @@ impl Stream {
     fn from_config(config: &EncoderConfig) -> Result<Self, VaapiError> {
         let settings = match config.codec {
             EncoderCodec::H264(settings) => settings,
-            EncoderCodec::H265(_) => return Err(VaapiError::UnsupportedCodec("H.265")),
-            EncoderCodec::Av1 => return Err(VaapiError::UnsupportedCodec("AV1")),
+            EncoderCodec::H265(_) => return Err(VaapiError::UnsupportedCodec("H.265 encoding")),
+            EncoderCodec::Av1 => return Err(VaapiError::UnsupportedCodec("AV1 encoding")),
         };
         let parameters = StreamParameters {
             profile: settings.profile,
@@ -197,6 +198,7 @@ impl VaapiEncoder {
         let config = create_config(&device, stream, entrypoint)?;
         let surfaces = Surfaces::create(
             &device,
+            SampleFormat::NV12,
             stream.coded_width,
             stream.coded_height,
             usize::from(SURFACE_COUNT),
@@ -209,7 +211,12 @@ impl VaapiEncoder {
             &surfaces,
         )?;
         let coded_buffer = create_coded_buffer(&device, &context, stream)?;
-        let image = Image::create(&device, stream.coded_width, stream.coded_height)?;
+        let image = Image::create(
+            &device,
+            SampleFormat::NV12,
+            stream.coded_width,
+            stream.coded_height,
+        )?;
 
         let parameter_sets = stream.parameters.annex_b_parameter_sets()?;
         let codec_config = build_h264_avcc_from_annex_b(&parameter_sets);

@@ -11,14 +11,12 @@
 use super::{
     VaapiError,
     api::Api,
-    device::{Config, Context, Device, Image, PictureBuffers, Surfaces, render_nodes, to_usize},
-    plan::Nv12Planes,
+    device::{Device, PictureBuffers, SampleFormat, render_nodes},
+    target::{DecodedPicture, Target, Visible, offers_decoding},
     types::{
-        DecodePictureFields, DecodeSequenceFields, VA_ATTRIB_NOT_SUPPORTED, VA_INVALID_ID,
-        VA_PICTURE_H264_LONG_TERM_REFERENCE, VA_PICTURE_H264_NON_EXISTING,
-        VA_PICTURE_H264_SHORT_TERM_REFERENCE, VA_RT_FORMAT_YUV420, VA_SLICE_DATA_FLAG_ALL,
-        VAConfigAttrib, VAConfigAttribRTFormat, VAEntrypointVLD, VAIQMatrixBufferH264,
-        VAIQMatrixBufferType, VAPictureH264, VAPictureParameterBufferH264,
+        DecodePictureFields, DecodeSequenceFields, VA_PICTURE_H264_LONG_TERM_REFERENCE,
+        VA_PICTURE_H264_NON_EXISTING, VA_PICTURE_H264_SHORT_TERM_REFERENCE, VA_SLICE_DATA_FLAG_ALL,
+        VAIQMatrixBufferH264, VAIQMatrixBufferType, VAPictureH264, VAPictureParameterBufferH264,
         VAPictureParameterBufferType, VAProfileH264ConstrainedBaseline, VAProfileH264High,
         VAProfileH264Main, VASliceDataBufferType, VASliceParameterBufferH264,
         VASliceParameterBufferType, VASurfaceID,
@@ -30,7 +28,7 @@ use crate::{
     h264::{
         H264Error,
         dpb::{Dpb, Event, FrameId, FrameView, ListKind},
-        sequence::{Crop, ScalingLists, Sequence},
+        sequence::{ScalingLists, Sequence},
         slice::{ParameterSets, PredWeights, Slice, SliceHeader, SliceKind},
     },
 };
@@ -40,7 +38,7 @@ use h264_reader::nal::{
 };
 #[cfg(any(test, feature = "fuzzing"))]
 use std::path::Path;
-use std::{collections::HashMap, ffi::c_int, rc::Rc};
+use std::{ffi::c_int, rc::Rc};
 
 /// `nal_unit_type` of a coded slice of a non-IDR picture.
 const NAL_SLICE: u8 = 1;
@@ -51,19 +49,6 @@ const NAL_SLICE_IDR: u8 = 5;
 const NAL_AU_BOUNDARY: std::ops::RangeInclusive<u8> = 6..=11;
 /// The longest reference list libva carries.
 const MAX_LIST_LEN: usize = 32;
-
-/// One decoded frame: tightly packed 8-bit NV12 of the cropped size.
-#[derive(Debug)]
-pub struct DecodedPicture {
-    /// The planes, luma first, then interleaved chroma.
-    pub data: Vec<u8>,
-    /// The frame width in samples.
-    pub width: u32,
-    /// The frame height in samples.
-    pub height: u32,
-    /// The timestamp of the packet the picture came in.
-    pub timestamp_ns: u64,
-}
 
 /// A picture whose slices are being collected.
 struct OpenPicture {
@@ -76,26 +61,14 @@ struct OpenPicture {
 
 /// Everything that depends on the active sequence parameter set.
 struct Session {
-    // Declaration order is teardown order; the device goes last.
     open: Option<OpenPicture>,
-    image: Image,
-    context: Context,
-    surfaces: Surfaces,
-    _config: Config,
-    device: Rc<Device>,
+    target: Target<FrameId>,
     sequence: Sequence,
     dpb: Dpb,
-    /// The surfaces not holding a frame.
-    free: Vec<usize>,
-    /// The surface index of each frame in the buffer.
-    assigned: HashMap<FrameId, usize>,
-    timestamps: HashMap<FrameId, u64>,
-    coded_width: u32,
-    coded_height: u32,
 }
 
 /// A VA-API H.264 decoder.
-pub struct VaapiDecoder {
+pub struct H264Decoder {
     session: Option<Session>,
     converter: NalStreamConverter,
     parameters: ParameterSets,
@@ -110,17 +83,17 @@ pub struct VaapiDecoder {
 // moving it moves every handle to the display together, and libva allows a
 // display to be used from any one thread at a time, which `&mut self`
 // guarantees.
-unsafe impl Send for VaapiDecoder {}
+unsafe impl Send for H264Decoder {}
 
-impl std::fmt::Debug for VaapiDecoder {
+impl std::fmt::Debug for H264Decoder {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("VaapiDecoder")
+            .debug_struct("H264Decoder")
             .finish_non_exhaustive()
     }
 }
 
-impl VaapiDecoder {
+impl H264Decoder {
     /// Creates a decoder on the first render node that can decode H.264.
     ///
     /// `config` is the `avcC` record of length-prefixed samples; without it
@@ -178,7 +151,7 @@ impl VaapiDecoder {
     /// unsupported feature, or the driver fails. The picture being decoded is
     /// dropped; decoding resumes at the next IDR picture or whenever the
     /// following pictures only refer to intact ones.
-    pub fn decode(
+    pub(super) fn decode(
         &mut self,
         sample: &[u8],
         timestamp_ns: u64,
@@ -201,7 +174,7 @@ impl VaapiDecoder {
     /// # Errors
     ///
     /// Returns a [`VaapiError`] when a picture cannot be completed or read.
-    pub fn drain(&mut self) -> Result<Vec<DecodedPicture>, VaapiError> {
+    pub(super) fn drain(&mut self) -> Result<Vec<DecodedPicture>, VaapiError> {
         let mut output = Vec::new();
         let result = self.finish_picture(&mut output);
         let drained = end_sequence(&mut self.session, &mut output);
@@ -339,12 +312,6 @@ const fn profile_candidates(profile: &Profile) -> &'static [c_int] {
     }
 }
 
-fn offers_decoding(device: &Device, profile: c_int) -> Result<bool, VaapiError> {
-    Ok(device
-        .entrypoints(profile)?
-        .is_some_and(|entrypoints| entrypoints.contains(&VAEntrypointVLD)))
-}
-
 /// Checks the device decodes H.264 at all.
 fn supports_h264(device: Device) -> Result<Device, VaapiError> {
     for profile in [
@@ -381,29 +348,22 @@ impl Session {
             }
         }
         let profile = profile.ok_or(VaapiError::NoDecodeEntrypoint)?;
-        let config = create_config(device, profile)?;
-        let coded_width = sequence.width_mbs * 16;
-        let coded_height = sequence.height_mbs * 16;
+        let coded = (sequence.width_mbs * 16, sequence.height_mbs * 16);
+        let visible = Visible {
+            left: sequence.crop.left,
+            top: sequence.crop.top,
+            width: sequence.width,
+            height: sequence.height,
+        };
         // The frames of the buffer plus the one being decoded.
         let count = sequence.dpb.capacity + 1;
-        let surfaces = Surfaces::create(device, coded_width, coded_height, count)?;
-        let context = Context::create(device, &config, coded_width, coded_height, &surfaces)?;
-        let image = Image::create(device, coded_width, coded_height)?;
+        let target = Target::new(device, profile, SampleFormat::NV12, coded, visible, count)?;
         let dpb = Dpb::new(sequence.dpb.clone()).map_err(H264Error::from)?;
         Ok(Self {
             open: None,
-            image,
-            context,
-            surfaces,
-            _config: config,
-            device: Rc::clone(device),
+            target,
             sequence,
             dpb,
-            free: (0..count).rev().collect(),
-            assigned: HashMap::new(),
-            timestamps: HashMap::new(),
-            coded_width,
-            coded_height,
         })
     }
 
@@ -416,23 +376,13 @@ impl Session {
     }
 
     fn release(&mut self, id: FrameId) {
-        if let Some(index) = self.assigned.remove(&id) {
-            self.free.push(index);
-        }
-        self.timestamps.remove(&id);
+        self.target.release(id);
     }
 
     /// The surface of a frame, taking a free one for a frame that has none:
     /// the frames a `frame_num` gap inferred are never decoded.
     fn surface_of(&mut self, id: FrameId) -> Result<VASurfaceID, VaapiError> {
-        let index = if let Some(&index) = self.assigned.get(&id) {
-            index
-        } else {
-            let index = self.free.pop().ok_or(VaapiError::NoFreeSurface)?;
-            self.assigned.insert(id, index);
-            index
-        };
-        Ok(self.surfaces.ids[index])
+        self.target.surface_of(id)
     }
 
     fn apply(
@@ -442,7 +392,7 @@ impl Session {
     ) -> Result<(), VaapiError> {
         for event in events {
             match *event {
-                Event::Output(id) => output.push(self.read(id)?),
+                Event::Output(id) => output.push(self.target.read(id)?),
                 Event::Release(id) => self.release(id),
             }
         }
@@ -462,9 +412,9 @@ impl Session {
             .begin_picture(slice.header.picture.clone())
             .map_err(H264Error::from)?;
         self.apply(&began.events, output)?;
-        self.timestamps.insert(began.id, timestamp_ns);
+        self.target.stamp(began.id, timestamp_ns);
         let surface = self.surface_of(began.id)?;
-        let mut buffers = PictureBuffers::new(&self.device, self.context.id);
+        let mut buffers = self.target.picture_buffers();
         buffers.add(
             VAPictureParameterBufferType,
             &self.picture_parameters(slice, sps, pps, surface)?,
@@ -731,96 +681,6 @@ impl Session {
         self.dpb.abort_picture();
         self.release(id);
     }
-
-    /// Reads a decoded frame back, cropped and tightly packed.
-    fn read(&self, id: FrameId) -> Result<DecodedPicture, VaapiError> {
-        let (&index, &timestamp_ns) =
-            self.assigned
-                .get(&id)
-                .zip(self.timestamps.get(&id))
-                .ok_or(H264Error::Invalid(
-                    "output of a frame that was never decoded",
-                ))?;
-        let device = &*self.device;
-        let image = &self.image.image;
-        // SAFETY: the surface and the image belong to this display, and the
-        // surface was synchronised when its picture was rendered.
-        let status = unsafe {
-            (device.api.get_image)(
-                device.display,
-                self.surfaces.ids[index],
-                0,
-                0,
-                self.coded_width,
-                self.coded_height,
-                image.image_id,
-            )
-        };
-        device.check("vaGetImage", status)?;
-        if image.num_planes != 2 {
-            return Err(VaapiError::BufferTooSmall("image planes"));
-        }
-        let planes = Nv12Planes {
-            y_offset: to_usize(image.offsets[0])?,
-            y_pitch: to_usize(image.pitches[0])?,
-            uv_offset: to_usize(image.offsets[1])?,
-            uv_pitch: to_usize(image.pitches[1])?,
-        };
-        let crop = self.sequence.crop;
-        let (width, height) = (self.sequence.width, self.sequence.height);
-        let data =
-            device.with_mapped_bytes(image.buf, to_usize(image.data_size)?, "image", |bytes| {
-                copy_nv12_cropped(
-                    bytes,
-                    planes,
-                    (self.coded_width, self.coded_height),
-                    crop,
-                    (width, height),
-                )
-            })?;
-        Ok(DecodedPicture {
-            data,
-            width,
-            height,
-            timestamp_ns,
-        })
-    }
-}
-
-fn create_config(device: &Rc<Device>, profile: c_int) -> Result<Config, VaapiError> {
-    let mut attribute = VAConfigAttrib {
-        type_: VAConfigAttribRTFormat,
-        value: 0,
-    };
-    // SAFETY: the pointer refers to the one attribute counted.
-    let status = unsafe {
-        (device.api.get_config_attributes)(
-            device.display,
-            profile,
-            VAEntrypointVLD,
-            &raw mut attribute,
-            1,
-        )
-    };
-    device.check("vaGetConfigAttributes", status)?;
-    if attribute.value == VA_ATTRIB_NOT_SUPPORTED || attribute.value & VA_RT_FORMAT_YUV420 == 0 {
-        return Err(VaapiError::UnsupportedRtFormat);
-    }
-    attribute.value = VA_RT_FORMAT_YUV420;
-    let mut id = VA_INVALID_ID;
-    // SAFETY: the pointers refer to live locals; one attribute is counted.
-    let status = unsafe {
-        (device.api.create_config)(
-            device.display,
-            profile,
-            VAEntrypointVLD,
-            &raw mut attribute,
-            1,
-            &raw mut id,
-        )
-    };
-    device.check("vaCreateConfig", status)?;
-    Ok(Config::new(Rc::clone(device), id))
 }
 
 /// Fills the explicit prediction weights of a slice. Entries without explicit
@@ -882,35 +742,4 @@ fn fill_list(
         }
     }
     (any_luma, any_chroma)
-}
-
-/// Copies the visible rectangle of a mapped NV12 image into a tightly packed
-/// frame of `width` x `height`.
-pub(super) fn copy_nv12_cropped(
-    image: &[u8],
-    planes: Nv12Planes,
-    (coded_width, coded_height): (u32, u32),
-    crop: Crop,
-    (width, height): (u32, u32),
-) -> Result<Vec<u8>, VaapiError> {
-    let too_small = || VaapiError::BufferTooSmall("image");
-    let (width, height) = (to_usize(width)?, to_usize(height)?);
-    let (left, top) = (to_usize(crop.left)?, to_usize(crop.top)?);
-    if width + left + to_usize(crop.right)? != to_usize(coded_width)?
-        || height + top + to_usize(crop.bottom)? != to_usize(coded_height)?
-    {
-        return Err(too_small());
-    }
-    let mut frame = Vec::with_capacity(width * height * 3 / 2);
-    for row in 0..height {
-        let start = planes.y_offset + (top + row) * planes.y_pitch + left;
-        frame.extend_from_slice(image.get(start..start + width).ok_or_else(too_small)?);
-    }
-    // A chroma row covers two luma rows, and a chroma sample two luma
-    // columns in two bytes, so the byte offset of the column is `left`.
-    for row in 0..height / 2 {
-        let start = planes.uv_offset + (top / 2 + row) * planes.uv_pitch + left;
-        frame.extend_from_slice(image.get(start..start + width).ok_or_else(too_small)?);
-    }
-    Ok(frame)
 }
