@@ -456,7 +456,17 @@ fn test_jpeg(width: u32, height: u32) -> Vec<u8> {
 fn jpeg_decodes_to_a_pixel_buffer_the_encoder_takes() {
     let jpeg = test_jpeg(640, 480);
     let started = Instant::now();
-    let buffer = decode_jpeg_pixel_buffer(&jpeg).expect("hardware JPEG decode");
+    // Hosted macOS runners are virtual machines that do not always expose the
+    // hardware JPEG decoder.
+    let buffer = match decode_jpeg_pixel_buffer(&jpeg) {
+        Ok(buffer) => buffer,
+        Err(crate::CodecError::Unsupported(reason)) => {
+            crate::init_test_tracing();
+            tracing::warn!(%reason, "skipping: no hardware JPEG decoder");
+            return;
+        }
+        Err(error) => panic!("hardware JPEG decode: {error}"),
+    };
     let decode = started.elapsed();
     let mut encoder =
         Encoder::new(config(h264(BitstreamFormat::AnnexB), 640, 480, 2_000_000)).expect("encoder");
