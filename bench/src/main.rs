@@ -5,8 +5,25 @@
 
 mod common;
 
-use mediax_codec::{CodecType, Encoder, EncoderProfile};
-use std::time::Instant;
+use mediax_codec::{
+    Bitrate, BitstreamFormat, Encoder, EncoderCodec, EncoderConfig, EncoderProfile, EvenDimension,
+    FrameOptions, FrameRate, H264Level, H264Profile, H264Settings, H265Settings,
+};
+use std::{num::NonZeroU32, time::Instant};
+
+/// The benchmarked stream rate, 30 fps.
+const FRAME_RATE: FrameRate = FrameRate::new(NonZeroU32::new(30).unwrap(), NonZeroU32::MIN);
+/// The benchmarked target bitrate, 20 Mbps.
+const BITRATE: Bitrate = Bitrate::new(NonZeroU32::new(20_000_000).unwrap());
+
+const H264: EncoderCodec = EncoderCodec::H264(H264Settings {
+    profile: H264Profile::High,
+    level: H264Level::L5_2,
+    bitstream: BitstreamFormat::LengthPrefixed,
+});
+const H265: EncoderCodec = EncoderCodec::H265(H265Settings {
+    bitstream: BitstreamFormat::LengthPrefixed,
+});
 
 fn create_test_nv12(width: u32, height: u32) -> Vec<u8> {
     // Create a dummy NV12 frame for testing
@@ -46,7 +63,7 @@ fn benchmark_encoder(
 
     // Warmup
     for _ in 0..5 {
-        for result in encoder.encode_nv12(nv12_data) {
+        for result in encoder.encode_nv12(nv12_data, FrameOptions::default()) {
             let _ = result;
         }
     }
@@ -57,11 +74,11 @@ fn benchmark_encoder(
     let mut total_bytes = 0usize;
 
     for _ in 0..iterations {
-        for result in encoder.encode_nv12(nv12_data) {
+        for result in encoder.encode_nv12(nv12_data, FrameOptions::default()) {
             match result {
                 Ok(data) => {
                     success_count += 1;
-                    total_bytes += data.len();
+                    total_bytes += data.data.len();
                 }
                 Err(e) => {
                     eprintln!("Encode error: {e:?}");
@@ -104,21 +121,24 @@ struct BenchResult {
 /// One encoder configuration to benchmark against one input frame.
 struct BenchCase<'a> {
     name: &'a str,
-    codec: CodecType,
-    width: u32,
-    height: u32,
+    codec: EncoderCodec,
+    width: EvenDimension,
+    height: EvenDimension,
     profile: EncoderProfile,
     iterations: u32,
 }
 
 fn run_case(results: &mut Vec<BenchResult>, case: &BenchCase<'_>, nv12_data: &[u8]) {
-    match Encoder::new(
-        case.codec,
-        case.width,
-        case.height,
-        case.profile,
-        common::bt709_sdr_limited(),
-    ) {
+    match Encoder::new(EncoderConfig {
+        codec: case.codec,
+        width: case.width,
+        height: case.height,
+        color: common::bt709_sdr_limited(),
+        profile: case.profile,
+        bitrate: BITRATE,
+        frame_rate: FRAME_RATE,
+        keyframe_interval: None,
+    }) {
         Ok(mut encoder) => {
             results.push(benchmark_encoder(
                 case.name,
@@ -163,15 +183,15 @@ fn main() {
     println!("\n>>> Camera Input (1080p)");
     let nv12_data = create_test_nv12(1920, 1080);
     for (label, name, codec) in [
-        ("H.264", "H.264 VT (1080p)", CodecType::H264),
-        ("H.265", "H.265 VT (1080p)", CodecType::H265),
+        ("H.264", "H.264 VT (1080p)", H264),
+        ("H.265", "H.265 VT (1080p)", H265),
     ] {
         println!("\n--- Hardware {label} (VideoToolbox) ---");
         let case = BenchCase {
             name,
             codec,
-            width: 1920,
-            height: 1080,
+            width: EvenDimension::new(1920).unwrap(),
+            height: EvenDimension::new(1080).unwrap(),
             profile: EncoderProfile::Offline,
             iterations: 100,
         };
@@ -183,15 +203,15 @@ fn main() {
     let (width_4k, height_4k) = (3840, 2160);
     let nv12_data = create_test_nv12(width_4k, height_4k);
     for (label, name, codec) in [
-        ("H.264", "H.264 VT (4K)", CodecType::H264),
-        ("H.265", "H.265 VT (4K)", CodecType::H265),
+        ("H.264", "H.264 VT (4K)", H264),
+        ("H.265", "H.265 VT (4K)", H265),
     ] {
         println!("\n--- Hardware {label} (VideoToolbox) at 4K ---");
         let case = BenchCase {
             name,
             codec,
-            width: width_4k,
-            height: height_4k,
+            width: EvenDimension::new(width_4k).unwrap(),
+            height: EvenDimension::new(height_4k).unwrap(),
             profile: EncoderProfile::Realtime,
             iterations: 50,
         };
