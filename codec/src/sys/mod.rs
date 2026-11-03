@@ -8,3 +8,6 @@ pub mod android;
 
 #[cfg(mediax_hw_codec_windows)]
 pub mod windows;
+
+#[cfg(any(test, mediax_hw_codec_vaapi))]
+pub mod vaapi;

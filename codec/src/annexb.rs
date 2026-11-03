@@ -1,13 +1,23 @@
 //! Annex B framing shared by the encoders and the decoder-side converter.
 
-#[cfg(any(test, mediax_hw_codec_android, mediax_hw_codec_windows))]
+#[cfg(any(
+    test,
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
+))]
 use crate::{BitstreamFormat, CodecError, EncodedPacket};
 
 /// The four-byte Annex B start code.
 pub const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
 /// Returns `(start, end)` byte ranges of each NAL unit after its start code.
-#[cfg(any(test, mediax_hw_codec_android, mediax_hw_codec_windows))]
+#[cfg(any(
+    test,
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
+))]
 pub fn annex_b_nalus(data: &[u8]) -> Vec<(usize, usize)> {
     let mut nalus = Vec::new();
     let mut i = 0;
@@ -81,7 +91,12 @@ pub fn read_length_field(bytes: &[u8]) -> usize {
 }
 
 /// Returns the NAL unit type of `nalu` (its first bytes, header included).
-#[cfg(any(test, mediax_hw_codec_android, mediax_hw_codec_windows))]
+#[cfg(any(
+    test,
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
+))]
 const fn nal_type(nalu: &[u8], is_hevc: bool) -> u8 {
     if is_hevc {
         (nalu[0] >> 1) & 0x3F
@@ -91,7 +106,12 @@ const fn nal_type(nalu: &[u8], is_hevc: bool) -> u8 {
 }
 
 /// Whether `nal_type` is a parameter set: SPS or PPS, plus VPS for H.265.
-#[cfg(any(test, mediax_hw_codec_android, mediax_hw_codec_windows))]
+#[cfg(any(
+    test,
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
+))]
 const fn is_parameter_set(nal_type: u8, is_hevc: bool) -> bool {
     if is_hevc {
         matches!(nal_type, 32..=34)
@@ -101,7 +121,12 @@ const fn is_parameter_set(nal_type: u8, is_hevc: bool) -> bool {
 }
 
 /// Whether `nal_type` is an IDR slice (`IDR_W_RADL` or `IDR_N_LP` for H.265).
-#[cfg(any(test, mediax_hw_codec_android, mediax_hw_codec_windows))]
+#[cfg(any(
+    test,
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
+))]
 const fn is_idr(nal_type: u8, is_hevc: bool) -> bool {
     if is_hevc {
         matches!(nal_type, 19 | 20)
@@ -116,7 +141,12 @@ const fn is_idr(nal_type: u8, is_hevc: bool) -> bool {
 /// Platform encoders disagree on whether an IDR carries its parameter sets, so
 /// this keeps the last ones seen (seeded from the encoder's own configuration)
 /// and puts them in front of every IDR that lacks them.
-#[cfg(any(test, mediax_hw_codec_android, mediax_hw_codec_windows))]
+#[cfg(any(
+    test,
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
+))]
 #[derive(Debug)]
 pub struct AnnexBPackets {
     is_hevc: bool,
@@ -125,7 +155,12 @@ pub struct AnnexBPackets {
     parameter_sets: Vec<u8>,
 }
 
-#[cfg(any(test, mediax_hw_codec_android, mediax_hw_codec_windows))]
+#[cfg(any(
+    test,
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
+))]
 impl AnnexBPackets {
     pub const fn new(is_hevc: bool, bitstream: BitstreamFormat, parameter_sets: Vec<u8>) -> Self {
         Self {
@@ -136,6 +171,7 @@ impl AnnexBPackets {
     }
 
     /// Replaces the cached parameter sets with the Annex B `parameter_sets`.
+    #[cfg(any(test, mediax_hw_codec_android, mediax_hw_codec_windows))]
     pub fn set_parameter_sets(&mut self, parameter_sets: Vec<u8>) {
         self.parameter_sets = parameter_sets;
     }
