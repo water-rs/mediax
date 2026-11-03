@@ -90,6 +90,10 @@ jobs:
       - name: Install DirectX Shader Compiler
         if: runner.os == 'Windows'
         uses: tracel-ai/github-actions/install-dxc@295f2fdbae5271f4f8ad56d634e4ff6a95daafc8
+      # rav1e's x86_64 SIMD kernels are assembled with nasm.
+      - name: Install nasm
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         uses: ./.github/actions/setup-linux-deps
@@ -253,6 +257,10 @@ jobs:
       - name: Install DirectX Shader Compiler
         if: runner.os == 'Windows'
         uses: tracel-ai/github-actions/install-dxc@295f2fdbae5271f4f8ad56d634e4ff6a95daafc8
+      # rav1e's x86_64 SIMD kernels are assembled with nasm.
+      - name: Install nasm
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         uses: ./.github/actions/setup-linux-deps
