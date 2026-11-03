@@ -5,25 +5,29 @@ use std::time::Duration;
 
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(target_vendor = "apple")]
+mod apple;
 #[cfg(target_os = "windows")]
 mod windows;
 
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 use symphonia_codec_aac::AacDecoder;
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 use symphonia_core::codecs::audio::well_known::CODEC_ID_AAC;
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 use symphonia_core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 use symphonia_core::packet::Packet;
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 use symphonia_core::units::{Duration as SymphoniaDuration, Timestamp};
 
+#[cfg(target_vendor = "apple")]
+type SelectedAacDecoder = apple::AppleAacDecoder;
 #[cfg(target_os = "android")]
 type SelectedAacDecoder = android::AndroidAacDecoder;
 #[cfg(target_os = "windows")]
 type SelectedAacDecoder = windows::WindowsAacDecoder;
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 type SelectedAacDecoder = Box<dyn AudioDecoder>;
 
 /// Errors raised by packet-oriented audio decoding.
@@ -291,8 +295,13 @@ pub trait PacketAudioDecoder: Send {
 
 /// Packet decoder for AAC access units.
 ///
-/// Android and Windows use their platform AAC decoders. On other targets, a
+/// Apple, Android and Windows use their platform AAC decoders (`AudioToolbox`,
+/// `MediaCodec`, Media Foundation), which also decode HE-AAC. On other targets, a
 /// pure-Rust decoder supports AAC-LC only.
+///
+/// The configured channel count and sample rate are the decoded output format:
+/// for HE-AAC that is the SBR-doubled rate and, with parametric stereo, two
+/// channels.
 pub struct AacPacketDecoder {
     decoder: SelectedAacDecoder,
     channels: NonZeroU16,
@@ -333,7 +342,7 @@ impl AacPacketDecoder {
     }
 }
 
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 fn create_aac_decoder(config: AacDecoderConfig) -> Result<SelectedAacDecoder, String> {
     let mut parameters = AudioCodecParameters::new();
     parameters
@@ -341,6 +350,11 @@ fn create_aac_decoder(config: AacDecoderConfig) -> Result<SelectedAacDecoder, St
         .with_sample_rate(config.sample_rate.get())
         .with_extra_data(config.audio_specific_config);
     create_symphonia_aac_decoder(&parameters).map_err(|error| error.to_string())
+}
+
+#[cfg(target_vendor = "apple")]
+fn create_aac_decoder(config: AacDecoderConfig) -> Result<SelectedAacDecoder, String> {
+    apple::AppleAacDecoder::new(config)
 }
 
 #[cfg(target_os = "android")]
@@ -353,7 +367,7 @@ fn create_aac_decoder(config: AacDecoderConfig) -> Result<SelectedAacDecoder, St
     windows::WindowsAacDecoder::new(config)
 }
 
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 fn create_symphonia_aac_decoder(
     parameters: &AudioCodecParameters,
 ) -> symphonia_core::errors::Result<SelectedAacDecoder> {
@@ -361,7 +375,7 @@ fn create_symphonia_aac_decoder(
         .map(|decoder| Box::new(decoder) as Box<dyn AudioDecoder>)
 }
 
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 impl PacketAudioDecoder for AacPacketDecoder {
     fn decode(
         &mut self,
@@ -417,7 +431,7 @@ impl PacketAudioDecoder for AacPacketDecoder {
     }
 }
 
-#[cfg(any(target_os = "android", target_os = "windows"))]
+#[cfg(not(mediax_aac_pure_rust))]
 impl PacketAudioDecoder for AacPacketDecoder {
     fn decode(
         &mut self,

@@ -103,6 +103,8 @@ objc2-core-image = { version = "0.3", default-features = false }
 objc2-core-media = "0.3"
 objc2-core-video = "0.3"
 objc2-video-toolbox = "0.3"
+objc2-audio-toolbox = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-core-audio-types = { version = "0.3.2", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
 objc2-core-foundation = "0.3"
 objc2-image-io = { version = "0.3", default-features = false }
 objc2-io-surface = "0.3"
