@@ -216,17 +216,20 @@ impl ParameterSets {
     ///
     /// Returns an [`H265Error`] when the header does not parse or refers to a
     /// parameter set that was not received.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn slice(&self, nal: &[u8], previous: Option<&SliceHeader>) -> Result<Slice, H265Error> {
         self.slice_if(nal, previous, |_| Ok(()))
     }
 
-    /// Reads a slice segment header like [`Self::slice`], first asking
-    /// `supported` about the sequence parameter set the slice resolves to: an
-    /// error from it is returned before the rest of the header is read.
+    /// Reads the slice segment header of `nal`, first asking `supported` about
+    /// the sequence parameter set the slice resolves to: an error from it is
+    /// returned before the rest of the header is read. A dependent slice
+    /// segment takes the fields it does not code from `previous`.
     ///
     /// # Errors
     ///
-    /// See [`Self::slice`]; also whatever `supported` returns.
+    /// Returns an [`H265Error`] when the header does not parse or refers to a
+    /// parameter set that was not received, and whatever `supported` returns.
     #[allow(
         clippy::too_many_lines,
         reason = "one pass over the syntax, each element checked where it is read"
