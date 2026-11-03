@@ -310,6 +310,7 @@ impl Dpb {
     }
 
     /// Looks a frame up, the one being decoded included.
+    #[cfg(test)]
     #[must_use]
     pub fn frame(&self, id: FrameId) -> Option<FrameView> {
         self.frames

@@ -106,6 +106,7 @@ pub struct HevcPicture {
     /// The surface decoded into.
     pub target: VASurfaceID,
     /// The picture parameters.
+    #[cfg(test)]
     pub parameters: VAPictureParameterBufferHEVC,
     /// The scaling lists, when the picture sent them.
     #[cfg(test)]
@@ -812,6 +813,7 @@ fn render_hevc(state: &mut State, target: VASurfaceID, buffers: &[(u32, Vec<u8>)
     }
     state.submitted_hevc = Some(HevcPicture {
         target,
+        #[cfg(test)]
         parameters: picture,
         #[cfg(test)]
         scaling,

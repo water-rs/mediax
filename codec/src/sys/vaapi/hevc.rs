@@ -354,7 +354,7 @@ impl HevcDecoder {
         let Some(session) = &mut self.session else {
             return Ok(());
         };
-        let events = session.dpb.end_sequence(false);
+        let events = session.dpb.drain();
         session.apply(&events, output)
     }
 }

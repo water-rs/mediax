@@ -15,8 +15,6 @@ impl NalUnitType {
     pub const IDR_W_RADL: Self = Self(19);
     /// `IDR_N_LP`.
     pub const IDR_N_LP: Self = Self(20);
-    /// `CRA_NUT`.
-    pub const CRA: Self = Self(21);
     /// `RSV_IRAP_VCL23`, the last IRAP type.
     pub const LAST_IRAP: Self = Self(23);
     /// `VPS_NUT`.
@@ -54,12 +52,6 @@ impl NalUnitType {
     #[must_use]
     pub const fn is_bla(self) -> bool {
         self.0 >= Self::BLA_W_LP.0 && self.0 <= Self::BLA_N_LP.0
-    }
-
-    /// Whether the picture is a CRA picture.
-    #[must_use]
-    pub const fn is_cra(self) -> bool {
-        self.0 == Self::CRA.0
     }
 
     /// Whether the picture is a random access skipped leading picture.
@@ -179,6 +171,5 @@ mod tests {
         assert!(!NalUnitType(16).is_sub_layer_non_reference());
         assert!(NalUnitType(8).is_rasl() && NalUnitType(9).is_rasl());
         assert!(NalUnitType(6).is_radl() && NalUnitType(7).is_radl());
-        assert!(NalUnitType(21).is_cra());
     }
 }
