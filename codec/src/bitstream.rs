@@ -1,7 +1,8 @@
-use crate::CodecError;
+use crate::{
+    CodecError,
+    annexb::{START_CODE, annex_b_nalus, length_prefixed_to_annex_b, read_length_field},
+};
 use mediax_core::EncryptionSubsample;
-
-const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
 /// Converts ISO BMFF length-prefixed H.264/H.265 access units to Annex B.
 ///
@@ -125,7 +126,8 @@ impl NalStreamConverter {
             Self::AnnexB => Ok(sample.to_vec()),
             Self::LengthPrefixed {
                 nal_length_size, ..
-            } => length_prefixed_to_annex_b(sample, *nal_length_size),
+            } => length_prefixed_to_annex_b(sample, *nal_length_size)
+                .map_err(|reason| CodecError::DecodingFailed(reason.into())),
         }
     }
 
@@ -180,7 +182,8 @@ impl NalStreamConverter {
                 sent_parameter_sets,
                 ..
             } => {
-                let mut annex_b = length_prefixed_to_annex_b(sample, *nal_length_size)?;
+                let mut annex_b = length_prefixed_to_annex_b(sample, *nal_length_size)
+                    .map_err(|reason| CodecError::DecodingFailed(reason.into()))?;
                 if *sent_parameter_sets {
                     return Ok(annex_b);
                 }
@@ -316,40 +319,6 @@ pub fn annex_b_to_length_prefixed(data: &[u8], is_hevc: bool) -> (Option<Vec<u8>
         }
     }
     (Some(out), is_keyframe)
-}
-
-/// Returns `(start, end)` byte ranges of each NAL unit after its start code.
-fn annex_b_nalus(data: &[u8]) -> Vec<(usize, usize)> {
-    let mut nalus = Vec::new();
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        let (is_start, start_code_len) = if data[i..].starts_with(&[0, 0, 0, 1]) {
-            (true, 4)
-        } else if data[i..].starts_with(&[0, 0, 1]) {
-            (true, 3)
-        } else {
-            (false, 0)
-        };
-        if is_start {
-            let start = i + start_code_len;
-            let mut end = data.len();
-            let mut j = start;
-            while j + 3 <= data.len() {
-                if data[j..].starts_with(&[0, 0, 1]) || data[j..].starts_with(&[0, 0, 0, 1]) {
-                    end = j;
-                    break;
-                }
-                j += 1;
-            }
-            if start < end {
-                nalus.push((start, end));
-            }
-            i = end;
-        } else {
-            i += 1;
-        }
-    }
-    nalus
 }
 
 /// Builds the `avcC` (`AVCDecoderConfigurationRecord`) payload from an
@@ -669,46 +638,6 @@ fn append_parameter_set(
     output.extend_from_slice(nal);
     *cursor = end;
     Ok(())
-}
-
-fn length_prefixed_to_annex_b(
-    sample: &[u8],
-    nal_length_size: usize,
-) -> Result<Vec<u8>, CodecError> {
-    let mut offset = 0;
-    let mut output = Vec::with_capacity(sample.len() + 64);
-    while offset + nal_length_size <= sample.len() {
-        let nal_len = read_length_field(&sample[offset..offset + nal_length_size]);
-        offset += nal_length_size;
-        if nal_len == 0 {
-            continue;
-        }
-        let end = offset.checked_add(nal_len).ok_or_else(|| {
-            CodecError::DecodingFailed("length-prefixed NAL size overflowed usize".into())
-        })?;
-        let nal = sample.get(offset..end).ok_or_else(|| {
-            CodecError::DecodingFailed("length-prefixed sample has a truncated NAL unit".into())
-        })?;
-        output.extend_from_slice(&START_CODE);
-        output.extend_from_slice(nal);
-        offset = end;
-    }
-    if offset != sample.len() {
-        return Err(CodecError::DecodingFailed(
-            "length-prefixed sample has trailing bytes".into(),
-        ));
-    }
-    Ok(output)
-}
-
-fn read_length_field(bytes: &[u8]) -> usize {
-    match bytes {
-        [a] => *a as usize,
-        [a, b] => u16::from_be_bytes([*a, *b]) as usize,
-        [a, b, c] => ((*a as usize) << 16) | ((*b as usize) << 8) | (*c as usize),
-        [a, b, c, d] => u32::from_be_bytes([*a, *b, *c, *d]) as usize,
-        _ => unreachable!("NAL length size is encoded in two bits and must be 1..=4"),
-    }
 }
 
 #[cfg(test)]

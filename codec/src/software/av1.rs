@@ -1,15 +1,13 @@
 //! AV1 software encoding (rav1e) and decoding (rav1d).
 
 #[cfg(mediax_av1_software_encode)]
-use crate::EncoderProfile;
+use crate::{Bitrate, EncodedPacket, EncoderProfile, FrameOptions};
 use crate::{CodecError, DecodePacket, DecodedPixelLayout};
 #[cfg(all(
     not(any(target_os = "android", target_arch = "wasm32")),
     any(test, not(target_vendor = "apple"))
 ))]
 use mediax_core::CicpColor;
-#[cfg(mediax_av1_software_encode)]
-use mediax_core::VideoColorInfo;
 #[cfg(mediax_av1_software_encode)]
 use num_traits::FromPrimitive;
 use rav1d::include::dav1d::data::Dav1dData;
@@ -58,8 +56,13 @@ pub struct CpuFrame {
 #[cfg(mediax_av1_software_encode)]
 pub struct Av1Encoder {
     ctx: Context<u8>,
+    /// The settings `ctx` was built from, kept to rebuild it at a new rate.
+    settings: EncoderConfig,
+    threads: usize,
     width: usize,
     height: usize,
+    /// A bitrate [`Self::set_bitrate`] asked for, applied at the next frame.
+    pending_bitrate: Option<Bitrate>,
 }
 
 #[cfg(mediax_av1_software_encode)]
@@ -72,15 +75,21 @@ impl fmt::Debug for Av1Encoder {
     }
 }
 
+/// The longest `max_key_frame_interval` rav1e accepts; stands in for "never".
+#[cfg(mediax_av1_software_encode)]
+const MAX_KEY_FRAME_INTERVAL: u64 = 715_827_882;
+
+/// rav1e takes its rate as an `i32` of bits per second.
+#[cfg(mediax_av1_software_encode)]
+fn rav1e_bitrate(bitrate: Bitrate) -> i32 {
+    i32::try_from(bitrate.bits_per_second().get()).unwrap_or(i32::MAX)
+}
+
 #[cfg(mediax_av1_software_encode)]
 impl Av1Encoder {
-    pub fn new(
-        width: usize,
-        height: usize,
-        profile: EncoderProfile,
-        color: VideoColorInfo,
-    ) -> Result<Self, CodecError> {
-        let realtime = matches!(profile, EncoderProfile::Realtime);
+    pub fn new(config: &crate::EncoderConfig) -> Result<Self, CodecError> {
+        let realtime = matches!(config.profile, EncoderProfile::Realtime);
+        let color = config.color;
         if color.dolby_vision {
             return Err(CodecError::Unsupported(
                 "AV1 encoder cannot preserve Dolby Vision metadata".into(),
@@ -109,44 +118,95 @@ impl Av1Encoder {
                 ))
             })?,
         };
-        let cfg = Config::new()
-            .with_encoder_config(EncoderConfig {
-                width,
-                height,
-                bit_depth: 8,
-                chroma_sampling: ChromaSampling::Cs420,
-                // Realtime capture trades compression efficiency for speed;
-                // offline encoding keeps the balanced preset.
-                speed_settings: SpeedSettings::from_preset(if realtime { 10 } else { 6 }),
-                low_latency: true,
-                pixel_range: if cicp.full_range {
-                    PixelRange::Full
-                } else {
-                    PixelRange::Limited
-                },
-                color_description: Some(color_description),
-                content_light: color.content_light_level.map(|level| ContentLight {
-                    max_content_light_level: level.max_content_light_level(),
-                    max_frame_average_light_level: level.max_frame_average_light_level(),
-                }),
-                mastering_display: None,
-                ..Default::default()
-            })
-            .with_threads(if realtime {
-                std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
-            } else {
-                4
-            });
+        let width = config.width.get() as usize;
+        let height = config.height.get() as usize;
 
-        let ctx = cfg
+        // Realtime capture trades compression efficiency for speed; offline
+        // encoding keeps the balanced preset.
+        let mut speed_settings = SpeedSettings::from_preset(if realtime { 10 } else { 6 });
+        if realtime {
+            // rav1e holds a frame back until its RDO lookahead is full; one
+            // frame of lookahead lets every submitted frame come out at once.
+            speed_settings.rdo_lookahead_frames = 1;
+        }
+        // rav1e has no switch for the AV1 screen-content tools in video mode
+        // (it only enables them for still pictures), so the realtime
+        // screen-content tuning is the non-perceptual tune, which keeps the
+        // hard edges of text and UI that psychovisual smoothing blurs.
+        let tune = if realtime {
+            Tune::Psnr
+        } else {
+            Tune::default()
+        };
+        let max_key_frame_interval =
+            config
+                .keyframe_interval
+                .map_or(MAX_KEY_FRAME_INTERVAL, |interval| {
+                    config
+                        .frame_rate
+                        .frames_in(interval)
+                        .min(MAX_KEY_FRAME_INTERVAL)
+                });
+        let settings = EncoderConfig {
+            width,
+            height,
+            bit_depth: 8,
+            chroma_sampling: ChromaSampling::Cs420,
+            time_base: Rational::new(
+                u64::from(config.frame_rate.denominator().get()),
+                u64::from(config.frame_rate.numerator().get()),
+            ),
+            speed_settings,
+            low_latency: true,
+            tune,
+            bitrate: rav1e_bitrate(config.bitrate),
+            max_key_frame_interval,
+            pixel_range: if cicp.full_range {
+                PixelRange::Full
+            } else {
+                PixelRange::Limited
+            },
+            color_description: Some(color_description),
+            content_light: color.content_light_level.map(|level| ContentLight {
+                max_content_light_level: level.max_content_light_level(),
+                max_frame_average_light_level: level.max_frame_average_light_level(),
+            }),
+            mastering_display: None,
+            ..Default::default()
+        };
+        let threads = if realtime {
+            std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
+        } else {
+            4
+        };
+        let ctx = Config::new()
+            .with_encoder_config(settings.clone())
+            .with_threads(threads)
             .new_context()
             .map_err(|e| CodecError::InitializationFailed(e.to_string()))?;
 
-        Ok(Self { ctx, width, height })
+        Ok(Self {
+            ctx,
+            settings,
+            threads,
+            width,
+            height,
+            pending_bitrate: None,
+        })
+    }
+
+    /// Holds `bitrate` until the next frame, which then restarts the encoder
+    /// context at the new rate as a keyframe (see [`crate::Encoder::set_bitrate`]).
+    pub const fn set_bitrate(&mut self, bitrate: Bitrate) {
+        self.pending_bitrate = Some(bitrate);
     }
 
     /// Encode NV12 data to AV1.
-    pub fn encode_nv12(&mut self, nv12: &[u8]) -> Result<Vec<u8>, CodecError> {
+    pub fn encode_nv12(
+        &mut self,
+        nv12: &[u8],
+        options: FrameOptions,
+    ) -> Result<Vec<EncodedPacket>, CodecError> {
         let y_size = self.width * self.height;
         let uv_size = y_size / 2; // Interleaved UV
         let expected_size = y_size + uv_size;
@@ -160,6 +220,23 @@ impl Av1Encoder {
                 self.height
             )));
         }
+
+        // A pending rate change restarts the context: rav1e's rate control
+        // is fixed at construction. Frames the old context still holds are
+        // emitted first, at the old rate.
+        let mut output = Vec::new();
+        let keyframe = if let Some(bitrate) = self.pending_bitrate.take() {
+            output = self.flush()?;
+            self.settings.bitrate = rav1e_bitrate(bitrate);
+            self.ctx = Config::new()
+                .with_encoder_config(self.settings.clone())
+                .with_threads(self.threads)
+                .new_context()
+                .map_err(|e| CodecError::EncodingFailed(e.to_string()))?;
+            true
+        } else {
+            options.keyframe
+        };
 
         let mut f = self.ctx.new_frame();
 
@@ -192,14 +269,24 @@ impl Av1Encoder {
             }
         }
 
+        let parameters = FrameParameters {
+            frame_type_override: if keyframe {
+                FrameTypeOverride::Key
+            } else {
+                FrameTypeOverride::No
+            },
+            ..Default::default()
+        };
         self.ctx
-            .send_frame(f)
+            .send_frame((f, parameters))
             .map_err(|e| CodecError::EncodingFailed(e.to_string()))?;
 
-        let mut output = Vec::new();
         loop {
             match self.ctx.receive_packet() {
-                Ok(pkt) => output.extend_from_slice(&pkt.data),
+                Ok(pkt) => output.push(EncodedPacket {
+                    keyframe: pkt.frame_type == FrameType::KEY,
+                    data: pkt.data,
+                }),
                 Err(
                     EncoderStatus::Encoded
                     | EncoderStatus::NeedMoreData
@@ -227,13 +314,16 @@ impl Av1Encoder {
     /// returns packets once the encoder decides to emit, so a recording must
     /// call `flush` to receive the frames it already submitted. Each element
     /// is one encoded frame.
-    pub fn flush(&mut self) -> Result<Vec<Vec<u8>>, CodecError> {
+    pub fn flush(&mut self) -> Result<Vec<EncodedPacket>, CodecError> {
         self.ctx.flush();
 
         let mut packets = Vec::new();
         loop {
             match self.ctx.receive_packet() {
-                Ok(pkt) => packets.push(pkt.data),
+                Ok(pkt) => packets.push(EncodedPacket {
+                    keyframe: pkt.frame_type == FrameType::KEY,
+                    data: pkt.data,
+                }),
                 Err(EncoderStatus::Encoded | EncoderStatus::NeedMoreData) => {}
                 Err(EncoderStatus::LimitReached) => break,
                 Err(e) => return Err(CodecError::EncodingFailed(e.to_string())),
@@ -689,5 +779,124 @@ mod tests {
             .map(|bytes| u16::from_le_bytes(*bytes) >> 6)
             .collect();
         assert_eq!(samples, [0, 256, 512, 1023, 150, 550]);
+    }
+}
+
+#[cfg(all(test, mediax_av1_software_encode))]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::missing_const_for_fn,
+    reason = "test patterns on small known ranges"
+)]
+mod encoder_tests {
+    use crate::{
+        Bitrate, Encoder, EncoderCodec, EncoderConfig, EncoderProfile, EvenDimension, FrameOptions,
+        FrameRate,
+    };
+    use mediax_core::{
+        ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
+    };
+    use std::{num::NonZeroU32, time::Instant};
+
+    fn nz(value: u32) -> NonZeroU32 {
+        NonZeroU32::new(value).expect("test value is non-zero")
+    }
+
+    fn encoder(profile: EncoderProfile) -> Encoder {
+        Encoder::new(EncoderConfig {
+            codec: EncoderCodec::Av1,
+            width: EvenDimension::new(320).unwrap(),
+            height: EvenDimension::new(240).unwrap(),
+            color: VideoColorInfo {
+                primaries: ColorPrimaries::Bt709,
+                transfer: TransferFunction::Sdr,
+                matrix: MatrixCoefficients::Bt709,
+                range: ColorRange::Limited,
+                content_light_level: None,
+                dolby_vision: false,
+            },
+            profile,
+            bitrate: Bitrate::new(nz(500_000)),
+            frame_rate: FrameRate::new(nz(30), nz(1)),
+            keyframe_interval: None,
+        })
+        .expect("software AV1 encoder")
+    }
+
+    fn frame(index: usize) -> Vec<u8> {
+        let mut data = vec![128_u8; 320 * 240 * 3 / 2];
+        for (offset, luma) in data[..320 * 240].iter_mut().enumerate() {
+            *luma = ((offset % 320 + offset / 320 + index * 5) % 200 + 20) as u8;
+        }
+        data
+    }
+
+    /// Submits `count` frames, `request` and `rate_change` naming the frames
+    /// that ask for a keyframe and for a new bitrate; returns every packet's
+    /// keyframe flag in output order and the per-call latencies.
+    fn run(
+        encoder: &mut Encoder,
+        count: usize,
+        request: Option<usize>,
+        rate_change: Option<usize>,
+    ) -> (Vec<bool>, Vec<std::time::Duration>) {
+        let mut keyframes = Vec::new();
+        let mut latencies = Vec::new();
+        for index in 0..count {
+            if rate_change == Some(index) {
+                encoder
+                    .set_bitrate(Bitrate::new(nz(2_000_000)))
+                    .expect("rav1e takes the rate for the next keyframe");
+            }
+            let started = Instant::now();
+            let packets = encoder
+                .encode_nv12(
+                    &frame(index),
+                    FrameOptions {
+                        keyframe: request == Some(index),
+                    },
+                )
+                .collect::<Result<Vec<_>, _>>()
+                .expect("encode");
+            latencies.push(started.elapsed());
+            keyframes.extend(packets.iter().map(|packet| packet.keyframe));
+        }
+        keyframes.extend(
+            encoder
+                .flush()
+                .expect("flush")
+                .iter()
+                .map(|packet| packet.keyframe),
+        );
+        (keyframes, latencies)
+    }
+
+    #[test]
+    fn realtime_emits_every_frame_and_honours_keyframe_requests() {
+        let mut encoder = encoder(EncoderProfile::Realtime);
+        let (keyframes, mut latencies) = run(&mut encoder, 30, Some(12), None);
+        assert_eq!(keyframes.len(), 30);
+        let positions: Vec<_> = (0..30).filter(|&index| keyframes[index]).collect();
+        assert_eq!(positions, [0, 12]);
+        latencies.sort();
+        crate::init_test_tracing();
+        tracing::info!(
+            median = ?latencies[latencies.len() / 2],
+            max = ?latencies[latencies.len() - 1],
+            "AV1 rav1e 320x240 Realtime latency (dev profile)"
+        );
+    }
+
+    #[test]
+    fn bitrate_change_restarts_at_a_keyframe_after_draining_the_old_context() {
+        let mut encoder = encoder(EncoderProfile::Realtime);
+        let (keyframes, _) = run(&mut encoder, 16, None, Some(10));
+        assert_eq!(keyframes.len(), 16, "no frame is lost across the restart");
+        let positions: Vec<_> = (0..16).filter(|&index| keyframes[index]).collect();
+        assert_eq!(
+            positions,
+            [0, 10],
+            "the first frame after set_bitrate is a keyframe"
+        );
     }
 }

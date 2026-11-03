@@ -1,8 +1,9 @@
 //! Android `MediaCodec` hardware encoding and decoding.
 
 use crate::{
-    CodecError, DecodePacket, DecodedPixelLayout, bitstream::NalStreamConverter,
-    config::decoded_pixel_layout,
+    Bitrate, BitstreamFormat, CodecError, DecodePacket, DecodedPixelLayout, EncodedPacket,
+    EncoderCodec, EncoderConfig, EncoderProfile, FrameOptions, FrameRate, H264Level, H264Profile,
+    annexb::AnnexBPackets, bitstream::NalStreamConverter, config::decoded_pixel_layout,
 };
 use mediax_core::{
     ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
@@ -460,8 +461,10 @@ pub struct AndroidEncoder {
     codec_type: CodecType,
     width: u32,
     height: u32,
+    frame_rate: FrameRate,
     frame_count: i64,
     codec_config: Option<Vec<u8>>,
+    packets: AnnexBPackets,
 }
 
 impl fmt::Debug for AndroidEncoder {
@@ -481,17 +484,53 @@ impl fmt::Debug for AndroidEncoder {
 unsafe impl Send for AndroidEncoder {}
 unsafe impl Sync for AndroidEncoder {}
 
+/// `MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedBaseline`.
+const AVC_PROFILE_CONSTRAINED_BASELINE: i32 = 0x1_0000;
+/// `MediaCodecInfo.CodecProfileLevel.AVCProfileMain`.
+const AVC_PROFILE_MAIN: i32 = 0x2;
+/// `MediaCodecInfo.CodecProfileLevel.AVCProfileHigh`.
+const AVC_PROFILE_HIGH: i32 = 0x8;
+/// `MediaFormat.KEY_BITRATE_MODE` value `BITRATE_MODE_CBR`.
+const BITRATE_MODE_CBR: i32 = 2;
+/// `MediaFormat.KEY_PRIORITY` value for realtime work.
+const PRIORITY_REALTIME: i32 = 0;
+
+/// The `MediaCodecInfo.CodecProfileLevel.AVCLevel*` constant of `level`.
+const fn avc_level(level: H264Level) -> i32 {
+    match level {
+        H264Level::L3_0 => 0x100,
+        H264Level::L3_1 => 0x200,
+        H264Level::L3_2 => 0x400,
+        H264Level::L4_0 => 0x800,
+        H264Level::L4_1 => 0x1000,
+        H264Level::L4_2 => 0x2000,
+        H264Level::L5_0 => 0x4000,
+        H264Level::L5_1 => 0x8000,
+        H264Level::L5_2 => 0x1_0000,
+    }
+}
+
+/// A bitrate as `MediaFormat` takes it, an `i32` of bits per second.
+fn format_bitrate(bitrate: Bitrate) -> Result<i32, CodecError> {
+    i32::try_from(bitrate.bits_per_second().get()).map_err(|_| {
+        CodecError::Unsupported("MediaCodec takes bitrates up to i32::MAX bits per second".into())
+    })
+}
+
 impl AndroidEncoder {
     /// Create a new Android hardware encoder.
-    #[allow(clippy::cast_possible_wrap)] // Video dimensions won't exceed i32::MAX
-    pub fn new(
-        codec_type: CodecType,
-        width: u32,
-        height: u32,
-        color: VideoColorInfo,
-    ) -> Result<Self, CodecError> {
-        let color_format = media_color_format(color)?;
+    pub fn new(config: &EncoderConfig) -> Result<Self, CodecError> {
+        let (codec_type, bitstream) = match config.codec {
+            EncoderCodec::H264(settings) => (CodecType::H264, settings.bitstream),
+            EncoderCodec::H265(settings) => (CodecType::H265, settings.bitstream),
+            EncoderCodec::Av1 => unreachable!("AV1 is encoded in software"),
+        };
+        let color_format = media_color_format(config.color)?;
         let mime_type = codec_type.mime_type();
+        let width = i32::try_from(config.width.get())
+            .map_err(|_| CodecError::Unsupported("frame width exceeds i32::MAX".into()))?;
+        let height = i32::try_from(config.height.get())
+            .map_err(|_| CodecError::Unsupported("frame height exceeds i32::MAX".into()))?;
 
         // Create MediaCodec encoder
         let codec = MediaCodec::from_encoder_type(mime_type)
@@ -500,15 +539,60 @@ impl AndroidEncoder {
         // Create format
         let mut format = MediaFormat::new();
         format.set_str("mime", mime_type);
-        format.set_i32("width", width as i32);
-        format.set_i32("height", height as i32);
-        format.set_i32("color-format", 0x15); // COLOR_FormatYUV420SemiPlanar (NV12)
-        format.set_i32("bitrate", 4_000_000); // 4 Mbps
-        format.set_i32("frame-rate", 30);
-        format.set_i32("i-frame-interval", 1); // Keyframe every 1 second
+        format.set_i32("width", width);
+        format.set_i32("height", height);
+        format.set_i32("color-format", COLOR_FORMAT_YUV420_SEMIPLANAR);
+        format.set_i32("bitrate", format_bitrate(config.bitrate)?);
+        #[allow(clippy::cast_precision_loss)] // frame rates are far below 2^24
+        format.set_f32(
+            "frame-rate",
+            config.frame_rate.numerator().get() as f32
+                / config.frame_rate.denominator().get() as f32,
+        );
+        // A negative interval asks for no periodic sync frames: only the first
+        // frame and requested ones. `i-frame-interval` is in seconds.
+        #[allow(clippy::cast_precision_loss)]
+        format.set_f32(
+            "i-frame-interval",
+            config
+                .keyframe_interval
+                .map_or(-1.0, |interval| interval.as_secs_f32()),
+        );
         format.set_i32("color-standard", color_format.standard);
         format.set_i32("color-transfer", color_format.transfer);
         format.set_i32("color-range", color_format.range);
+        if let EncoderCodec::H264(settings) = config.codec {
+            format.set_i32(
+                "profile",
+                match settings.profile {
+                    H264Profile::ConstrainedBaseline => AVC_PROFILE_CONSTRAINED_BASELINE,
+                    H264Profile::Main => AVC_PROFILE_MAIN,
+                    H264Profile::High => AVC_PROFILE_HIGH,
+                },
+            );
+            format.set_i32("level", avc_level(settings.level));
+        }
+        if bitstream == BitstreamFormat::AnnexB {
+            // Ask the encoder for SPS/PPS in front of each IDR; `AnnexBPackets`
+            // adds them for encoders that ignore the key.
+            format.set_i32("prepend-sps-pps-to-idr-frames", 1);
+        }
+        if config.profile == EncoderProfile::Realtime {
+            // Keys an older API level does not know are ignored by the codec.
+            format.set_i32("bitrate-mode", BITRATE_MODE_CBR);
+            format.set_i32("priority", PRIORITY_REALTIME);
+            format.set_i32("low-latency", 1);
+            format.set_i32("max-b-frames", 0);
+            format.set_i32("latency", 1);
+            format.set_i32(
+                "operating-rate",
+                config
+                    .frame_rate
+                    .rounded_fps()
+                    .try_into()
+                    .map_err(|_| CodecError::Unsupported("frame rate exceeds i32::MAX".into()))?,
+            );
+        }
 
         // Configure the codec
         codec
@@ -523,17 +607,32 @@ impl AndroidEncoder {
         Ok(Self {
             codec,
             codec_type,
-            width,
-            height,
+            width: config.width.get(),
+            height: config.height.get(),
+            frame_rate: config.frame_rate,
             frame_count: 0,
             codec_config: None,
+            packets: AnnexBPackets::new(codec_type == CodecType::H265, bitstream, Vec::new()),
         })
+    }
+
+    /// Change the target bitrate; `MediaCodec` applies it from the next frame.
+    pub fn set_bitrate(&self, bitrate: Bitrate) -> Result<(), CodecError> {
+        let mut parameters = MediaFormat::new();
+        parameters.set_i32("video-bitrate", format_bitrate(bitrate)?);
+        self.codec
+            .set_parameters(parameters)
+            .map_err(|e| CodecError::EncodingFailed(format!("MediaCodec set_parameters: {e}")))
     }
 
     /// Encode NV12 data to compressed video.
     #[allow(clippy::similar_names)] // y_size, uv_size are intentionally similar
     #[allow(clippy::cast_sign_loss)] // MediaCodec API uses signed integers
-    pub fn encode_nv12(&mut self, nv12: &[u8]) -> Result<Vec<u8>, CodecError> {
+    pub fn encode_nv12(
+        &mut self,
+        nv12: &[u8],
+        options: FrameOptions,
+    ) -> Result<Vec<EncodedPacket>, CodecError> {
         use ndk::media::media_codec::{DequeuedInputBufferResult, DequeuedOutputBufferInfoResult};
 
         let y_size = (self.width * self.height) as usize;
@@ -548,6 +647,16 @@ impl AndroidEncoder {
                 self.width,
                 self.height
             )));
+        }
+
+        if options.keyframe {
+            // `MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME`: the next input
+            // frame becomes a sync frame.
+            let mut parameters = MediaFormat::new();
+            parameters.set_i32("request-sync", 0);
+            self.codec
+                .set_parameters(parameters)
+                .map_err(|e| CodecError::EncodingFailed(format!("MediaCodec request-sync: {e}")))?;
         }
 
         // Get input buffer
@@ -572,8 +681,10 @@ impl AndroidEncoder {
             buffer_slice[i] = MaybeUninit::new(*byte);
         }
 
-        // Queue input buffer with timestamp
-        let presentation_time_us = self.frame_count * 33333; // ~30fps
+        // Queue input buffer with the presentation time of this frame.
+        let presentation_time_us =
+            self.frame_count * 1_000_000 * i64::from(self.frame_rate.denominator().get())
+                / i64::from(self.frame_rate.numerator().get());
         self.frame_count += 1;
 
         self.codec
@@ -587,7 +698,7 @@ impl AndroidEncoder {
             .map_err(|e| CodecError::EncodingFailed(format!("queue_input_buffer: {e}")))?;
 
         // Collect encoded output
-        let mut encoded_data = Vec::new();
+        let mut packets = Vec::new();
 
         loop {
             let output_result = self
@@ -602,14 +713,16 @@ impl AndroidEncoder {
 
                     let offset = info.offset() as usize;
                     let size = info.size() as usize;
+                    let bytes = buffer_data[offset..offset + size].to_vec();
 
                     // Check if this is codec config (SPS/PPS)
                     let flags = info.flags();
                     if flags & 2 != 0 {
                         // BUFFER_FLAG_CODEC_CONFIG
-                        self.codec_config = Some(buffer_data[offset..offset + size].to_vec());
-                    } else {
-                        encoded_data.extend_from_slice(&buffer_data[offset..offset + size]);
+                        self.packets.set_parameter_sets(bytes.clone());
+                        self.codec_config = Some(bytes);
+                    } else if !bytes.is_empty() {
+                        packets.push(self.packets.packet(bytes)?);
                     }
 
                     self.codec
@@ -624,7 +737,7 @@ impl AndroidEncoder {
             }
         }
 
-        Ok(encoded_data)
+        Ok(packets)
     }
 
     /// Get the codec configuration data (avcC/hvcC) if available.
@@ -655,19 +768,9 @@ pub fn open_decoder(
     AndroidDecoder::new(codec, config, width, height).map(crate::DecoderInner::Android)
 }
 
-/// Open a hardware encoder for a crate-level codec type.
-pub fn open_encoder(
-    codec: crate::CodecType,
-    width: u32,
-    height: u32,
-    color: VideoColorInfo,
-) -> Result<crate::EncoderInner, CodecError> {
-    let codec = match codec {
-        crate::CodecType::H264 => CodecType::H264,
-        crate::CodecType::H265 => CodecType::H265,
-        crate::CodecType::Av1 => unreachable!(),
-    };
-    AndroidEncoder::new(codec, width, height, color).map(crate::EncoderInner::Android)
+/// Open a hardware encoder for `config`.
+pub fn open_encoder(config: &crate::EncoderConfig) -> Result<crate::EncoderInner, CodecError> {
+    AndroidEncoder::new(config).map(crate::EncoderInner::Android)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

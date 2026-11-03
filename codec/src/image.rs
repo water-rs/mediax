@@ -1,3 +1,5 @@
+//! Still-image decoding, in software and on the platform decoders.
+
 use half::f16;
 use image::{ColorType, DynamicImage, GenericImageView};
 #[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
@@ -132,6 +134,26 @@ pub fn decode_image(data: &[u8]) -> Result<DecodedImage, CodecError> {
 #[cfg(not(all(mediax_av1_software, any(test, not(target_vendor = "apple")))))]
 pub fn decode_image(data: &[u8]) -> Result<DecodedImage, CodecError> {
     decode_image_platform(data)
+}
+
+/// Decodes a JPEG into an `IOSurface`-backed BGRA `CVPixelBuffer` that
+/// [`Encoder::encode_pixel_buffer`](crate::Encoder::encode_pixel_buffer) takes
+/// as input.
+///
+/// The decode runs on the hardware JPEG decoder through a `VideoToolbox`
+/// decompression session and the pixels stay on the GPU/media-engine side of
+/// the machine; nothing is copied to CPU memory.
+///
+/// # Errors
+///
+/// Returns [`CodecError::DecodingFailed`] when `data` is not a decodable
+/// JPEG, and [`CodecError::Unsupported`] when the machine has no hardware JPEG
+/// decoder.
+#[cfg(target_vendor = "apple")]
+pub fn decode_jpeg_pixel_buffer(
+    data: &[u8],
+) -> Result<objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>, CodecError> {
+    image_apple::decode_jpeg_pixel_buffer(data)
 }
 
 /// Decodes image bytes through the primary image decode path.

@@ -59,6 +59,8 @@
 
 #![warn(missing_docs)]
 
+#[cfg(any(test, mediax_hw_codec))]
+mod annexb;
 #[cfg(feature = "aac")]
 pub mod audio;
 
@@ -72,8 +74,9 @@ mod color;
     mediax_hw_codec_windows
 ))]
 mod config;
+mod encoder_config;
 mod frame;
-mod image;
+pub mod image;
 #[cfg(target_os = "android")]
 pub(crate) mod image_android;
 #[cfg(target_vendor = "apple")]
@@ -87,15 +90,27 @@ pub use color::{
     ColorOutputTarget, SDR_REFERENCE_WHITE_NITS, VideoColorUniform, YUV_COLOR_SHADER_WGSL,
     video_color_uniform,
 };
+pub use encoder_config::{
+    Bitrate, BitstreamFormat, EncodedPacket, EncoderCodec, EncoderConfig, EncoderProfile,
+    EvenDimension, FrameOptions, FrameRate, H264Level, H264Profile, H264Settings, H265Settings,
+};
 pub use frame::{DecodedFrame, DecodedPixelLayout};
 #[cfg(feature = "gpu")]
 pub use frame::{DecodedFrameUploader, GpuFrame, LinearRgbaConverter};
 pub use image::{DecodedImage, DecodedPixelFormat, decode_image, decode_image_platform};
 pub use mediax_core::CicpColor;
 
-use mediax_core::VideoColorInfo;
 use std::{time::Duration, vec::IntoIter};
 use thiserror::Error;
+
+/// Routes `tracing` events to the test harness's captured output.
+#[cfg(all(test, any(mediax_hw_codec_apple, mediax_av1_software_encode)))]
+pub(crate) fn init_test_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+}
 
 /// Codec error type.
 #[derive(Debug, Clone, Error)]
@@ -257,32 +272,46 @@ impl std::fmt::Debug for DecodeIntoStream {
 
 /// Streaming iterator over encoded packets.
 ///
-/// Created by [`Encoder::encode_nv12`] or [`Encoder::encode_iosurface`]. Yields encoded data packets one at a time.
+/// Created by [`Encoder::encode_nv12`] or, on Apple, `Encoder::encode_pixel_buffer`.
+/// Yields the access units the encoder finished for the submitted frame:
+/// usually one, none while a lookahead encoder buffers, or the error once.
 pub struct EncodeStream {
     inner: EncodeStreamInner,
 }
 
 enum EncodeStreamInner {
-    /// Successful encode - yields the packet once.
-    Packet(Option<Vec<u8>>),
+    /// Successful encode - yields the finished packets.
+    Packets(IntoIter<EncodedPacket>),
     /// Encode error - yields the error once, then empty.
     Error(Option<CodecError>),
 }
 
+impl EncodeStream {
+    fn new(result: Result<Vec<EncodedPacket>, CodecError>) -> Self {
+        Self {
+            inner: match result {
+                Ok(packets) => EncodeStreamInner::Packets(packets.into_iter()),
+                Err(error) => EncodeStreamInner::Error(Some(error)),
+            },
+        }
+    }
+}
+
 impl Iterator for EncodeStream {
-    type Item = Result<Vec<u8>, CodecError>;
+    type Item = Result<EncodedPacket, CodecError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.inner {
-            EncodeStreamInner::Packet(packet) => packet.take().map(Ok),
+            EncodeStreamInner::Packets(packets) => packets.next().map(Ok),
             EncodeStreamInner::Error(err) => err.take().map(Err),
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match &self.inner {
-            EncodeStreamInner::Packet(Some(_)) | EncodeStreamInner::Error(Some(_)) => (1, Some(1)),
-            EncodeStreamInner::Packet(None) | EncodeStreamInner::Error(None) => (0, Some(0)),
+            EncodeStreamInner::Packets(packets) => packets.size_hint(),
+            EncodeStreamInner::Error(Some(_)) => (1, Some(1)),
+            EncodeStreamInner::Error(None) => (0, Some(0)),
         }
     }
 }
@@ -730,23 +759,6 @@ fn copy_frames_to_buffer(
     Ok(infos)
 }
 
-/// How an [`Encoder`] trades compression efficiency for latency.
-///
-/// The profile is chosen at construction because software encoders bake
-/// their threading and speed preset into the context; it cannot be
-/// switched on the fly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum EncoderProfile {
-    /// Compression-first encoding for offline jobs: balanced speed preset
-    /// and a modest thread count (rav1e preset 6 on four threads).
-    #[default]
-    Offline,
-    /// Latency-first encoding for live capture: the fastest settings each
-    /// backend offers (rav1e's maximum speed preset on every available
-    /// core; hardware encoders are already realtime).
-    Realtime,
-}
-
 /// Unified video encoder with automatic hardware/software selection.
 pub struct Encoder {
     inner: EncoderInner,
@@ -772,93 +784,120 @@ impl std::fmt::Debug for Encoder {
 }
 
 impl Encoder {
-    /// Create a new encoder tuned for `profile` and signal `color` on its output.
+    /// Create a new encoder from `config`.
     ///
-    /// `color` must describe the colorimetry of the NV12 samples passed to
-    /// [`Self::encode_nv12`].
+    /// `config.color` must describe the colorimetry of the samples passed to
+    /// [`Self::encode_nv12`] (and, for BGRA pixel buffers, the YCbCr
+    /// colorimetry the encoder converts them to).
     ///
     /// # Errors
     ///
-    /// Returns error if no suitable encoder is available.
-    pub fn new(
-        codec: CodecType,
-        width: u32,
-        height: u32,
-        profile: EncoderProfile,
-        color: VideoColorInfo,
-    ) -> Result<Self, CodecError> {
+    /// Returns [`CodecError::InitializationFailed`] or
+    /// [`CodecError::Unsupported`] when no suitable encoder is available for
+    /// the configuration.
+    pub fn new(config: EncoderConfig) -> Result<Self, CodecError> {
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = (width, height, profile, color);
             let _ = EncoderInner::Unsupported;
             Err(CodecError::Unsupported(format!(
-                "{codec:?} encoding is not supported by mediax-codec on WebAssembly"
+                "{:?} encoding is not supported by mediax-codec on WebAssembly",
+                config.codec.codec_type()
             )))
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            #[cfg(not(any(mediax_hw_codec, mediax_av1_software_encode)))]
-            let _ = (width, height, color);
-            #[cfg(not(mediax_av1_software_encode))]
-            let _ = profile;
-            match codec {
+            match config.codec {
                 #[cfg(mediax_hw_codec_apple)]
-                CodecType::H264 | CodecType::H265 => Ok(Self {
-                    inner: sys::apple::open_encoder(codec, width, height, color)?,
+                EncoderCodec::H264(_) | EncoderCodec::H265(_) => Ok(Self {
+                    inner: sys::apple::open_encoder(&config)?,
                 }),
 
                 #[cfg(mediax_hw_codec_android)]
-                CodecType::H264 | CodecType::H265 => Ok(Self {
-                    inner: sys::android::open_encoder(codec, width, height, color)?,
+                EncoderCodec::H264(_) | EncoderCodec::H265(_) => Ok(Self {
+                    inner: sys::android::open_encoder(&config)?,
                 }),
 
                 #[cfg(mediax_hw_codec_windows)]
-                CodecType::H264 | CodecType::H265 => Ok(Self {
-                    inner: sys::windows::open_encoder(codec, width, height, color)?,
+                EncoderCodec::H264(_) | EncoderCodec::H265(_) => Ok(Self {
+                    inner: sys::windows::open_encoder(&config)?,
                 }),
 
                 #[cfg(not(mediax_hw_codec))]
-                CodecType::H264 | CodecType::H265 => Err(CodecError::Unsupported(format!(
-                    "{codec:?} hardware encoding not available on this platform"
-                ))),
+                EncoderCodec::H264(_) | EncoderCodec::H265(_) => {
+                    Err(CodecError::Unsupported(format!(
+                        "{:?} hardware encoding not available on this platform",
+                        config.codec.codec_type()
+                    )))
+                }
 
                 #[cfg(mediax_av1_software_encode)]
-                CodecType::Av1 => Ok(Self {
-                    inner: EncoderInner::Av1(Box::new(software::av1::Av1Encoder::new(
-                        width as usize,
-                        height as usize,
-                        profile,
-                        color,
-                    )?)),
+                EncoderCodec::Av1 => Ok(Self {
+                    inner: EncoderInner::Av1(Box::new(software::av1::Av1Encoder::new(&config)?)),
                 }),
 
                 #[cfg(not(mediax_av1_software_encode))]
-                CodecType::Av1 => Err(CodecError::Unsupported(
+                EncoderCodec::Av1 => Err(CodecError::Unsupported(
                     "AV1 software encoding not available on this platform".into(),
                 )),
             }
         }
     }
 
-    /// Encode a frame from NV12 data.
+    /// Change the target bitrate of the running stream.
     ///
-    /// Returns a streaming iterator yielding encoded packets.
-    pub fn encode_nv12(&mut self, data: &[u8]) -> EncodeStream {
-        let result = self.encode_nv12_inner(data);
-        match result {
-            Ok(packet) => EncodeStream {
-                inner: EncodeStreamInner::Packet(Some(packet)),
-            },
-            Err(e) => EncodeStream {
-                inner: EncodeStreamInner::Error(Some(e)),
-            },
+    /// On the hardware backends (`VideoToolbox`, Media Foundation, `MediaCodec`)
+    /// the new rate applies from the next submitted frame. The software AV1
+    /// encoder (rav1e) cannot change its rate mid-stream, so the new bitrate
+    /// is held and applied by rebuilding the encoder context at the next
+    /// keyframe: [`Self::encode_nv12`] after this call encodes the frame as a
+    /// keyframe (a new coded video sequence with a fresh sequence header) and
+    /// every frame from there on uses the new rate. Frames rav1e still holds
+    /// from before the call are emitted first, at the old rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::EncodingFailed`] when the platform rejects the
+    /// rate, and [`CodecError::Unsupported`] when the bitrate does not fit the
+    /// platform's rate property.
+    pub fn set_bitrate(&mut self, bitrate: Bitrate) -> Result<(), CodecError> {
+        match self.inner {
+            #[cfg(target_arch = "wasm32")]
+            EncoderInner::Unsupported => {
+                let _ = bitrate;
+                Err(CodecError::Unsupported(String::from(
+                    "video encoding is not supported by mediax-codec on WebAssembly",
+                )))
+            }
+            #[cfg(mediax_hw_codec_apple)]
+            EncoderInner::Apple(ref mut enc) => enc.set_bitrate(bitrate),
+            #[cfg(mediax_hw_codec_android)]
+            EncoderInner::Android(ref mut enc) => enc.set_bitrate(bitrate),
+            #[cfg(mediax_hw_codec_windows)]
+            EncoderInner::Windows(ref mut enc) => enc.set_bitrate(bitrate),
+            #[cfg(mediax_av1_software_encode)]
+            EncoderInner::Av1(ref mut enc) => {
+                enc.set_bitrate(bitrate);
+                Ok(())
+            }
         }
     }
 
+    /// Encode a frame from NV12 data.
+    ///
+    /// `options.keyframe` makes this frame an IDR (a random access point).
+    /// Returns a streaming iterator yielding the finished packets.
+    pub fn encode_nv12(&mut self, data: &[u8], options: FrameOptions) -> EncodeStream {
+        EncodeStream::new(self.encode_nv12_inner(data, options))
+    }
+
     #[cfg(not(any(mediax_hw_codec, mediax_av1_software_encode)))]
-    fn encode_nv12_inner(&self, data: &[u8]) -> Result<Vec<u8>, CodecError> {
-        let _ = data;
+    fn encode_nv12_inner(
+        &self,
+        data: &[u8],
+        options: FrameOptions,
+    ) -> Result<Vec<EncodedPacket>, CodecError> {
+        let _ = (data, options);
         match self.inner {
             #[cfg(target_arch = "wasm32")]
             EncoderInner::Unsupported => Err(CodecError::Unsupported(String::from(
@@ -868,46 +907,65 @@ impl Encoder {
     }
 
     #[cfg(any(mediax_hw_codec, mediax_av1_software_encode))]
-    fn encode_nv12_inner(&mut self, data: &[u8]) -> Result<Vec<u8>, CodecError> {
+    fn encode_nv12_inner(
+        &mut self,
+        data: &[u8],
+        options: FrameOptions,
+    ) -> Result<Vec<EncodedPacket>, CodecError> {
         match self.inner {
             #[cfg(mediax_hw_codec_apple)]
-            EncoderInner::Apple(ref mut enc) => enc.encode_nv12(data),
+            EncoderInner::Apple(ref mut enc) => enc.encode_nv12(data, options),
 
             #[cfg(mediax_hw_codec_android)]
-            EncoderInner::Android(ref mut enc) => enc.encode_nv12(data),
+            EncoderInner::Android(ref mut enc) => enc.encode_nv12(data, options),
 
             #[cfg(mediax_hw_codec_windows)]
-            EncoderInner::Windows(ref mut enc) => enc.encode_nv12(data),
+            EncoderInner::Windows(ref mut enc) => enc.encode_nv12(data, options),
 
             #[cfg(mediax_av1_software_encode)]
-            EncoderInner::Av1(ref mut enc) => enc.encode_nv12(data),
+            EncoderInner::Av1(ref mut enc) => enc.encode_nv12(data, options),
         }
     }
 
-    /// Encode directly from an `IOSurface` (zero-copy, Apple only).
+    /// Encode a frame straight from a `CVPixelBuffer` (Apple only).
     ///
-    /// Returns a streaming iterator yielding encoded packets.
+    /// BGRA (`32BGRA`) and NV12 (`420YpCbCr8BiPlanar`, video or full range)
+    /// buffers are accepted at the configured size; `VideoToolbox` converts
+    /// BGRA on the GPU/media engine, so no CPU pixel conversion happens. An
+    /// `IOSurface`-backed buffer is encoded without a copy.
+    ///
+    /// Returns a streaming iterator yielding the finished packets.
     #[cfg(mediax_hw_codec_apple)]
-    pub fn encode_iosurface(&mut self, iosurface_ptr: u64) -> EncodeStream {
-        let result = self.encode_iosurface_inner(iosurface_ptr);
-        match result {
-            Ok(packet) => EncodeStream {
-                inner: EncodeStreamInner::Packet(Some(packet)),
-            },
-            Err(e) => EncodeStream {
-                inner: EncodeStreamInner::Error(Some(e)),
-            },
+    pub fn encode_pixel_buffer(
+        &mut self,
+        buffer: &objc2_core_video::CVPixelBuffer,
+        options: FrameOptions,
+    ) -> EncodeStream {
+        EncodeStream::new(self.encode_pixel_buffer_inner(buffer, options))
+    }
+
+    #[cfg(mediax_hw_codec_apple)]
+    fn encode_pixel_buffer_inner(
+        &mut self,
+        buffer: &objc2_core_video::CVPixelBuffer,
+        options: FrameOptions,
+    ) -> Result<Vec<EncodedPacket>, CodecError> {
+        match self.inner {
+            EncoderInner::Apple(ref mut enc) => enc.encode_pixel_buffer(buffer, options),
+            #[cfg(mediax_av1_software_encode)]
+            EncoderInner::Av1(_) => Err(CodecError::Unsupported(
+                "pixel-buffer encoding is not supported for AV1".into(),
+            )),
         }
     }
 
     /// Drain frames the encoder still holds after the last `encode_nv12`.
     ///
-    /// Most hardware backends in this crate emit bitstream synchronously per
-    /// `encode_nv12` call, so flushing them yields no packets. The Media
-    /// Foundation encoder buffers frames for lookahead and only emits its
-    /// tail here, and the software AV1 encoder queues input internally and
-    /// emits the held frames here as well; each returned packet is one
-    /// encoded frame.
+    /// `VideoToolbox` and `MediaCodec` emit bitstream synchronously per
+    /// frame, so flushing them yields no packets. The Media Foundation
+    /// encoder buffers frames for lookahead and only emits its tail here, and
+    /// the software AV1 encoder queues input internally and emits the held
+    /// frames here as well; each returned packet is one encoded frame.
     ///
     /// # Errors
     /// Returns [`CodecError::EncodingFailed`] when the drain fails.
@@ -922,7 +980,7 @@ impl Encoder {
             reason = "only the software AV1, Windows and wasm32 arms are non-const; the other hardware-only builds reduce to `Ok(Vec::new())`"
         )
     )]
-    pub fn flush(&mut self) -> Result<Vec<Vec<u8>>, CodecError> {
+    pub fn flush(&mut self) -> Result<Vec<EncodedPacket>, CodecError> {
         match self.inner {
             #[cfg(target_arch = "wasm32")]
             EncoderInner::Unsupported => Err(CodecError::Unsupported(String::from(
@@ -936,17 +994,6 @@ impl Encoder {
             EncoderInner::Windows(ref mut enc) => enc.drain(),
             #[cfg(mediax_av1_software_encode)]
             EncoderInner::Av1(ref mut enc) => enc.flush(),
-        }
-    }
-
-    #[cfg(mediax_hw_codec_apple)]
-    fn encode_iosurface_inner(&mut self, iosurface_ptr: u64) -> Result<Vec<u8>, CodecError> {
-        match self.inner {
-            EncoderInner::Apple(ref mut enc) => enc.encode_iosurface(iosurface_ptr),
-            #[cfg(mediax_av1_software_encode)]
-            EncoderInner::Av1(_) => Err(CodecError::Unsupported(
-                "IOSurface encoding not supported for AV1".into(),
-            )),
         }
     }
 

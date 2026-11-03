@@ -1,7 +1,9 @@
 //! Windows Media Foundation hardware encoding and decoding.
 
 use crate::{
-    CodecError, DecodePacket, DecodedPixelLayout,
+    Bitrate, CodecError, DecodePacket, DecodedPixelLayout, EncodedPacket, EncoderCodec,
+    EncoderConfig, EncoderProfile, FrameOptions, FrameRate, H264Profile,
+    annexb::AnnexBPackets,
     bitstream::{NalStreamConverter, build_h264_avcc_from_annex_b, build_h265_hvcc_from_annex_b},
     config::decoded_pixel_layout,
 };
@@ -14,9 +16,12 @@ use std::fmt;
 use std::ptr;
 use std::time::Duration;
 use windows::Win32::Media::MediaFoundation::{
-    IMF2DBuffer, IMFMediaType, IMFSample, IMFTransform, MF_E_NO_MORE_TYPES,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncCommonRealTime, CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMF2DBuffer,
+    IMFMediaType, IMFSample, IMFTransform, MF_E_NO_MORE_TYPES, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
+    MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE,
     MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES,
     MF_MT_YUV_MATRIX, MF_VERSION, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
     MFNominalRange, MFNominalRange_0_255, MFNominalRange_16_235, MFSTARTUP_NOSOCKET, MFShutdown,
@@ -28,10 +33,12 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoPrimaries_BT2020, MFVideoPrimaries_SMPTE170M, MFVideoTransFunc_709,
     MFVideoTransFunc_2084, MFVideoTransFunc_HLG, MFVideoTransferFunction, MFVideoTransferMatrix,
     MFVideoTransferMatrix_BT601, MFVideoTransferMatrix_BT709, MFVideoTransferMatrix_BT2020_10,
+    eAVEncCommonRateControlMode_CBR,
 };
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
+use windows::Win32::System::Variant::VARIANT;
 use windows::core::{GUID, Interface};
 
 // Media Foundation GUIDs
@@ -166,7 +173,7 @@ impl WindowsDecoder {
 
         unsafe {
             let input_bitstream = NalStreamConverter::new(codec_type == CodecType::H265, config)?;
-            let input_type = create_video_type(codec_type.subtype(), width, height)?;
+            let input_type = create_video_type(codec_type.subtype(), width, height, (30, 1))?;
             if !input_bitstream.parameter_sets().is_empty() {
                 input_type
                     .SetBlob(
@@ -184,7 +191,7 @@ impl WindowsDecoder {
                 DecodedPixelLayout::Nv12 => MFVideoFormat_NV12,
                 DecodedPixelLayout::P010 => MFVideoFormat_P010,
             };
-            let output_type = create_video_type(output_subtype, width, height)?;
+            let output_type = create_video_type(output_subtype, width, height, (30, 1))?;
 
             let transform = activate_hardware_transform(
                 MFT_CATEGORY_VIDEO_DECODER,
@@ -403,12 +410,15 @@ impl WindowsDecoder {
 #[allow(clippy::non_send_fields_in_send_ty)]
 pub struct WindowsEncoder {
     transform: IMFTransform,
+    codec_api: ICodecAPI,
     codec_type: CodecType,
     width: u32,
     height: u32,
+    frame_rate: FrameRate,
     frame_count: i64,
     output_stream_info: MFT_OUTPUT_STREAM_INFO,
     codec_config: Option<Vec<u8>>,
+    packets: AnnexBPackets,
     _media_foundation: MediaFoundationSession,
 }
 
@@ -423,14 +433,128 @@ impl fmt::Debug for WindowsEncoder {
     }
 }
 
+/// `eAVEncH264VProfile_ConstrainedBase`.
+const H264_PROFILE_CONSTRAINED_BASE: u32 = 256;
+/// `eAVEncH264VProfile_Main`.
+const H264_PROFILE_MAIN: u32 = 77;
+/// `eAVEncH264VProfile_High`.
+const H264_PROFILE_HIGH: u32 = 100;
+/// `eAVEncH265VProfile_Main_420_8`.
+const H265_PROFILE_MAIN: u32 = 1;
+/// `MF_MT_AVG_BITRATE`-style 100ns units per second.
+const HNS_PER_SECOND: i64 = 10_000_000;
+
+/// Sets one `ICodecAPI` property.
+fn set_codec_value(codec_api: &ICodecAPI, key: &GUID, value: &VARIANT) -> Result<(), String> {
+    // SAFETY: `key` and `value` are valid for the call.
+    unsafe { codec_api.SetValue(key, value) }.map_err(|error| error.to_string())
+}
+
+/// Wraps a failed encoder setup step.
+fn init_error(what: &str, error: impl std::fmt::Display) -> CodecError {
+    CodecError::InitializationFailed(format!("{what} failed: {error}"))
+}
+
+/// Sets bitrate, GOP size and, for realtime sessions, constant-bitrate
+/// low-latency encoding without B-frames.
+fn configure_rate_control(codec_api: &ICodecAPI, config: &EncoderConfig) -> Result<(), CodecError> {
+    let bitrate = VARIANT::from(config.bitrate.bits_per_second().get());
+    set_codec_value(codec_api, &CODECAPI_AVEncCommonMeanBitRate, &bitrate)
+        .map_err(|error| init_error("setting the mean bitrate", error))?;
+    let gop_size = config.keyframe_interval.map_or(u32::MAX, |interval| {
+        u32::try_from(config.frame_rate.frames_in(interval)).unwrap_or(u32::MAX)
+    });
+    set_codec_value(
+        codec_api,
+        &CODECAPI_AVEncMPVGOPSize,
+        &VARIANT::from(gop_size),
+    )
+    .map_err(|error| init_error("setting the GOP size", error))?;
+    if config.profile == EncoderProfile::Realtime {
+        // Constant bitrate keeps each frame inside its interval's budget;
+        // low-latency mode and no B-frames remove the reordering delay.
+        for (what, key, value) in [
+            (
+                "setting constant-bitrate rate control",
+                &CODECAPI_AVEncCommonRateControlMode,
+                VARIANT::from(eAVEncCommonRateControlMode_CBR.0.cast_unsigned()),
+            ),
+            (
+                "enabling low-latency mode",
+                &CODECAPI_AVLowLatencyMode,
+                VARIANT::from(true),
+            ),
+            (
+                "disabling B-frames",
+                &CODECAPI_AVEncMPVDefaultBPictureCount,
+                VARIANT::from(0_u32),
+            ),
+            (
+                "enabling realtime mode",
+                &CODECAPI_AVEncCommonRealTime,
+                VARIANT::from(1_u32),
+            ),
+        ] {
+            set_codec_value(codec_api, key, &value).map_err(|error| init_error(what, error))?;
+        }
+    }
+    Ok(())
+}
+
+/// The compressed output media type: size, frame rate, colour, bitrate,
+/// profile and (for H.264) level.
+fn create_output_type(
+    codec_type: CodecType,
+    config: &EncoderConfig,
+    frame_rate: (u32, u32),
+) -> Result<IMFMediaType, CodecError> {
+    let output_type = create_video_type(
+        codec_type.subtype(),
+        config.width.get(),
+        config.height.get(),
+        frame_rate,
+    )?;
+    set_color_metadata(&output_type, config.color)?;
+    let (profile, level) = match config.codec {
+        EncoderCodec::H264(settings) => (
+            match settings.profile {
+                H264Profile::ConstrainedBaseline => H264_PROFILE_CONSTRAINED_BASE,
+                H264Profile::Main => H264_PROFILE_MAIN,
+                H264Profile::High => H264_PROFILE_HIGH,
+            },
+            // `eAVEncH264VLevel*` values are the level_idc values.
+            Some(u32::from(settings.level.idc())),
+        ),
+        EncoderCodec::H265(_) => (H265_PROFILE_MAIN, None),
+        EncoderCodec::Av1 => unreachable!("AV1 is encoded in software"),
+    };
+    // SAFETY: `output_type` is a live media type and the keys are valid
+    // attribute GUIDs.
+    unsafe {
+        output_type
+            .SetUINT32(&MF_MT_AVG_BITRATE, config.bitrate.bits_per_second().get())
+            .map_err(|error| init_error("setting the average bitrate", error))?;
+        output_type
+            .SetUINT32(&MF_MT_MPEG2_PROFILE, profile)
+            .map_err(|error| init_error("setting the profile", error))?;
+        if let Some(level) = level {
+            output_type
+                .SetUINT32(&MF_MT_MPEG2_LEVEL, level)
+                .map_err(|error| init_error("setting the level", error))?;
+        }
+    }
+    Ok(output_type)
+}
+
 impl WindowsEncoder {
     /// Create a new Windows hardware encoder.
-    pub fn new(
-        codec_type: CodecType,
-        width: u32,
-        height: u32,
-        color: VideoColorInfo,
-    ) -> Result<Self, CodecError> {
+    pub fn new(config: &EncoderConfig) -> Result<Self, CodecError> {
+        let (codec_type, bitstream) = match config.codec {
+            EncoderCodec::H264(settings) => (CodecType::H264, settings.bitstream),
+            EncoderCodec::H265(settings) => (CodecType::H265, settings.bitstream),
+            EncoderCodec::Av1 => unreachable!("AV1 is encoded in software"),
+        };
+        let (width, height) = (config.width.get(), config.height.get());
         let media_foundation = MediaFoundationSession::new()?;
 
         unsafe {
@@ -440,17 +564,28 @@ impl WindowsEncoder {
                 create_register_type_info(codec_type.subtype()),
                 "encoder",
             )?;
+            let codec_api = transform.cast::<ICodecAPI>().map_err(|error| {
+                CodecError::Unsupported(format!(
+                    "the hardware encoder does not expose ICodecAPI: {error}"
+                ))
+            })?;
 
-            let output_type = create_video_type(codec_type.subtype(), width, height)?;
-            set_color_metadata(&output_type, color)?;
-            output_type.SetUINT32(&MF_MT_AVG_BITRATE, 4_000_000).ok();
+            // Rate control and latency are set before the media types, which
+            // is when Media Foundation encoders read them.
+            configure_rate_control(&codec_api, config)?;
+
+            let frame_rate = (
+                config.frame_rate.numerator().get(),
+                config.frame_rate.denominator().get(),
+            );
+            let output_type = create_output_type(codec_type, config, frame_rate)?;
 
             transform.SetOutputType(0, &output_type, 0).map_err(|e| {
                 CodecError::InitializationFailed(format!("SetOutputType failed: {e}"))
             })?;
 
-            let input_type = create_video_type(MFVideoFormat_NV12, width, height)?;
-            set_color_metadata(&input_type, color)?;
+            let input_type = create_video_type(MFVideoFormat_NV12, width, height, frame_rate)?;
+            set_color_metadata(&input_type, config.color)?;
             transform.SetInputType(0, &input_type, 0).map_err(|e| {
                 CodecError::InitializationFailed(format!("SetInputType failed: {e}"))
             })?;
@@ -470,23 +605,47 @@ impl WindowsEncoder {
             // type as soon as the types are negotiated; read them right away
             // and keep re-reading lazily for transforms that fill the
             // attribute only once encoding has started.
-            let codec_config = codec_config_from_media_type(&transform, codec_type);
+            let sequence_header = sequence_header_from_media_type(&transform);
+            let codec_config = sequence_header
+                .as_deref()
+                .and_then(|header| codec_config_from_sequence_header(header, codec_type));
 
             Ok(Self {
                 transform,
+                codec_api,
                 codec_type,
                 width,
                 height,
+                frame_rate: config.frame_rate,
                 frame_count: 0,
                 output_stream_info,
                 codec_config,
+                packets: AnnexBPackets::new(
+                    codec_type == CodecType::H265,
+                    bitstream,
+                    sequence_header.unwrap_or_default(),
+                ),
                 _media_foundation: media_foundation,
             })
         }
     }
 
+    /// Change the mean bitrate; the encoder applies it from the next frame.
+    pub fn set_bitrate(&self, bitrate: Bitrate) -> Result<(), CodecError> {
+        set_codec_value(
+            &self.codec_api,
+            &CODECAPI_AVEncCommonMeanBitRate,
+            &VARIANT::from(bitrate.bits_per_second().get()),
+        )
+        .map_err(|error| CodecError::EncodingFailed(format!("setting the mean bitrate: {error}")))
+    }
+
     /// Encode NV12 data to compressed video.
-    pub fn encode_nv12(&mut self, nv12: &[u8]) -> Result<Vec<u8>, CodecError> {
+    pub fn encode_nv12(
+        &mut self,
+        nv12: &[u8],
+        options: FrameOptions,
+    ) -> Result<Vec<EncodedPacket>, CodecError> {
         let y_size = self.width as usize * self.height as usize;
         let uv_size = y_size / 2;
         let expected_size = y_size + uv_size;
@@ -501,28 +660,33 @@ impl WindowsEncoder {
             )));
         }
 
+        if options.keyframe {
+            // Applies to the next frame submitted.
+            set_codec_value(
+                &self.codec_api,
+                &CODECAPI_AVEncVideoForceKeyFrame,
+                &VARIANT::from(1_u32),
+            )
+            .map_err(|error| CodecError::EncodingFailed(format!("forcing a keyframe: {error}")))?;
+        }
+
         unsafe {
             let input_sample = create_sample(nv12)?;
-            let time_100ns = self.frame_count * 333_333;
+            let frame_duration_hns = HNS_PER_SECOND
+                * i64::from(self.frame_rate.denominator().get())
+                / i64::from(self.frame_rate.numerator().get());
+            let time_100ns = self.frame_count * frame_duration_hns;
             self.frame_count += 1;
             input_sample.SetSampleTime(time_100ns).ok();
-            input_sample.SetSampleDuration(333_333).ok();
+            input_sample.SetSampleDuration(frame_duration_hns).ok();
 
             self.transform
                 .ProcessInput(0, &input_sample, 0)
                 .map_err(|e| CodecError::EncodingFailed(format!("ProcessInput: {e}")))?;
-
-            let mut encoded_data = Vec::new();
-            for packet in self.pump_output_samples()? {
-                encoded_data.extend_from_slice(&packet);
-            }
-
-            if self.codec_config.is_none() {
-                self.codec_config = codec_config_from_media_type(&self.transform, self.codec_type);
-            }
-
-            Ok(encoded_data)
         }
+
+        let raw = self.pump_output_samples()?;
+        self.frame_packets(raw)
     }
 
     /// Notify end-of-stream, drain the access units the encoder still buffers
@@ -531,7 +695,7 @@ impl WindowsEncoder {
     /// Media Foundation encoders emit with several frames of delay, so the
     /// tail of a recording only ever arrives here; each entry is one access
     /// unit and becomes one container sample.
-    pub fn drain(&mut self) -> Result<Vec<Vec<u8>>, CodecError> {
+    pub fn drain(&mut self) -> Result<Vec<EncodedPacket>, CodecError> {
         unsafe {
             self.transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)
@@ -541,11 +705,22 @@ impl WindowsEncoder {
                 .map_err(|e| CodecError::EncodingFailed(format!("encoder drain: {e}")))?;
         }
 
-        let packets = self.pump_output_samples()?;
-        if self.codec_config.is_none() {
-            self.codec_config = codec_config_from_media_type(&self.transform, self.codec_type);
+        let raw = self.pump_output_samples()?;
+        self.frame_packets(raw)
+    }
+
+    /// Frames raw Annex B samples as the configured bitstream, first taking
+    /// the parameter sets the transform has published since the last call.
+    fn frame_packets(&mut self, raw: Vec<Vec<u8>>) -> Result<Vec<EncodedPacket>, CodecError> {
+        if self.codec_config.is_none()
+            && let Some(header) = sequence_header_from_media_type(&self.transform)
+        {
+            self.codec_config = codec_config_from_sequence_header(&header, self.codec_type);
+            self.packets.set_parameter_sets(header);
         }
-        Ok(packets)
+        raw.into_iter()
+            .map(|sample| self.packets.packet(sample))
+            .collect()
     }
 
     /// Pump every output sample the transform can currently produce,
@@ -605,7 +780,12 @@ impl WindowsEncoder {
 
 // Helper functions
 
-fn create_video_type(subtype: GUID, width: u32, height: u32) -> Result<IMFMediaType, CodecError> {
+fn create_video_type(
+    subtype: GUID,
+    width: u32,
+    height: u32,
+    (frame_rate_numerator, frame_rate_denominator): (u32, u32),
+) -> Result<IMFMediaType, CodecError> {
     unsafe {
         let media_type: IMFMediaType = MFCreateMediaType()
             .map_err(|e| CodecError::InitializationFailed(format!("MFCreateMediaType: {e}")))?;
@@ -623,7 +803,8 @@ fn create_video_type(subtype: GUID, width: u32, height: u32) -> Result<IMFMediaT
             .SetUINT64(&MF_MT_FRAME_SIZE, frame_size)
             .map_err(|e| CodecError::InitializationFailed(format!("SetUINT64 frame_size: {e}")))?;
 
-        let frame_rate = (30u64 << 32) | 1u64;
+        let frame_rate =
+            (u64::from(frame_rate_numerator) << 32) | u64::from(frame_rate_denominator);
         media_type
             .SetUINT64(&MF_MT_FRAME_RATE, frame_rate)
             .map_err(|e| CodecError::InitializationFailed(format!("SetUINT64 frame_rate: {e}")))?;
@@ -798,10 +979,8 @@ fn activate_hardware_transform(
 /// (SPS/PPS for H.264, plus VPS for H.265), which convert to the avcC/hvcC
 /// record the container stores. `None` while the transform has not exposed
 /// the attribute yet.
-fn codec_config_from_media_type(
-    transform: &IMFTransform,
-    codec_type: CodecType,
-) -> Option<Vec<u8>> {
+/// The Annex B parameter sets the transform publishes on its output type.
+fn sequence_header_from_media_type(transform: &IMFTransform) -> Option<Vec<u8>> {
     unsafe {
         let media_type = transform.GetOutputCurrentType(0).ok()?;
         let size = media_type.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER).ok()?;
@@ -809,10 +988,15 @@ fn codec_config_from_media_type(
         media_type
             .GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut annex_b, None)
             .ok()?;
-        match codec_type {
-            CodecType::H264 => build_h264_avcc_from_annex_b(&annex_b),
-            CodecType::H265 => build_h265_hvcc_from_annex_b(&annex_b),
-        }
+        Some(annex_b)
+    }
+}
+
+/// The `avcC`/`hvcC` record built from Annex B parameter sets.
+fn codec_config_from_sequence_header(annex_b: &[u8], codec_type: CodecType) -> Option<Vec<u8>> {
+    match codec_type {
+        CodecType::H264 => build_h264_avcc_from_annex_b(annex_b),
+        CodecType::H265 => build_h265_hvcc_from_annex_b(annex_b),
     }
 }
 
@@ -1033,19 +1217,9 @@ pub fn open_decoder(
     WindowsDecoder::new(codec, config, width, height).map(crate::DecoderInner::Windows)
 }
 
-/// Open a hardware encoder for a crate-level codec type.
-pub fn open_encoder(
-    codec: crate::CodecType,
-    width: u32,
-    height: u32,
-    color: VideoColorInfo,
-) -> Result<crate::EncoderInner, CodecError> {
-    let codec = match codec {
-        crate::CodecType::H264 => CodecType::H264,
-        crate::CodecType::H265 => CodecType::H265,
-        crate::CodecType::Av1 => unreachable!(),
-    };
-    WindowsEncoder::new(codec, width, height, color).map(crate::EncoderInner::Windows)
+/// Open a hardware encoder for `config`.
+pub fn open_encoder(config: &crate::EncoderConfig) -> Result<crate::EncoderInner, CodecError> {
+    WindowsEncoder::new(config).map(crate::EncoderInner::Windows)
 }
 
 #[cfg(test)]
