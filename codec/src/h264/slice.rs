@@ -4,6 +4,7 @@ use super::{
     dpb::{Marking, Mmco, Modification, PictureHeader},
     error::{H264Error, Unsupported},
 };
+use crate::rbsp::Counting;
 use h264_reader::{
     Context,
     nal::{
@@ -16,7 +17,7 @@ use h264_reader::{
         },
         sps::SeqParameterSet,
     },
-    rbsp::{BitRead, BitReader, BitReaderError, ByteReader, Integer, Primitive},
+    rbsp::{BitReader, ByteReader},
 };
 
 /// The type of a slice, with SP and SI folded away because they are rejected.
@@ -105,85 +106,6 @@ pub struct Slice {
     /// Bits from the start of the NAL unit, its header byte included, to
     /// `slice_data()`, not counting emulation prevention bytes.
     pub data_bit_offset: u32,
-}
-
-/// Counts the bits a parser reads.
-struct Counting<R> {
-    inner: R,
-    bits: u64,
-}
-
-impl<R: BitRead> BitRead for Counting<R> {
-    fn read_ue(&mut self, name: &'static str) -> Result<u32, BitReaderError> {
-        let value = self.inner.read_ue(name)?;
-        // `value + 1` has `n + 1` bits and the code is `n` zeros then those.
-        self.bits += u64::from(2 * (u64::from(value) + 1).ilog2() + 1);
-        Ok(value)
-    }
-
-    fn read_se(&mut self, name: &'static str) -> Result<i32, BitReaderError> {
-        let value = self.inner.read_se(name)?;
-        let code = if value > 0 {
-            i64::from(value) * 2 - 1
-        } else {
-            -i64::from(value) * 2
-        };
-        self.bits += u64::from(2 * (code.unsigned_abs() + 1).ilog2() + 1);
-        Ok(value)
-    }
-
-    fn read_bit(&mut self, name: &'static str) -> Result<bool, BitReaderError> {
-        let bit = self.inner.read_bit(name)?;
-        self.bits += 1;
-        Ok(bit)
-    }
-
-    fn read<const BITS: u32, I: Integer>(
-        &mut self,
-        name: &'static str,
-    ) -> Result<I, BitReaderError> {
-        let value = self.inner.read::<BITS, I>(name)?;
-        self.bits += u64::from(BITS);
-        Ok(value)
-    }
-
-    fn read_var<I: Integer>(
-        &mut self,
-        bit_count: u32,
-        name: &'static str,
-    ) -> Result<I, BitReaderError> {
-        let value = self.inner.read_var::<I>(bit_count, name)?;
-        self.bits += u64::from(bit_count);
-        Ok(value)
-    }
-
-    fn read_to<V: Primitive>(&mut self, name: &'static str) -> Result<V, BitReaderError> {
-        let value = self.inner.read_to::<V>(name)?;
-        self.bits += 8 * u64::try_from(size_of::<V>()).unwrap_or(0);
-        Ok(value)
-    }
-
-    fn skip(&mut self, bit_count: u32, name: &'static str) -> Result<(), BitReaderError> {
-        self.inner.skip(bit_count, name)?;
-        self.bits += u64::from(bit_count);
-        Ok(())
-    }
-
-    fn byte_aligned(&self) -> bool {
-        self.inner.byte_aligned()
-    }
-
-    fn has_more_rbsp_data(&mut self, name: &'static str) -> Result<bool, BitReaderError> {
-        self.inner.has_more_rbsp_data(name)
-    }
-
-    fn finish_rbsp(self) -> Result<(), BitReaderError> {
-        self.inner.finish_rbsp()
-    }
-
-    fn finish_sei_payload(self) -> Result<(), BitReaderError> {
-        self.inner.finish_sei_payload()
-    }
 }
 
 impl SliceHeader {
@@ -291,14 +213,12 @@ pub fn parse_slice(context: &Context, nal: &[u8]) -> Result<Slice, H264Error> {
         _ => return Err(H264Error::Invalid("not a slice NAL unit")),
     };
     let nal_ref_idc = nal_header.nal_ref_idc();
-    let mut bits = Counting {
-        inner: rbsp_bits(nal),
-        bits: 0,
-    };
+    let mut bits = Counting::new(rbsp_bits(nal));
     let (parsed, sps, pps) = ParsedHeader::from_bits(context, &mut bits, nal_header, None)
         .map_err(|error| H264Error::malformed("slice header", &error))?;
     super::sequence::check_picture_parameters(pps)?;
-    let data_bit_offset = u32::try_from(8 + bits.bits).map_err(|_| H264Error::Invalid("header"))?;
+    let data_bit_offset =
+        u32::try_from(8 + bits.bits()).map_err(|_| H264Error::Invalid("header"))?;
     let kind = match parsed.slice_type.family {
         SliceFamily::P => SliceKind::P,
         SliceFamily::B => SliceKind::B,

@@ -1104,13 +1104,13 @@ fn unsupported_configurations_fail_before_any_device_is_opened() {
     });
     assert!(matches!(
         handle.open(&h265).unwrap_err(),
-        VaapiError::UnsupportedCodec("H.265")
+        VaapiError::UnsupportedCodec("H.265 encoding")
     ));
     let mut av1 = annex_b_config();
     av1.codec = EncoderCodec::Av1;
     assert!(matches!(
         handle.open(&av1).unwrap_err(),
-        VaapiError::UnsupportedCodec("AV1")
+        VaapiError::UnsupportedCodec("AV1 encoding")
     ));
     let mut odd_rate = annex_b_config();
     odd_rate.codec = EncoderCodec::H264(H264Settings {

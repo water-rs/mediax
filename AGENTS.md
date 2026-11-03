@@ -15,7 +15,7 @@ cargo machete
 
 ## Architecture
 
-**mediax** is hardware-accelerated (Linux has VA-API H.264 encoding and progressive H.264 decoding; further decoders are still to come, #6), permissively licensed media processing for Rust: iOS, Android, macOS, Windows and Linux (plus wasm32 where a crate supports it).
+**mediax** is hardware-accelerated (Linux has VA-API H.264 encoding and progressive H.264 and H.265 decoding; further decoders are still to come, #6), permissively licensed media processing for Rust: iOS, Android, macOS, Windows and Linux (plus wasm32 where a crate supports it).
 
 - Root crate `mediax`: facade re-exporting the member crates behind features.
 - `core` (`mediax-core`): engine-neutral timing, color, stream and error types.

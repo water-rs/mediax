@@ -2,7 +2,7 @@
 
 Hardware-accelerated, permissively licensed codecs, containers and streaming for Rust.
 
-Video encode and decode go through the platform's own hardware stack: VideoToolbox on Apple platforms, Media Foundation on Windows, and MediaCodec on Android. Linux uses VA-API for H.264 encoding and for decoding progressive Baseline, Main and High streams (more of the backend is coming, #6). The only software codec is AV1 (rav1e and rav1d). There is deliberately no software H.264 or H.265, so nothing here carries a patent-encumbered or copyleft codec library. Apple targets need macOS 12 or iOS 15.
+Video encode and decode go through the platform's own hardware stack: VideoToolbox on Apple platforms, Media Foundation on Windows, and MediaCodec on Android. Linux uses VA-API for H.264 encoding and for decoding progressive H.264 (Baseline, Main, High) and H.265 (Main, Main 10) streams (more of the backend is coming, #6). The only software codec is AV1 (rav1e and rav1d). There is deliberately no software H.264 or H.265, so nothing here carries a patent-encumbered or copyleft codec library. Apple targets need macOS 12 or iOS 15.
 
 All crates are licensed `MIT OR Apache-2.0`.
 

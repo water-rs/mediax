@@ -4,7 +4,7 @@ use super::{
     dpb::{Marking, Mmco, Modification},
     slice::SliceKind,
 };
-use crate::annexb::START_CODE;
+pub use crate::rbsp::testing::{Bits, annex_b};
 use h264_reader::nal::{
     NalHeader, WritableNal,
     sps::{
@@ -81,89 +81,10 @@ impl Default for StreamConfig {
     }
 }
 
-/// Appends syntax elements bit by bit.
-#[derive(Debug, Default, Clone)]
-pub struct Bits(Vec<bool>);
-
-impl Bits {
-    /// The number of bits written.
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Writes a flag.
-    pub fn bit(&mut self, value: bool) {
-        self.0.push(value);
-    }
-
-    /// Writes `u(width)`.
-    pub fn u(&mut self, width: u8, value: u32) {
-        for shift in (0..width).rev() {
-            self.0.push(value >> shift & 1 == 1);
-        }
-    }
-
-    /// Writes `ue(v)`.
-    pub fn ue(&mut self, value: u32) {
-        let code = u64::from(value) + 1;
-        let width = 64 - code.leading_zeros();
-        for _ in 1..width {
-            self.0.push(false);
-        }
-        for shift in (0..width).rev() {
-            self.0.push(code >> shift & 1 == 1);
-        }
-    }
-
-    /// Writes `se(v)`.
-    pub fn se(&mut self, value: i32) {
-        self.ue(if value > 0 {
-            value.unsigned_abs() * 2 - 1
-        } else {
-            value.unsigned_abs() * 2
-        });
-    }
-
-    /// Ends the bits with the RBSP trailing bits and packs them.
-    #[must_use]
-    pub fn into_rbsp(mut self) -> Vec<u8> {
-        self.0.push(true);
-        while !self.0.len().is_multiple_of(8) {
-            self.0.push(false);
-        }
-        self.0
-            .chunks(8)
-            .map(|byte| byte.iter().fold(0, |acc, bit| acc << 1 | u8::from(*bit)))
-            .collect()
-    }
-}
-
 /// Inserts emulation prevention bytes into an RBSP and prepends the header.
 #[must_use]
 pub fn nal_unit(header: u8, rbsp: &[u8]) -> Vec<u8> {
-    let mut nal = vec![header];
-    let mut zeros = 0;
-    for &byte in rbsp {
-        if zeros >= 2 && byte <= 3 {
-            nal.push(3);
-            zeros = 0;
-        }
-        nal.push(byte);
-        zeros = if byte == 0 { zeros + 1 } else { 0 };
-    }
-    nal
-}
-
-/// Frames NAL units with four-byte start codes.
-#[must_use]
-pub fn annex_b(nals: &[Vec<u8>]) -> Vec<u8> {
-    let mut stream = Vec::new();
-    for nal in nals {
-        stream.extend_from_slice(&START_CODE);
-        stream.extend_from_slice(nal);
-    }
-    stream
+    crate::rbsp::testing::nal_unit(&[header], rbsp)
 }
 
 impl StreamConfig {

@@ -3,9 +3,10 @@
 
 use super::{
     VaapiError,
-    decoder::{DecodedPicture, VaapiDecoder, apply_weights, copy_nv12_cropped},
+    decoder::{H264Decoder, apply_weights},
     double::{Driver, chroma, fill_of, luma},
     plan::Nv12Planes,
+    target::{DecodedPicture, Visible, copy_cropped},
     types::{
         VA_INVALID_ID, VA_PICTURE_H264_INVALID, VA_PICTURE_H264_NON_EXISTING,
         VA_PICTURE_H264_SHORT_TERM_REFERENCE, VAProfileH264ConstrainedBaseline, VAProfileH264Main,
@@ -18,18 +19,17 @@ use crate::{
     bitstream::{annex_b_to_length_prefixed, build_h264_avcc_from_annex_b},
     h264::{
         H264Error,
-        sequence::Crop,
         slice::{EntryWeights, PredWeights},
         testing::{SliceSpec, StreamConfig, TestPoc, annex_b},
     },
 };
 use std::path::Path;
 
-fn open(config: Option<&[u8]>) -> Result<VaapiDecoder, VaapiError> {
-    VaapiDecoder::with_api(Driver::api(), Path::new("/dev/null"), config)
+fn open(config: Option<&[u8]>) -> Result<H264Decoder, VaapiError> {
+    H264Decoder::with_api(Driver::api(), Path::new("/dev/null"), config)
 }
 
-fn decoder() -> (Driver, VaapiDecoder) {
+fn decoder() -> (Driver, H264Decoder) {
     let driver = Driver::new();
     let decoder = open(None).unwrap();
     (driver, decoder)
@@ -64,7 +64,7 @@ fn access_unit(config: &StreamConfig, with_parameters: bool, specs: &[SliceSpec]
 }
 
 fn decode(
-    decoder: &mut VaapiDecoder,
+    decoder: &mut H264Decoder,
     config: &StreamConfig,
     first: bool,
     spec: SliceSpec,
@@ -518,7 +518,7 @@ fn a_driver_without_h264_decoding_is_unsupported() {
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn a_host_without_libva_gets_a_clear_error_from_the_constructor() {
-    let error = VaapiDecoder::new(None).unwrap_err();
+    let error = H264Decoder::new(None).unwrap_err();
     assert!(
         matches!(
             &error,
@@ -672,23 +672,47 @@ fn cropped_copies_check_the_image_they_read() {
         uv_pitch: 6,
     };
     let image: Vec<u8> = (0..36).collect();
-    let crop = Crop {
+    let visible = Visible {
         left: 2,
-        right: 0,
         top: 2,
-        bottom: 0,
+        width: 2,
+        height: 2,
     };
     // 4x4 coded, 2x2 visible.
-    let frame = copy_nv12_cropped(&image, planes, (4, 4), crop, (2, 2)).unwrap();
+    let frame = copy_cropped(&image, planes, (4, 4), visible, 1).unwrap();
     assert_eq!(frame, [14, 15, 20, 21, 32, 33]);
     assert!(matches!(
-        copy_nv12_cropped(&image[..30], planes, (4, 4), crop, (2, 2)),
+        copy_cropped(&image[..30], planes, (4, 4), visible, 1),
         Err(VaapiError::BufferTooSmall(_))
     ));
+    let too_wide = Visible {
+        width: 3,
+        ..visible
+    };
     assert!(matches!(
-        copy_nv12_cropped(&image, planes, (4, 4), crop, (3, 2)),
+        copy_cropped(&image, planes, (4, 4), too_wide, 1),
         Err(VaapiError::BufferTooSmall(_))
     ));
+}
+
+#[test]
+fn cropped_copies_of_two_byte_samples_keep_whole_samples() {
+    // 4x4 coded, 8 bytes a row; the visible 2x2 starts at column 2, row 2.
+    let planes = Nv12Planes {
+        y_offset: 0,
+        y_pitch: 8,
+        uv_offset: 32,
+        uv_pitch: 8,
+    };
+    let image: Vec<u8> = (0..48).collect();
+    let visible = Visible {
+        left: 2,
+        top: 2,
+        width: 2,
+        height: 2,
+    };
+    let frame = copy_cropped(&image, planes, (4, 4), visible, 2).unwrap();
+    assert_eq!(frame, [20, 21, 22, 23, 28, 29, 30, 31, 44, 45, 46, 47]);
 }
 
 #[test]
