@@ -15,6 +15,7 @@ use std::ffi::c_void;
 use std::fmt;
 use std::ptr;
 use std::time::Duration;
+use windows::Win32::Foundation::S_OK;
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncCommonRealTime, CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
@@ -489,16 +490,32 @@ fn configure_rate_control(codec_api: &ICodecAPI, config: &EncoderConfig) -> Resu
                 &CODECAPI_AVEncMPVDefaultBPictureCount,
                 VARIANT::from(0_u32),
             ),
-            (
-                "enabling realtime mode",
-                &CODECAPI_AVEncCommonRealTime,
-                VARIANT::from(1_u32),
-            ),
         ] {
             set_codec_value(codec_api, key, &value).map_err(|error| init_error(what, error))?;
         }
+        // The real-time scheduling hint is optional: not every encoder
+        // implements it (the one on hosted Windows runners does not), and the
+        // settings above already carry the latency guarantees.
+        if codec_value_supported(codec_api, &CODECAPI_AVEncCommonRealTime) {
+            set_codec_value(
+                codec_api,
+                &CODECAPI_AVEncCommonRealTime,
+                &VARIANT::from(1_u32),
+            )
+            .map_err(|error| init_error("enabling realtime mode", error))?;
+        }
     }
     Ok(())
+}
+
+/// Whether the encoder implements an `ICodecAPI` property.
+///
+/// `ICodecAPI::IsSupported` answers `S_OK` for a supported property and
+/// `S_FALSE` or an error otherwise; the generated wrapper folds `S_FALSE` into
+/// success, so the raw result is compared here.
+fn codec_value_supported(codec_api: &ICodecAPI, key: &GUID) -> bool {
+    // SAFETY: `codec_api` is a live interface and `key` is valid for the call.
+    unsafe { (Interface::vtable(codec_api).IsSupported)(Interface::as_raw(codec_api), key) == S_OK }
 }
 
 /// The compressed output media type: size, frame rate, colour, bitrate,
