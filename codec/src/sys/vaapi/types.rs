@@ -1,4 +1,4 @@
-//! The libva types the H.264 encoder uses.
+//! The libva types the H.264 encoder and decoder use.
 //!
 //! Layouts follow `va/va.h`, `va/va_enc_h264.h` and `va/drm/va_drm.h` of
 //! libva 2.24.1 (<https://github.com/intel/libva/tree/2.24.1>), for the LP64
@@ -12,14 +12,6 @@
     clippy::struct_field_names,
     reason = "the names are libva's, kept so each field can be found in the header"
 )]
-#![cfg_attr(
-    not(mediax_hw_codec_vaapi),
-    allow(
-        dead_code,
-        reason = "the Linux encoder consumes these; other hosts compile them for the layout tests"
-    )
-)]
-
 use std::ffi::{c_int, c_uint, c_void};
 
 /// `VADisplay`.
@@ -63,6 +55,8 @@ pub const VAProfileH264High: c_int = 7;
 /// `VAProfileH264ConstrainedBaseline`.
 pub const VAProfileH264ConstrainedBaseline: c_int = 13;
 
+/// `VAEntrypointVLD`.
+pub const VAEntrypointVLD: c_int = 1;
 /// `VAEntrypointEncSlice`.
 pub const VAEntrypointEncSlice: c_int = 6;
 /// `VAEntrypointEncSliceLP`.
@@ -88,6 +82,17 @@ pub const VA_ENC_PACKED_HEADER_SEQUENCE: u32 = 0x1;
 pub const VA_ENC_PACKED_HEADER_PICTURE: u32 = 0x2;
 /// `VA_ENC_PACKED_HEADER_SLICE`.
 pub const VA_ENC_PACKED_HEADER_SLICE: u32 = 0x4;
+
+/// `VAPictureParameterBufferType`.
+pub const VAPictureParameterBufferType: u32 = 0;
+/// `VAIQMatrixBufferType`.
+pub const VAIQMatrixBufferType: u32 = 1;
+/// `VASliceParameterBufferType`.
+pub const VASliceParameterBufferType: u32 = 4;
+/// `VASliceDataBufferType`.
+pub const VASliceDataBufferType: u32 = 5;
+/// `VA_SLICE_DATA_FLAG_ALL`: the buffer holds the whole slice.
+pub const VA_SLICE_DATA_FLAG_ALL: u32 = 0;
 
 /// `VAEncCodedBufferType`.
 pub const VAEncCodedBufferType: u32 = 21;
@@ -129,6 +134,10 @@ pub const VAGenericValueTypeInteger: u32 = 1;
 pub const VA_PICTURE_H264_INVALID: u32 = 0x1;
 /// `VA_PICTURE_H264_SHORT_TERM_REFERENCE`.
 pub const VA_PICTURE_H264_SHORT_TERM_REFERENCE: u32 = 0x8;
+/// `VA_PICTURE_H264_LONG_TERM_REFERENCE`.
+pub const VA_PICTURE_H264_LONG_TERM_REFERENCE: u32 = 0x10;
+/// `VA_PICTURE_H264_NON_EXISTING`.
+pub const VA_PICTURE_H264_NON_EXISTING: u32 = 0x20;
 
 /// `VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK`.
 pub const VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK: u32 = 0x200;
@@ -137,6 +146,8 @@ pub const VA_CODED_BUF_STATUS_BAD_BITSTREAM: u32 = 0x8000;
 
 /// `VA_PADDING_LOW`.
 const VA_PADDING_LOW: usize = 4;
+/// `VA_PADDING_MEDIUM`.
+const VA_PADDING_MEDIUM: usize = 8;
 
 /// `VAConfigAttrib`.
 #[repr(C)]
@@ -304,6 +315,145 @@ impl VAPictureH264 {
         BottomFieldOrderCnt: 0,
         va_reserved: [0; VA_PADDING_LOW],
     };
+}
+
+/// `VAPictureParameterBufferH264`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct VAPictureParameterBufferH264 {
+    pub CurrPic: VAPictureH264,
+    pub ReferenceFrames: [VAPictureH264; 16],
+    pub picture_width_in_mbs_minus1: u16,
+    pub picture_height_in_mbs_minus1: u16,
+    pub bit_depth_luma_minus8: u8,
+    pub bit_depth_chroma_minus8: u8,
+    pub num_ref_frames: u8,
+    pub seq_fields: u32,
+    pub num_slice_groups_minus1: u8,
+    pub slice_group_map_type: u8,
+    pub slice_group_change_rate_minus1: u16,
+    pub pic_init_qp_minus26: i8,
+    pub pic_init_qs_minus26: i8,
+    pub chroma_qp_index_offset: i8,
+    pub second_chroma_qp_index_offset: i8,
+    pub pic_fields: u32,
+    pub frame_num: u16,
+    pub va_reserved: [u32; VA_PADDING_MEDIUM],
+}
+
+/// `VAIQMatrixBufferH264`: the scaling lists in raster order.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct VAIQMatrixBufferH264 {
+    pub ScalingList4x4: [[u8; 16]; 6],
+    pub ScalingList8x8: [[u8; 64]; 2],
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VASliceParameterBufferH264`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct VASliceParameterBufferH264 {
+    pub slice_data_size: u32,
+    pub slice_data_offset: u32,
+    pub slice_data_flag: u32,
+    pub slice_data_bit_offset: u16,
+    pub first_mb_in_slice: u16,
+    pub slice_type: u8,
+    pub direct_spatial_mv_pred_flag: u8,
+    pub num_ref_idx_l0_active_minus1: u8,
+    pub num_ref_idx_l1_active_minus1: u8,
+    pub cabac_init_idc: u8,
+    pub slice_qp_delta: i8,
+    pub disable_deblocking_filter_idc: u8,
+    pub slice_alpha_c0_offset_div2: i8,
+    pub slice_beta_offset_div2: i8,
+    pub RefPicList0: [VAPictureH264; 32],
+    pub RefPicList1: [VAPictureH264; 32],
+    pub luma_log2_weight_denom: u8,
+    pub chroma_log2_weight_denom: u8,
+    pub luma_weight_l0_flag: u8,
+    pub luma_weight_l0: [i16; 32],
+    pub luma_offset_l0: [i16; 32],
+    pub chroma_weight_l0_flag: u8,
+    pub chroma_weight_l0: [[i16; 2]; 32],
+    pub chroma_offset_l0: [[i16; 2]; 32],
+    pub luma_weight_l1_flag: u8,
+    pub luma_weight_l1: [i16; 32],
+    pub luma_offset_l1: [i16; 32],
+    pub chroma_weight_l1_flag: u8,
+    pub chroma_weight_l1: [[i16; 2]; 32],
+    pub chroma_offset_l1: [[i16; 2]; 32],
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// The `seq_fields` bit-fields of `VAPictureParameterBufferH264` for a
+/// progressive 4:2:0 stream.
+#[derive(Debug, Clone, Copy)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "mirrors the C bit-fields one to one"
+)]
+pub struct DecodeSequenceFields {
+    pub gaps_in_frame_num_allowed: bool,
+    pub direct_8x8_inference: bool,
+    /// Whether the level is 3.1 or higher.
+    pub min_luma_bi_pred_size_8x8: bool,
+    pub log2_max_frame_num: u32,
+    pub pic_order_cnt_type: u32,
+    pub log2_max_poc_lsb: u32,
+    pub delta_pic_order_always_zero: bool,
+}
+
+impl DecodeSequenceFields {
+    /// The packed union value.
+    pub const fn pack(self) -> u32 {
+        const CHROMA_FORMAT_IDC_420: u32 = 1;
+        const FRAME_MBS_ONLY: u32 = 1 << 4;
+        CHROMA_FORMAT_IDC_420
+            | FRAME_MBS_ONLY
+            | ((self.gaps_in_frame_num_allowed as u32) << 3)
+            | ((self.direct_8x8_inference as u32) << 6)
+            | ((self.min_luma_bi_pred_size_8x8 as u32) << 7)
+            | ((self.log2_max_frame_num - 4) << 8)
+            | (self.pic_order_cnt_type << 12)
+            | (self.log2_max_poc_lsb.saturating_sub(4) << 14)
+            | ((self.delta_pic_order_always_zero as u32) << 18)
+    }
+}
+
+/// The `pic_fields` bit-fields of `VAPictureParameterBufferH264` for a frame
+/// picture.
+#[derive(Debug, Clone, Copy)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "mirrors the C bit-fields one to one"
+)]
+pub struct DecodePictureFields {
+    pub entropy_coding_mode: bool,
+    pub weighted_pred: bool,
+    pub weighted_bipred_idc: u32,
+    pub transform_8x8_mode: bool,
+    pub constrained_intra_pred: bool,
+    pub pic_order_present: bool,
+    pub deblocking_filter_control_present: bool,
+    pub redundant_pic_cnt_present: bool,
+    pub reference_pic: bool,
+}
+
+impl DecodePictureFields {
+    /// The packed union value.
+    pub const fn pack(self) -> u32 {
+        (self.entropy_coding_mode as u32)
+            | ((self.weighted_pred as u32) << 1)
+            | (self.weighted_bipred_idc << 2)
+            | ((self.transform_8x8_mode as u32) << 4)
+            | ((self.constrained_intra_pred as u32) << 6)
+            | ((self.pic_order_present as u32) << 7)
+            | ((self.deblocking_filter_control_present as u32) << 8)
+            | ((self.redundant_pic_cnt_present as u32) << 9)
+            | ((self.reference_pic as u32) << 10)
+    }
 }
 
 /// `VAEncSequenceParameterBufferH264`.
@@ -483,6 +633,108 @@ mod tests {
         assert_eq!(size_of::<VAEncSequenceParameterBufferH264>(), 1132);
         assert_eq!(size_of::<VAEncPictureParameterBufferH264>(), 648);
         assert_eq!(size_of::<VAEncSliceParameterBufferH264>(), 3140);
+        assert_eq!(
+            (
+                size_of::<VAPictureParameterBufferH264>(),
+                align_of::<VAPictureParameterBufferH264>()
+            ),
+            (672, 4)
+        );
+        assert_eq!(size_of::<VAIQMatrixBufferH264>(), 240);
+        assert_eq!(
+            (
+                size_of::<VASliceParameterBufferH264>(),
+                align_of::<VASliceParameterBufferH264>()
+            ),
+            (3128, 4)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, reason = "one assertion per field")]
+    fn decode_field_offsets_match_the_c_headers() {
+        type Picture = VAPictureParameterBufferH264;
+        type Slice = VASliceParameterBufferH264;
+        assert_eq!(offset_of!(Picture, ReferenceFrames), 36);
+        assert_eq!(offset_of!(Picture, picture_width_in_mbs_minus1), 612);
+        assert_eq!(offset_of!(Picture, picture_height_in_mbs_minus1), 614);
+        assert_eq!(offset_of!(Picture, bit_depth_luma_minus8), 616);
+        assert_eq!(offset_of!(Picture, bit_depth_chroma_minus8), 617);
+        assert_eq!(offset_of!(Picture, num_ref_frames), 618);
+        assert_eq!(offset_of!(Picture, seq_fields), 620);
+        assert_eq!(offset_of!(Picture, num_slice_groups_minus1), 624);
+        assert_eq!(offset_of!(Picture, slice_group_map_type), 625);
+        assert_eq!(offset_of!(Picture, slice_group_change_rate_minus1), 626);
+        assert_eq!(offset_of!(Picture, pic_init_qp_minus26), 628);
+        assert_eq!(offset_of!(Picture, pic_init_qs_minus26), 629);
+        assert_eq!(offset_of!(Picture, chroma_qp_index_offset), 630);
+        assert_eq!(offset_of!(Picture, second_chroma_qp_index_offset), 631);
+        assert_eq!(offset_of!(Picture, pic_fields), 632);
+        assert_eq!(offset_of!(Picture, frame_num), 636);
+        assert_eq!(offset_of!(Picture, va_reserved), 640);
+
+        assert_eq!(offset_of!(VAIQMatrixBufferH264, ScalingList8x8), 96);
+        assert_eq!(offset_of!(VAIQMatrixBufferH264, va_reserved), 224);
+
+        assert_eq!(offset_of!(Slice, slice_data_offset), 4);
+        assert_eq!(offset_of!(Slice, slice_data_flag), 8);
+        assert_eq!(offset_of!(Slice, slice_data_bit_offset), 12);
+        assert_eq!(offset_of!(Slice, first_mb_in_slice), 14);
+        assert_eq!(offset_of!(Slice, slice_type), 16);
+        assert_eq!(offset_of!(Slice, direct_spatial_mv_pred_flag), 17);
+        assert_eq!(offset_of!(Slice, num_ref_idx_l0_active_minus1), 18);
+        assert_eq!(offset_of!(Slice, num_ref_idx_l1_active_minus1), 19);
+        assert_eq!(offset_of!(Slice, cabac_init_idc), 20);
+        assert_eq!(offset_of!(Slice, slice_qp_delta), 21);
+        assert_eq!(offset_of!(Slice, disable_deblocking_filter_idc), 22);
+        assert_eq!(offset_of!(Slice, slice_alpha_c0_offset_div2), 23);
+        assert_eq!(offset_of!(Slice, slice_beta_offset_div2), 24);
+        assert_eq!(offset_of!(Slice, RefPicList0), 28);
+        assert_eq!(offset_of!(Slice, RefPicList1), 1180);
+        assert_eq!(offset_of!(Slice, luma_log2_weight_denom), 2332);
+        assert_eq!(offset_of!(Slice, chroma_log2_weight_denom), 2333);
+        assert_eq!(offset_of!(Slice, luma_weight_l0_flag), 2334);
+        assert_eq!(offset_of!(Slice, luma_weight_l0), 2336);
+        assert_eq!(offset_of!(Slice, luma_offset_l0), 2400);
+        assert_eq!(offset_of!(Slice, chroma_weight_l0_flag), 2464);
+        assert_eq!(offset_of!(Slice, chroma_weight_l0), 2466);
+        assert_eq!(offset_of!(Slice, chroma_offset_l0), 2594);
+        assert_eq!(offset_of!(Slice, luma_weight_l1_flag), 2722);
+        assert_eq!(offset_of!(Slice, luma_weight_l1), 2724);
+        assert_eq!(offset_of!(Slice, luma_offset_l1), 2788);
+        assert_eq!(offset_of!(Slice, chroma_weight_l1_flag), 2852);
+        assert_eq!(offset_of!(Slice, chroma_weight_l1), 2854);
+        assert_eq!(offset_of!(Slice, chroma_offset_l1), 2982);
+        assert_eq!(offset_of!(Slice, va_reserved), 3112);
+    }
+
+    // A C program set every bit-field of the headers' unions to the values
+    // below and printed 0x665d9 and 0x7fb; the latter also set
+    // `field_pic_flag` (bit 5), which frame pictures leave clear.
+    #[test]
+    fn decode_bit_fields_match_the_c_compiler() {
+        let sequence = DecodeSequenceFields {
+            gaps_in_frame_num_allowed: true,
+            direct_8x8_inference: true,
+            min_luma_bi_pred_size_8x8: true,
+            log2_max_frame_num: 9,
+            pic_order_cnt_type: 2,
+            log2_max_poc_lsb: 13,
+            delta_pic_order_always_zero: true,
+        };
+        assert_eq!(sequence.pack(), 0x665d9);
+        let picture = DecodePictureFields {
+            entropy_coding_mode: true,
+            weighted_pred: true,
+            weighted_bipred_idc: 2,
+            transform_8x8_mode: true,
+            constrained_intra_pred: true,
+            pic_order_present: true,
+            deblocking_filter_control_present: true,
+            redundant_pic_cnt_present: true,
+            reference_pic: true,
+        };
+        assert_eq!(picture.pack(), 0x7fb & !(1 << 5));
     }
 
     #[test]

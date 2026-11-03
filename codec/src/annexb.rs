@@ -63,7 +63,8 @@ pub fn annex_b_nalus(data: &[u8]) -> Vec<(usize, usize)> {
     test,
     mediax_hw_codec_apple,
     mediax_hw_codec_android,
-    mediax_hw_codec_windows
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
 ))]
 pub fn length_prefixed_to_annex_b(
     sample: &[u8],

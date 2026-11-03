@@ -23,7 +23,8 @@ fn main() {
         mediax_hw_codec_windows: { target_os = "windows" },
         // VA-API loads libva at run time, so the Linux backend compiles on any
         // Linux host and reports a missing driver stack from the constructor.
-        // Encode only: Linux decode stays outside `mediax_hw_codec`.
+        // Linux stays outside `mediax_hw_codec`, which gates the backends
+        // that take the shared packet path; VA-API has its own decoder wiring.
         mediax_hw_codec_vaapi: { target_os = "linux" },
         mediax_av1_software: { all(
             feature = "software-decode",
@@ -42,6 +43,7 @@ fn main() {
             target_vendor = "apple",
             target_os = "android",
             target_os = "windows",
+            target_os = "linux",
             all(
                 any(feature = "software-decode", feature = "software-encode"),
                 not(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))
@@ -50,6 +52,7 @@ fn main() {
         mediax_software_frames: { any(
             target_os = "android",
             target_os = "windows",
+            target_os = "linux",
             all(
                 any(feature = "software-decode", feature = "software-encode"),
                 not(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))

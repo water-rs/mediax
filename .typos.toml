@@ -1,4 +1,6 @@
 [default.extend-words]
+# The "BA" (baseline) in the JVT conformance bitstream names, such as SVA_BA2_D.
+BA = "BA"
 # ISO base media file format box names, spelled as the specification spells
 # them. `trun` is the track fragment run box, alongside `trak`.
 trak = "trak"

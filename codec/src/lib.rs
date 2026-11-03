@@ -81,6 +81,11 @@ mod color;
 mod config;
 mod encoder_config;
 mod frame;
+#[cfg(all(feature = "fuzzing", mediax_hw_codec_vaapi))]
+#[doc(hidden)]
+pub mod fuzzing;
+#[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
+mod h264;
 pub mod image;
 #[cfg(target_os = "android")]
 pub(crate) mod image_android;
@@ -349,6 +354,8 @@ enum DecoderInner {
     Android(sys::android::AndroidDecoder),
     #[cfg(mediax_hw_codec_windows)]
     Windows(sys::windows::WindowsDecoder),
+    #[cfg(mediax_hw_codec_vaapi)]
+    Vaapi(Box<sys::vaapi::VaapiDecoder>),
     #[cfg(mediax_av1_software)]
     Av1(software::av1::Av1Decoder),
 }
@@ -390,10 +397,21 @@ impl Decoder {
         {
             // With no hardware decoder backend these stay unused: the AV1
             // software decoder reads dimensions from the bitstream itself.
+            // The VA-API decoder reads the dimensions from the SPS.
             #[cfg(not(mediax_hw_codec))]
             let _ = (config, width, height);
 
             match codec {
+                #[cfg(mediax_hw_codec_vaapi)]
+                CodecType::H264 => Ok(Self {
+                    inner: sys::vaapi::open_decoder(config)?,
+                }),
+
+                #[cfg(mediax_hw_codec_vaapi)]
+                CodecType::H265 => Err(CodecError::Unsupported(
+                    "H.265 decoding over VA-API is not implemented".into(),
+                )),
+
                 #[cfg(mediax_hw_codec_apple)]
                 CodecType::H264 | CodecType::H265 => Ok(Self {
                     inner: sys::apple::open_decoder(codec, config, width, height)?,
@@ -409,7 +427,7 @@ impl Decoder {
                     inner: sys::windows::open_decoder(codec, config, width, height)?,
                 }),
 
-                #[cfg(not(mediax_hw_codec))]
+                #[cfg(not(any(mediax_hw_codec, mediax_hw_codec_vaapi)))]
                 CodecType::H264 | CodecType::H265 => Err(CodecError::Unsupported(format!(
                     "{codec:?} hardware decoding not available on this platform"
                 ))),
@@ -500,6 +518,12 @@ impl Decoder {
                 }
                 Ok(frames)
             }
+
+            #[cfg(mediax_hw_codec_vaapi)]
+            DecoderInner::Vaapi(ref mut dec) => dec
+                .decode(packet.data(), timestamp_ns(packet.presentation_time()))
+                .map(vaapi_frames)
+                .map_err(sys::vaapi::VaapiError::at_decode),
 
             #[cfg(mediax_av1_software)]
             DecoderInner::Av1(ref mut dec) => {
@@ -594,6 +618,11 @@ impl Decoder {
                     )
                 })
                 .collect()),
+            #[cfg(mediax_hw_codec_vaapi)]
+            DecoderInner::Vaapi(ref mut decoder) => decoder
+                .drain()
+                .map(vaapi_frames)
+                .map_err(sys::vaapi::VaapiError::at_decode),
             #[cfg(mediax_av1_software)]
             DecoderInner::Av1(ref mut decoder) => Ok(decoder
                 .drain()?
@@ -719,6 +748,25 @@ impl Decoder {
                 )
             }
 
+            #[cfg(mediax_hw_codec_vaapi)]
+            DecoderInner::Vaapi(ref mut dec) => {
+                let pictures = dec
+                    .decode(packet.data(), timestamp_ns(packet.presentation_time()))
+                    .map_err(sys::vaapi::VaapiError::at_decode)?;
+                copy_frames_to_buffer(
+                    pictures.into_iter().map(|picture| {
+                        (
+                            picture.data,
+                            picture.width,
+                            picture.height,
+                            picture.timestamp_ns,
+                            DecodedPixelLayout::Nv12,
+                        )
+                    }),
+                    output,
+                )
+            }
+
             #[cfg(mediax_av1_software)]
             DecoderInner::Av1(ref mut dec) => {
                 let cpu_frames = dec.decode(packet)?;
@@ -731,6 +779,30 @@ impl Decoder {
             }
         }
     }
+}
+
+/// The presentation time of a packet in the nanoseconds frames carry.
+#[cfg(mediax_hw_codec_vaapi)]
+fn timestamp_ns(time: Duration) -> u64 {
+    u64::try_from(time.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Wraps the frames of the VA-API decoder.
+#[cfg(mediax_hw_codec_vaapi)]
+fn vaapi_frames(pictures: Vec<sys::vaapi::DecodedPicture>) -> Vec<DecodedFrame> {
+    pictures
+        .into_iter()
+        .map(|picture| {
+            DecodedFrame::from_biplanar_data(
+                picture.data,
+                picture.width,
+                picture.height,
+                picture.timestamp_ns,
+                DecodedPixelLayout::Nv12,
+                None,
+            )
+        })
+        .collect()
 }
 
 /// Helper to copy decoded frames to an output buffer.

@@ -1,4 +1,4 @@
-//! The libva entry points the encoder calls, loaded at run time.
+//! The libva entry points the encoder and decoder call, loaded at run time.
 
 use super::{
     VaapiError,
@@ -134,6 +134,10 @@ libva_functions! {
             c_uint,
         ) -> VAStatus
         = "vaPutImage";
+    get_image:
+        unsafe extern "C" fn(VADisplay, VASurfaceID, c_int, c_int, c_uint, c_uint, VAImageID)
+            -> VAStatus
+        = "vaGetImage";
 }
 
 /// The two libraries the function pointers point into.
