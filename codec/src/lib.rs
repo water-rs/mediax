@@ -104,7 +104,7 @@ use std::{time::Duration, vec::IntoIter};
 use thiserror::Error;
 
 /// Routes `tracing` events to the test harness's captured output.
-#[cfg(test)]
+#[cfg(all(test, any(mediax_hw_codec_apple, mediax_av1_software_encode)))]
 pub(crate) fn init_test_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
@@ -863,9 +863,12 @@ impl Encoder {
     pub fn set_bitrate(&mut self, bitrate: Bitrate) -> Result<(), CodecError> {
         match self.inner {
             #[cfg(target_arch = "wasm32")]
-            EncoderInner::Unsupported => Err(CodecError::Unsupported(String::from(
-                "video encoding is not supported by mediax-codec on WebAssembly",
-            ))),
+            EncoderInner::Unsupported => {
+                let _ = bitrate;
+                Err(CodecError::Unsupported(String::from(
+                    "video encoding is not supported by mediax-codec on WebAssembly",
+                )))
+            }
             #[cfg(mediax_hw_codec_apple)]
             EncoderInner::Apple(ref mut enc) => enc.set_bitrate(bitrate),
             #[cfg(mediax_hw_codec_android)]

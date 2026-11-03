@@ -450,6 +450,102 @@ fn set_codec_value(codec_api: &ICodecAPI, key: &GUID, value: &VARIANT) -> Result
     unsafe { codec_api.SetValue(key, value) }.map_err(|error| error.to_string())
 }
 
+/// Wraps a failed encoder setup step.
+fn init_error(what: &str, error: impl std::fmt::Display) -> CodecError {
+    CodecError::InitializationFailed(format!("{what} failed: {error}"))
+}
+
+/// Sets bitrate, GOP size and, for realtime sessions, constant-bitrate
+/// low-latency encoding without B-frames.
+fn configure_rate_control(codec_api: &ICodecAPI, config: &EncoderConfig) -> Result<(), CodecError> {
+    let bitrate = VARIANT::from(config.bitrate.bits_per_second().get());
+    set_codec_value(codec_api, &CODECAPI_AVEncCommonMeanBitRate, &bitrate)
+        .map_err(|error| init_error("setting the mean bitrate", error))?;
+    let gop_size = config.keyframe_interval.map_or(u32::MAX, |interval| {
+        u32::try_from(config.frame_rate.frames_in(interval)).unwrap_or(u32::MAX)
+    });
+    set_codec_value(
+        codec_api,
+        &CODECAPI_AVEncMPVGOPSize,
+        &VARIANT::from(gop_size),
+    )
+    .map_err(|error| init_error("setting the GOP size", error))?;
+    if config.profile == EncoderProfile::Realtime {
+        // Constant bitrate keeps each frame inside its interval's budget;
+        // low-latency mode and no B-frames remove the reordering delay.
+        for (what, key, value) in [
+            (
+                "setting constant-bitrate rate control",
+                &CODECAPI_AVEncCommonRateControlMode,
+                VARIANT::from(eAVEncCommonRateControlMode_CBR.0.cast_unsigned()),
+            ),
+            (
+                "enabling low-latency mode",
+                &CODECAPI_AVLowLatencyMode,
+                VARIANT::from(true),
+            ),
+            (
+                "disabling B-frames",
+                &CODECAPI_AVEncMPVDefaultBPictureCount,
+                VARIANT::from(0_u32),
+            ),
+            (
+                "enabling realtime mode",
+                &CODECAPI_AVEncCommonRealTime,
+                VARIANT::from(1_u32),
+            ),
+        ] {
+            set_codec_value(codec_api, key, &value).map_err(|error| init_error(what, error))?;
+        }
+    }
+    Ok(())
+}
+
+/// The compressed output media type: size, frame rate, colour, bitrate,
+/// profile and (for H.264) level.
+fn create_output_type(
+    codec_type: CodecType,
+    config: &EncoderConfig,
+    frame_rate: (u32, u32),
+) -> Result<IMFMediaType, CodecError> {
+    let output_type = create_video_type(
+        codec_type.subtype(),
+        config.width.get(),
+        config.height.get(),
+        frame_rate,
+    )?;
+    set_color_metadata(&output_type, config.color)?;
+    let (profile, level) = match config.codec {
+        EncoderCodec::H264(settings) => (
+            match settings.profile {
+                H264Profile::ConstrainedBaseline => H264_PROFILE_CONSTRAINED_BASE,
+                H264Profile::Main => H264_PROFILE_MAIN,
+                H264Profile::High => H264_PROFILE_HIGH,
+            },
+            // `eAVEncH264VLevel*` values are the level_idc values.
+            Some(u32::from(settings.level.idc())),
+        ),
+        EncoderCodec::H265(_) => (H265_PROFILE_MAIN, None),
+        EncoderCodec::Av1 => unreachable!("AV1 is encoded in software"),
+    };
+    // SAFETY: `output_type` is a live media type and the keys are valid
+    // attribute GUIDs.
+    unsafe {
+        output_type
+            .SetUINT32(&MF_MT_AVG_BITRATE, config.bitrate.bits_per_second().get())
+            .map_err(|error| init_error("setting the average bitrate", error))?;
+        output_type
+            .SetUINT32(&MF_MT_MPEG2_PROFILE, profile)
+            .map_err(|error| init_error("setting the profile", error))?;
+        if let Some(level) = level {
+            output_type
+                .SetUINT32(&MF_MT_MPEG2_LEVEL, level)
+                .map_err(|error| init_error("setting the level", error))?;
+        }
+    }
+    Ok(output_type)
+}
+
 impl WindowsEncoder {
     /// Create a new Windows hardware encoder.
     pub fn new(config: &EncoderConfig) -> Result<Self, CodecError> {
@@ -459,11 +555,7 @@ impl WindowsEncoder {
             EncoderCodec::Av1 => unreachable!("AV1 is encoded in software"),
         };
         let (width, height) = (config.width.get(), config.height.get());
-        let realtime = config.profile == EncoderProfile::Realtime;
         let media_foundation = MediaFoundationSession::new()?;
-        let init = |what: &str, error: String| {
-            CodecError::InitializationFailed(format!("{what} failed: {error}"))
-        };
 
         unsafe {
             let transform = activate_hardware_transform(
@@ -480,78 +572,13 @@ impl WindowsEncoder {
 
             // Rate control and latency are set before the media types, which
             // is when Media Foundation encoders read them.
-            let bitrate = VARIANT::from(config.bitrate.bits_per_second().get());
-            set_codec_value(&codec_api, &CODECAPI_AVEncCommonMeanBitRate, &bitrate)
-                .map_err(|error| init("setting the mean bitrate", error))?;
-            let gop_size = config.keyframe_interval.map_or(u32::MAX, |interval| {
-                u32::try_from(config.frame_rate.frames_in(interval)).unwrap_or(u32::MAX)
-            });
-            set_codec_value(
-                &codec_api,
-                &CODECAPI_AVEncMPVGOPSize,
-                &VARIANT::from(gop_size),
-            )
-            .map_err(|error| init("setting the GOP size", error))?;
-            if realtime {
-                // Constant bitrate keeps each frame inside its interval's
-                // budget; low-latency mode and no B-frames remove the
-                // reordering delay.
-                for (what, key, value) in [
-                    (
-                        "setting constant-bitrate rate control",
-                        &CODECAPI_AVEncCommonRateControlMode,
-                        VARIANT::from(eAVEncCommonRateControlMode_CBR.0.cast_unsigned()),
-                    ),
-                    (
-                        "enabling low-latency mode",
-                        &CODECAPI_AVLowLatencyMode,
-                        VARIANT::from(true),
-                    ),
-                    (
-                        "disabling B-frames",
-                        &CODECAPI_AVEncMPVDefaultBPictureCount,
-                        VARIANT::from(0_u32),
-                    ),
-                    (
-                        "enabling realtime mode",
-                        &CODECAPI_AVEncCommonRealTime,
-                        VARIANT::from(1_u32),
-                    ),
-                ] {
-                    set_codec_value(&codec_api, key, &value).map_err(|error| init(what, error))?;
-                }
-            }
+            configure_rate_control(&codec_api, config)?;
 
             let frame_rate = (
                 config.frame_rate.numerator().get(),
                 config.frame_rate.denominator().get(),
             );
-            let output_type = create_video_type(codec_type.subtype(), width, height, frame_rate)?;
-            set_color_metadata(&output_type, config.color)?;
-            output_type
-                .SetUINT32(&MF_MT_AVG_BITRATE, config.bitrate.bits_per_second().get())
-                .map_err(|error| init("setting the average bitrate", error.to_string()))?;
-            let (profile, level) = match config.codec {
-                EncoderCodec::H264(settings) => (
-                    match settings.profile {
-                        H264Profile::ConstrainedBaseline => H264_PROFILE_CONSTRAINED_BASE,
-                        H264Profile::Main => H264_PROFILE_MAIN,
-                        H264Profile::High => H264_PROFILE_HIGH,
-                    },
-                    // `eAVEncH264VLevel*` values are the level_idc values.
-                    Some(u32::from(settings.level.idc())),
-                ),
-                EncoderCodec::H265(_) => (H265_PROFILE_MAIN, None),
-                EncoderCodec::Av1 => unreachable!("AV1 is encoded in software"),
-            };
-            output_type
-                .SetUINT32(&MF_MT_MPEG2_PROFILE, profile)
-                .map_err(|error| init("setting the profile", error.to_string()))?;
-            if let Some(level) = level {
-                output_type
-                    .SetUINT32(&MF_MT_MPEG2_LEVEL, level)
-                    .map_err(|error| init("setting the level", error.to_string()))?;
-            }
+            let output_type = create_output_type(codec_type, config, frame_rate)?;
 
             transform.SetOutputType(0, &output_type, 0).map_err(|e| {
                 CodecError::InitializationFailed(format!("SetOutputType failed: {e}"))
