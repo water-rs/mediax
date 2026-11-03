@@ -600,10 +600,24 @@ fn misc_kinds(frame: &[(u32, Vec<u8>)]) -> Vec<u32> {
 
 fn encode(encoder: &mut VaapiEncoder, seed: u8, keyframe: bool) -> crate::EncodedPacket {
     let mut packets = encoder
-        .encode_nv12(&nv12_frame(seed), FrameOptions { keyframe })
+        .encode_nv12(
+            &nv12_frame(seed),
+            Duration::from_millis(u64::from(seed)),
+            FrameOptions { keyframe },
+        )
         .unwrap();
     assert_eq!(packets.len(), 1);
-    packets.remove(0)
+    let packet = packets.remove(0);
+    assert_eq!(
+        packet.presentation_time,
+        Duration::from_millis(u64::from(seed))
+    );
+    assert_eq!(
+        packet.decode_time_nanos,
+        i64::from(seed) * 1_000_000,
+        "low-delay I/P decodes each frame at its presentation time"
+    );
+    packet
 }
 
 #[test]
@@ -751,7 +765,7 @@ fn frames_are_uploaded_padded_to_whole_macroblocks_through_the_image_pitch() {
     let mut encoder = handle.open(&annex_b_config()).unwrap();
     let frame = nv12_frame(3);
     encoder
-        .encode_nv12(&frame, FrameOptions::default())
+        .encode_nv12(&frame, Duration::ZERO, FrameOptions::default())
         .unwrap();
 
     let image = &handle.mock().uploads[0];
@@ -897,7 +911,7 @@ fn a_failed_frame_restarts_with_an_idr() {
     encode(&mut encoder, 0, false);
     handle.mock_mut().fail_on = Some(("vaRenderPicture", 0x1));
     let error = encoder
-        .encode_nv12(&nv12_frame(1), FrameOptions::default())
+        .encode_nv12(&nv12_frame(1), Duration::ZERO, FrameOptions::default())
         .unwrap_err();
     assert!(
         matches!(&error, CodecError::EncodingFailed(message) if message.contains("vaRenderPicture")),
@@ -922,7 +936,7 @@ fn wrong_sized_input_is_rejected_before_the_driver_is_touched() {
     let mut encoder = handle.open(&annex_b_config()).unwrap();
     let calls = handle.mock().log.len();
     let error = encoder
-        .encode_nv12(&[0; 10], FrameOptions::default())
+        .encode_nv12(&[0; 10], Duration::ZERO, FrameOptions::default())
         .unwrap_err();
     assert!(matches!(error, CodecError::EncodingFailed(_)));
     assert_eq!(handle.mock().log.len(), calls);
@@ -1107,7 +1121,7 @@ fn a_corrupt_coded_buffer_is_reported_and_the_next_frame_is_an_idr() {
     encode(&mut encoder, 0, false);
     handle.mock_mut().coded_status = VA_CODED_BUF_STATUS_BAD_BITSTREAM;
     let error = encoder
-        .encode_nv12(&nv12_frame(1), FrameOptions::default())
+        .encode_nv12(&nv12_frame(1), Duration::ZERO, FrameOptions::default())
         .unwrap_err();
     assert!(
         matches!(&error, CodecError::EncodingFailed(message) if message.contains("corrupt")),
@@ -1116,7 +1130,7 @@ fn a_corrupt_coded_buffer_is_reported_and_the_next_frame_is_an_idr() {
     handle.mock_mut().coded_status = VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK;
     assert!(
         encoder
-            .encode_nv12(&nv12_frame(2), FrameOptions::default())
+            .encode_nv12(&nv12_frame(2), Duration::ZERO, FrameOptions::default())
             .is_err()
     );
     handle.mock_mut().coded_status = 0;
@@ -1129,7 +1143,7 @@ fn a_failed_sync_is_reported() {
     let mut encoder = handle.open(&annex_b_config()).unwrap();
     handle.mock_mut().fail_on = Some(("vaSyncSurface", 0x22));
     let error = encoder
-        .encode_nv12(&nv12_frame(1), FrameOptions::default())
+        .encode_nv12(&nv12_frame(1), Duration::ZERO, FrameOptions::default())
         .unwrap_err();
     assert!(
         matches!(&error, CodecError::EncodingFailed(message) if message.contains("vaSyncSurface"))
@@ -1163,7 +1177,11 @@ fn hardware_encode_produces_decodable_annex_b() {
     let mut keyframes = 0;
     for index in 0..30_u8 {
         let packet = encoder
-            .encode_nv12(&nv12_frame(index.wrapping_mul(5)), FrameOptions::default())
+            .encode_nv12(
+                &nv12_frame(index.wrapping_mul(5)),
+                Duration::ZERO,
+                FrameOptions::default(),
+            )
             .unwrap()
             .remove(0);
         assert!(packet.data.starts_with(&[0, 0, 0, 1]) || packet.data.starts_with(&[0, 0, 1]));
@@ -1175,7 +1193,11 @@ fn hardware_encode_produces_decodable_annex_b() {
     }
     assert_eq!(keyframes, 1);
     let idr = encoder
-        .encode_nv12(&nv12_frame(9), FrameOptions { keyframe: true })
+        .encode_nv12(
+            &nv12_frame(9),
+            Duration::ZERO,
+            FrameOptions { keyframe: true },
+        )
         .unwrap()
         .remove(0);
     assert!(idr.keyframe);
@@ -1183,6 +1205,6 @@ fn hardware_encode_produces_decodable_annex_b() {
         .set_bitrate(Bitrate::new(NonZeroU32::new(1_000_000).unwrap()))
         .unwrap();
     encoder
-        .encode_nv12(&nv12_frame(10), FrameOptions::default())
+        .encode_nv12(&nv12_frame(10), Duration::ZERO, FrameOptions::default())
         .unwrap();
 }

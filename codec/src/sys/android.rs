@@ -2,8 +2,9 @@
 
 use crate::{
     Bitrate, BitstreamFormat, CodecError, DecodePacket, DecodedPixelLayout, EncodedPacket,
-    EncoderCodec, EncoderConfig, EncoderProfile, FrameOptions, FrameRate, H264Level, H264Profile,
+    EncoderCodec, EncoderConfig, EncoderProfile, FrameOptions, H264Level, H264Profile,
     annexb::AnnexBPackets, bitstream::NalStreamConverter, config::decoded_pixel_layout,
+    encoder_config::signed_nanos,
 };
 use mediax_core::{
     ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
@@ -461,8 +462,9 @@ pub struct AndroidEncoder {
     codec_type: CodecType,
     width: u32,
     height: u32,
-    frame_rate: FrameRate,
-    frame_count: i64,
+    /// The presentation time of the last packet, which the next must follow:
+    /// the encoder is configured without B-frames, so output keeps input order.
+    last_presentation: Option<Duration>,
     codec_config: Option<Vec<u8>>,
     packets: AnnexBPackets,
 }
@@ -473,7 +475,7 @@ impl fmt::Debug for AndroidEncoder {
             .field("codec_type", &self.codec_type)
             .field("width", &self.width)
             .field("height", &self.height)
-            .field("frame_count", &self.frame_count)
+            .field("last_presentation", &self.last_presentation)
             .finish_non_exhaustive()
     }
 }
@@ -609,8 +611,7 @@ impl AndroidEncoder {
             codec_type,
             width: config.width.get(),
             height: config.height.get(),
-            frame_rate: config.frame_rate,
-            frame_count: 0,
+            last_presentation: None,
             codec_config: None,
             packets: AnnexBPackets::new(codec_type == CodecType::H265, bitstream, Vec::new()),
         })
@@ -631,6 +632,7 @@ impl AndroidEncoder {
     pub fn encode_nv12(
         &mut self,
         nv12: &[u8],
+        presentation_time: Duration,
         options: FrameOptions,
     ) -> Result<Vec<EncodedPacket>, CodecError> {
         use ndk::media::media_codec::{DequeuedInputBufferResult, DequeuedOutputBufferInfoResult};
@@ -681,20 +683,14 @@ impl AndroidEncoder {
             buffer_slice[i] = MaybeUninit::new(*byte);
         }
 
-        // Queue input buffer with the presentation time of this frame.
-        let presentation_time_us =
-            self.frame_count * 1_000_000 * i64::from(self.frame_rate.denominator().get())
-                / i64::from(self.frame_rate.numerator().get());
-        self.frame_count += 1;
+        // Queue the input buffer with the frame's presentation time, which
+        // `MediaCodec` returns on the output buffer that encodes it.
+        let presentation_time_us = u64::try_from(presentation_time.as_micros()).map_err(|_| {
+            CodecError::EncodingFailed("presentation time exceeds u64 microseconds".into())
+        })?;
 
         self.codec
-            .queue_input_buffer(
-                input_buffer,
-                0,
-                expected_size,
-                presentation_time_us as u64,
-                0,
-            )
+            .queue_input_buffer(input_buffer, 0, expected_size, presentation_time_us, 0)
             .map_err(|e| CodecError::EncodingFailed(format!("queue_input_buffer: {e}")))?;
 
         // Collect encoded output
@@ -722,7 +718,31 @@ impl AndroidEncoder {
                         self.packets.set_parameter_sets(bytes.clone());
                         self.codec_config = Some(bytes);
                     } else if !bytes.is_empty() {
-                        packets.push(self.packets.packet(bytes)?);
+                        let presentation_time = Duration::from_micros(
+                            u64::try_from(info.presentation_time_us()).map_err(|_| {
+                                CodecError::EncodingFailed(
+                                    "MediaCodec reported a negative presentation time".into(),
+                                )
+                            })?,
+                        );
+                        // MediaCodec reports no decode time. Without B-frames
+                        // (none are requested) frames are coded in presentation
+                        // order, so the decode time is the presentation time;
+                        // a reordering encoder would break that, so it is refused.
+                        if self
+                            .last_presentation
+                            .is_some_and(|last| presentation_time <= last)
+                        {
+                            return Err(CodecError::EncodingFailed(
+                                "MediaCodec emitted frames out of presentation order".into(),
+                            ));
+                        }
+                        self.last_presentation = Some(presentation_time);
+                        packets.push(self.packets.packet(
+                            bytes,
+                            presentation_time,
+                            signed_nanos(presentation_time)?,
+                        )?);
                     }
 
                     self.codec

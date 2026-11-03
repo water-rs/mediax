@@ -1,6 +1,5 @@
 //! `mediax transcode`: decode the video track, encode it again, copy the rest.
 
-use std::collections::VecDeque;
 use std::io::{Seek, Write};
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -22,7 +21,7 @@ use crate::output::{container_format, remove_on_failure};
 use crate::samples::Samples;
 use crate::tracks::tracks_with_signaled_color;
 
-const NANOS_PER_SECOND: u128 = 1_000_000_000;
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
 
 /// How to encode the video track.
 #[derive(Debug, Clone, Copy)]
@@ -95,13 +94,12 @@ fn single_video_track<'a>(
     Ok(first)
 }
 
-/// The decoder and encoder of the video track, and the timing that pairs
-/// frames with the packets that come back out.
+/// The decoder and encoder of the video track.
 ///
-/// The encoder reports no timestamps, so packets are paired with frames by
-/// order: that holds because the encoders run without frame reordering (the
-/// AV1 encoder always, the hardware encoders in their `Realtime` profile), and
-/// each frame's presentation time is then also its decode time.
+/// Each frame goes to the encoder with its presentation time, and each packet
+/// that comes back is timed by the presentation and decode time it reports,
+/// so a frame the encoder drops simply leaves no sample and a reordering
+/// encoder gets composition offsets.
 struct VideoPipeline {
     /// The source track, whose id, size, timescale and colour the output keeps.
     source: TrackInfo,
@@ -111,11 +109,10 @@ struct VideoPipeline {
     encoder: Encoder,
     frame_rate: FrameRate,
     pixels: Vec<u8>,
-    /// Presentation times of frames the encoder has not returned a packet for.
-    awaiting: VecDeque<Duration>,
     /// The last packet, held until the next one gives its duration.
-    held: Option<(Duration, EncodedPacket)>,
-    /// Ticks between the last two packets, the duration of the final one.
+    held: Option<EncodedPacket>,
+    /// Ticks between the decode times of the last two packets, the duration of
+    /// the final one.
     last_gap: Option<i64>,
     frames: u64,
     packets: u64,
@@ -154,10 +151,7 @@ impl VideoPipeline {
             width: EvenDimension::new(width)?,
             height: EvenDimension::new(height)?,
             color,
-            profile: match options.codec {
-                OutputCodec::H264 | OutputCodec::H265 => EncoderProfile::Realtime,
-                OutputCodec::Av1 => EncoderProfile::Offline,
-            },
+            profile: EncoderProfile::Offline,
             bitrate: Bitrate::new(bitrate),
             frame_rate,
             keyframe_interval: options.keyframe_interval,
@@ -193,7 +187,6 @@ impl VideoPipeline {
             encoder,
             frame_rate,
             pixels: Vec::new(),
-            awaiting: VecDeque::new(),
             held: None,
             last_gap: None,
             frames: 0,
@@ -235,14 +228,13 @@ impl VideoPipeline {
         self.pixels
             .resize(layout.packed_len(frame.width(), frame.height()), 0);
         frame.copy_to_buffer(&mut self.pixels);
-        self.awaiting.push_back(frame.timestamp());
         let options = FrameOptions {
             keyframe: self.frames == 0,
         };
         self.frames += 1;
         let packets = self
             .encoder
-            .encode_nv12(&self.pixels, options)
+            .encode_nv12(&self.pixels, frame.timestamp(), options)
             .collect::<Result<Vec<_>, _>>()?;
         for packet in packets {
             self.emit(packet, muxer)?;
@@ -255,19 +247,18 @@ impl VideoPipeline {
         packet: EncodedPacket,
         muxer: &mut Muxer<W>,
     ) -> Result<(), CliError> {
-        let time = self.awaiting.pop_front().ok_or(CliError::UnpairedPacket)?;
         self.packets += 1;
-        if let Some((previous_time, previous)) = self.held.replace((time, packet)) {
-            let gap = self.ticks(time) - self.ticks(previous_time);
+        let decode = self.decode_ticks(&packet);
+        if let Some(previous) = self.held.replace(packet) {
+            let gap = decode - self.decode_ticks(&previous);
             self.last_gap = Some(gap);
-            self.write(previous_time, previous, gap, muxer)?;
+            self.write(previous, gap, muxer)?;
         }
         Ok(())
     }
 
     fn write<W: Write + Seek>(
         &mut self,
-        time: Duration,
         packet: EncodedPacket,
         duration_ticks: i64,
         muxer: &mut Muxer<W>,
@@ -289,11 +280,15 @@ impl VideoPipeline {
             self.track_declared = true;
         }
         let timescale = self.source.timescale();
-        let at = MediaTime::new(self.ticks(time), timescale);
+        let presentation = MediaTime::new(
+            self.ticks(packet.presentation_time.as_nanos().cast_signed()),
+            timescale,
+        );
+        let decode = MediaTime::new(self.decode_ticks(&packet), timescale);
         muxer.write_sample(&EncodedSample::new(
             self.source.id(),
-            at,
-            at,
+            decode,
+            presentation,
             MediaTime::new(duration_ticks, timescale),
             packet.keyframe,
             Bytes::from(packet.data),
@@ -301,11 +296,16 @@ impl VideoPipeline {
         Ok(())
     }
 
-    /// `time` in ticks of the source track's timescale, to the nearest tick.
-    fn ticks(&self, time: Duration) -> i64 {
-        let scaled =
-            time.as_nanos() * u128::from(self.source.timescale().get()) + NANOS_PER_SECOND / 2;
-        i64::try_from(scaled / NANOS_PER_SECOND).unwrap_or(i64::MAX)
+    /// `nanos` in ticks of the source track's timescale, to the nearest tick
+    /// (halves round up, negative times included).
+    fn ticks(&self, nanos: i128) -> i64 {
+        let scaled = nanos * i128::from(self.source.timescale().get()) + NANOS_PER_SECOND / 2;
+        i64::try_from(scaled.div_euclid(NANOS_PER_SECOND)).unwrap_or(i64::MAX)
+    }
+
+    /// The decode time of `packet` in ticks of the source track's timescale.
+    fn decode_ticks(&self, packet: &EncodedPacket) -> i64 {
+        self.ticks(i128::from(packet.decode_time_nanos))
     }
 
     fn finish<W: Write + Seek>(mut self, muxer: &mut Muxer<W>) -> Result<(), CliError> {
@@ -319,13 +319,7 @@ impl VideoPipeline {
         if self.frames == 0 {
             return Err(CliError::NoFrames);
         }
-        if !self.awaiting.is_empty() {
-            return Err(CliError::MissingPackets {
-                packets: self.packets,
-                frames: self.frames,
-            });
-        }
-        if let Some((time, packet)) = self.held.take() {
+        if let Some(packet) = self.held.take() {
             // The final packet lasts as long as the one before it, or one
             // frame period when it is the only one.
             let duration = self.last_gap.unwrap_or_else(|| {
@@ -334,9 +328,13 @@ impl VideoPipeline {
                 let rate = u128::from(self.frame_rate.numerator().get());
                 i64::try_from((scaled + rate / 2) / rate).unwrap_or(i64::MAX)
             });
-            self.write(time, packet, duration, muxer)?;
+            self.write(packet, duration, muxer)?;
         }
-        tracing::info!(frames = self.frames, "transcoded the video track");
+        tracing::info!(
+            frames = self.frames,
+            kept = self.packets,
+            "transcoded the video track"
+        );
         Ok(())
     }
 }

@@ -18,6 +18,13 @@ use std::{
 
 /// The benchmarked stream rate, 30 fps.
 const FRAME_RATE: FrameRate = FrameRate::new(NonZeroU32::new(30).unwrap(), NonZeroU32::MIN);
+
+/// The presentation time of frame `index` at [`FRAME_RATE`].
+fn frame_time(index: usize) -> Duration {
+    Duration::from_secs(index as u64) * FRAME_RATE.denominator().get()
+        / FRAME_RATE.numerator().get()
+}
+
 /// The benchmarked target bitrate, 20 Mbps.
 const BITRATE: Bitrate = Bitrate::new(NonZeroU32::new(20_000_000).unwrap());
 
@@ -67,8 +74,8 @@ fn benchmark_encoder(
     println!("\n=== Benchmarking {name} ===");
 
     // Warmup
-    for _ in 0..5 {
-        for result in encoder.encode_nv12(nv12_data, FrameOptions::default()) {
+    for index in 0..5 {
+        for result in encoder.encode_nv12(nv12_data, frame_time(index), FrameOptions::default()) {
             let _ = result;
         }
     }
@@ -78,8 +85,8 @@ fn benchmark_encoder(
     let mut success_count = 0u32;
     let mut total_bytes = 0usize;
 
-    for _ in 0..iterations {
-        for result in encoder.encode_nv12(nv12_data, FrameOptions::default()) {
+    for index in 5..5 + iterations as usize {
+        for result in encoder.encode_nv12(nv12_data, frame_time(index), FrameOptions::default()) {
             match result {
                 Ok(data) => {
                     success_count += 1;
@@ -90,6 +97,11 @@ fn benchmark_encoder(
                 }
             }
         }
+    }
+    // A reordering or lookahead encoder holds frames back until flushed.
+    for packet in encoder.flush().expect("flush after the timed run") {
+        success_count += 1;
+        total_bytes += packet.data.len();
     }
 
     let elapsed = start.elapsed();
@@ -260,7 +272,7 @@ fn benchmark_av1(width: u32, height: u32, bitrate: Bitrate, measured_frames: usi
     for index in 0..WARMUP_FRAMES + measured_frames {
         source.write_frame(index, &mut frame);
         let start = Instant::now();
-        let packets = encoder.encode_nv12(&frame, FrameOptions::default());
+        let packets = encoder.encode_nv12(&frame, frame_time(index), FrameOptions::default());
         let mut frame_bytes = 0usize;
         for packet in packets {
             frame_bytes += packet.expect("AV1 encode must succeed").data.len();

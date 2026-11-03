@@ -1,7 +1,7 @@
 //! AV1 software encoding (rav1e) and decoding (rav1d).
 
 #[cfg(mediax_av1_software_encode)]
-use crate::{Bitrate, EncodedPacket, EncoderProfile, FrameOptions};
+use crate::{Bitrate, EncodedPacket, EncoderProfile, FrameOptions, encoder_config::signed_nanos};
 use crate::{CodecError, DecodePacket, DecodedPixelLayout};
 #[cfg(all(
     not(any(target_os = "android", target_arch = "wasm32")),
@@ -23,6 +23,8 @@ use rav1e::prelude::*;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
+#[cfg(mediax_av1_software_encode)]
+use std::time::Duration;
 use std::{ptr, slice};
 
 /// `EAGAIN` as `rav1d` reports it: "no picture yet, send more data".
@@ -228,6 +230,7 @@ impl Av1Encoder {
     pub fn encode_nv12(
         &mut self,
         nv12: &[u8],
+        presentation_time: Duration,
         options: FrameOptions,
     ) -> Result<Vec<EncodedPacket>, CodecError> {
         let y_size = self.width * self.height;
@@ -298,6 +301,8 @@ impl Av1Encoder {
             } else {
                 FrameTypeOverride::No
             },
+            // rav1e hands the opaque back on the packet of this frame.
+            opaque: Some(Opaque::new(presentation_time)),
             ..Default::default()
         };
         self.ctx
@@ -306,10 +311,7 @@ impl Av1Encoder {
 
         loop {
             match self.ctx.receive_packet() {
-                Ok(pkt) => output.push(EncodedPacket {
-                    keyframe: pkt.frame_type == FrameType::KEY,
-                    data: pkt.data,
-                }),
+                Ok(pkt) => output.push(encoded_packet(pkt)?),
                 Err(
                     EncoderStatus::Encoded
                     | EncoderStatus::NeedMoreData
@@ -343,10 +345,7 @@ impl Av1Encoder {
         let mut packets = Vec::new();
         loop {
             match self.ctx.receive_packet() {
-                Ok(pkt) => packets.push(EncodedPacket {
-                    keyframe: pkt.frame_type == FrameType::KEY,
-                    data: pkt.data,
-                }),
+                Ok(pkt) => packets.push(encoded_packet(pkt)?),
                 Err(EncoderStatus::Encoded | EncoderStatus::NeedMoreData) => {}
                 Err(EncoderStatus::LimitReached) => break,
                 Err(e) => return Err(CodecError::EncodingFailed(e.to_string())),
@@ -355,6 +354,28 @@ impl Av1Encoder {
 
         Ok(packets)
     }
+}
+
+/// Frames a rav1e packet with the presentation time its frame was submitted
+/// with.
+///
+/// The encoder runs in low-latency mode, which codes frames in presentation
+/// order and never reorders, so the decode time is the presentation time.
+#[cfg(mediax_av1_software_encode)]
+fn encoded_packet(packet: Packet<u8>) -> Result<EncodedPacket, CodecError> {
+    let presentation_time = packet
+        .opaque
+        .and_then(|opaque| opaque.downcast::<Duration>().ok())
+        .map(|time| *time)
+        .ok_or_else(|| {
+            CodecError::EncodingFailed("rav1e returned a packet without its frame's time".into())
+        })?;
+    Ok(EncodedPacket {
+        keyframe: packet.frame_type == FrameType::KEY,
+        data: packet.data,
+        presentation_time,
+        decode_time_nanos: signed_nanos(presentation_time)?,
+    })
 }
 
 /// AV1 software decoder using rav1d.
@@ -819,7 +840,10 @@ mod encoder_tests {
     use mediax_core::{
         ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
     };
-    use std::{num::NonZeroU32, time::Instant};
+    use std::{
+        num::NonZeroU32,
+        time::{Duration, Instant},
+    };
 
     fn nz(value: u32) -> NonZeroU32 {
         NonZeroU32::new(value).expect("test value is non-zero")
@@ -864,6 +888,7 @@ mod encoder_tests {
         rate_change: Option<usize>,
     ) -> (Vec<bool>, Vec<std::time::Duration>) {
         let mut keyframes = Vec::new();
+        let mut times = Vec::new();
         let mut latencies = Vec::new();
         for index in 0..count {
             if rate_change == Some(index) {
@@ -875,6 +900,7 @@ mod encoder_tests {
             let packets = encoder
                 .encode_nv12(
                     &frame(index),
+                    Duration::from_secs(index as u64) / 30,
                     FrameOptions {
                         keyframe: request == Some(index),
                     },
@@ -883,14 +909,20 @@ mod encoder_tests {
                 .expect("encode");
             latencies.push(started.elapsed());
             keyframes.extend(packets.iter().map(|packet| packet.keyframe));
+            times.extend(packets.iter().map(|packet| packet.presentation_time));
+            assert!(packets.iter().all(|packet| {
+                packet.decode_time_nanos
+                    == i64::try_from(packet.presentation_time.as_nanos()).unwrap()
+            }));
         }
-        keyframes.extend(
-            encoder
-                .flush()
-                .expect("flush")
-                .iter()
-                .map(|packet| packet.keyframe),
-        );
+        let flushed = encoder.flush().expect("flush");
+        keyframes.extend(flushed.iter().map(|packet| packet.keyframe));
+        times.extend(flushed.iter().map(|packet| packet.presentation_time));
+        // Each packet carries its own frame's time, across the restart too.
+        let expected: Vec<_> = (0..count)
+            .map(|index| Duration::from_secs(index as u64) / 30)
+            .collect();
+        assert_eq!(times, expected);
         (keyframes, latencies)
     }
 

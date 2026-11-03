@@ -289,7 +289,13 @@ pub struct FrameOptions {
     pub keyframe: bool,
 }
 
-/// One encoded access unit.
+/// One encoded access unit and the timing of the frame it encodes.
+///
+/// A frame the encoder drops under rate control produces no packet, so
+/// packets pair with the submitted frames by [`presentation_time`], never by
+/// count or order.
+///
+/// [`presentation_time`]: Self::presentation_time
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedPacket {
     /// The access unit in the configured bitstream format.
@@ -297,6 +303,38 @@ pub struct EncodedPacket {
     /// Whether this is a random access point: an IDR for H.264 and H.265, a
     /// key frame for AV1.
     pub keyframe: bool,
+    /// The presentation time the frame was submitted with, to the resolution
+    /// of the platform encoder's own clock (100 ns for Media Foundation, 1 us
+    /// for `MediaCodec`, exact for the others).
+    pub presentation_time: Duration,
+    /// The time the frame is decoded at, in signed nanoseconds on the
+    /// encoder's decode timeline, as the platform encoder reports it. Decode
+    /// times strictly increase from packet to packet. An encoder that does not
+    /// reorder frames (VA-API, `MediaCodec`, rav1e, and `VideoToolbox` and
+    /// Media Foundation in the realtime profile) decodes each frame at its
+    /// presentation time. A reordering encoder (B-frames, offline profile)
+    /// decodes in a different order than it presents, and its decode timeline
+    /// is offset from the presentation timeline by the platform's own lead: a
+    /// decode time can fall after the presentation time of the same frame, a
+    /// negative composition offset, which a container muxer must absorb.
+    pub decode_time_nanos: i64,
+}
+
+/// `time` in the signed nanoseconds of [`EncodedPacket::decode_time_nanos`].
+///
+/// # Errors
+///
+/// Returns [`CodecError::EncodingFailed`] for a time past `i64::MAX`
+/// nanoseconds (about 292 years).
+#[cfg(any(
+    mediax_av1_software_encode,
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
+))]
+pub fn signed_nanos(time: Duration) -> Result<i64, CodecError> {
+    i64::try_from(time.as_nanos())
+        .map_err(|_| CodecError::EncodingFailed(format!("{time:?} does not fit i64 nanoseconds")))
 }
 
 #[cfg(test)]
