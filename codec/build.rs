@@ -12,6 +12,12 @@ fn main() {
     // *_software_frames: decoded frames stored as CPU planes (every backend
     // except Apple's `IOSurface` path).
     cfg_aliases::cfg_aliases! {
+        // AAC decodes in pure Rust only where no system decoder exists.
+        mediax_aac_pure_rust: { not(any(
+            target_vendor = "apple",
+            target_os = "android",
+            target_os = "windows"
+        )) },
         mediax_hw_codec_apple: { target_vendor = "apple" },
         mediax_hw_codec_android: { target_os = "android" },
         mediax_hw_codec_windows: { target_os = "windows" },

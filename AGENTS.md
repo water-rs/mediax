@@ -30,7 +30,7 @@ Platform access goes through `objc2`, `windows` and `jni`/`ndk` directly.
 ## Codec policy
 
 - No software H.264 or H.265, by design.
-- No HE-AAC / FDK AAC: its bundled Fraunhofer source grants no patent licence. AAC-LC decodes through MediaCodec, Media Foundation or the pure-Rust symphonia decoder.
+- No FDK AAC: its bundled Fraunhofer source grants no patent licence. AAC decodes through AudioToolbox, MediaCodec or Media Foundation (HE-AAC included); only targets without a system decoder use the pure-Rust symphonia decoder, which is AAC-LC only.
 - Every dependency must be permissively licensed.
 
 ## Coding guidelines
