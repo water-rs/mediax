@@ -390,30 +390,10 @@ pub fn same_time(a: MediaTime, b: MediaTime) -> bool {
         == i128::from(b.ticks()) * i128::from(a.timescale().get())
 }
 
-/// `time` in seconds-as-a-fraction relative to `origin`: ticks since `origin`
-/// over `time`'s timescale, cross-multiplied against another by [`same_time`].
-fn since(time: MediaTime, origin: MediaTime) -> MediaTime {
-    let origin_ticks = i128::from(origin.ticks()) * i128::from(time.timescale().get())
-        / i128::from(origin.timescale().get());
-    MediaTime::new(
-        i64::try_from(i128::from(time.ticks()) - origin_ticks).expect("fits i64"),
-        time.timescale(),
-    )
-}
-
 /// Asserts `actual` carries `expected`'s samples: the same bytes, keyframe
-/// flags and durations, and timestamps measured from each track's first
-/// sample. The muxer stores a track's start in an edit list, which the sample
-/// reader does not apply, so a track that starts late in the source reads back
-/// from zero.
+/// flags, durations and timestamps.
 pub fn assert_same_samples(actual: &[EncodedSample], expected: &[EncodedSample], label: &str) {
     assert_eq!(actual.len(), expected.len(), "{label}: sample count");
-    let (Some(actual_start), Some(expected_start)) = (
-        actual.first().map(EncodedSample::decode_time),
-        expected.first().map(EncodedSample::decode_time),
-    ) else {
-        return;
-    };
     for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
         assert_eq!(
             actual.data(),
@@ -426,15 +406,11 @@ pub fn assert_same_samples(actual: &[EncodedSample], expected: &[EncodedSample],
             "{label}: sample {index} keyframe flag"
         );
         for (what, actual, expected) in [
-            (
-                "decode time",
-                since(actual.decode_time(), actual_start),
-                since(expected.decode_time(), expected_start),
-            ),
+            ("decode time", actual.decode_time(), expected.decode_time()),
             (
                 "presentation time",
-                since(actual.presentation_time(), actual_start),
-                since(expected.presentation_time(), expected_start),
+                actual.presentation_time(),
+                expected.presentation_time(),
             ),
             ("duration", actual.duration(), expected.duration()),
         ] {
