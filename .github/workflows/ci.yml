@@ -29,7 +29,7 @@ jobs:
   # job below runs only when the change touches something it reads.
   changes:
     name: Changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
@@ -64,7 +64,7 @@ jobs:
     name: Format
     needs: changes
     if: needs.changes.outputs.format == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -82,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-24.04, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       # `shaderloom` compiles WGSL to DXIL on Windows and shells out to `dxc`,
@@ -124,9 +124,9 @@ jobs:
           - target: aarch64-apple-ios
             os: macos-latest
           - target: aarch64-linux-android
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: wasm32-unknown-unknown
-            os: ubuntu-latest
+            os: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux dependencies
@@ -163,7 +163,7 @@ jobs:
     name: Coverage
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -185,7 +185,7 @@ jobs:
 
   typos:
     name: Typos
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -195,7 +195,7 @@ jobs:
     name: Security Audit
     needs: changes
     if: needs.changes.outputs.manifests == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -207,7 +207,7 @@ jobs:
     name: Unused Dependencies
     needs: changes
     if: needs.changes.outputs.format == 'true' || needs.changes.outputs.manifests == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -219,7 +219,7 @@ jobs:
     name: Features
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -247,7 +247,7 @@ jobs:
       # says nothing about the others.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-24.04, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Install DirectX Shader Compiler
