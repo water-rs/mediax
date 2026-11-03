@@ -3,7 +3,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use waterkit_video_core::Error;
+use mediax_core::Error;
 
 const BASIC_HEADER_LENGTH: usize = 8;
 const BASIC_HEADER_SIZE: u64 = 8;

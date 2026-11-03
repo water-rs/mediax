@@ -23,11 +23,11 @@ use cros_codecs::video_frame::VideoFrame;
 use cros_codecs::video_frame::gbm_video_frame::{GbmDevice, GbmUsage, GbmVideoFrame};
 use cros_codecs::video_frame::generic_dma_video_frame::GenericDmaVideoFrame;
 use cros_codecs::{BlockingMode, DecodedFormat, Fourcc, FrameLayout, Resolution};
+use mediax_core::{CicpColor, VideoColorInfo};
 use std::fmt;
 use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::Arc;
-use waterkit_video_core::{CicpColor, VideoColorInfo};
 
 /// Internal codec type for Linux implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -2,9 +2,9 @@ use std::{num::NonZeroUsize, path::PathBuf};
 
 use async_fs::File;
 use futures::{AsyncWriteExt as _, StreamExt as _};
+use mediax_core::Error;
 use url::Url;
 use uuid::Uuid;
-use waterkit_video_core::Error;
 use zenwave::{Client as _, Method};
 
 use crate::atomic;

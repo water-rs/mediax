@@ -5,7 +5,7 @@ use std::ffi::OsStr;
 #[cfg(any(feature = "offline", target_os = "windows"))]
 use std::path::Path;
 
-use waterkit_video_core::Error;
+use mediax_core::Error;
 
 #[cfg(feature = "offline")]
 pub fn is_partial_file_name(name: &OsStr) -> bool {

@@ -9,6 +9,9 @@ use crate::{
     CodecError, DecodePacket, DecodedPixelLayout,
     config::{decoded_pixel_layout, strip_box_header},
 };
+use mediax_core::{
+    ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
+};
 use objc2_core_foundation::CFRetained;
 use objc2_core_video::{
     CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferLockBaseAddress,
@@ -25,9 +28,6 @@ use std::fmt;
 use std::ptr;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
-use waterkit_video_core::{
-    ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
-};
 
 /// Internal codec type for Apple implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

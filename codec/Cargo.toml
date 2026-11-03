@@ -1,5 +1,5 @@
 [package]
-name = "waterkit-codec"
+name = "mediax-codec"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -17,7 +17,7 @@ libc = "0.2"
 thiserror.workspace = true
 image.workspace = true
 half = "2"
-waterkit-video-core.workspace = true
+mediax-core.workspace = true
 tracing.workspace = true
 
 # GPU texture output. Optional so a decode-only consumer that just wants pixels
@@ -28,7 +28,7 @@ shaderloom = { workspace = true, features = ["runtime"], optional = true }
 [build-dependencies]
 cfg_aliases = "0.2"
 shaderloom = { workspace = true, features = ["build"], optional = true }
-waterkit-video-core.workspace = true
+mediax-core.workspace = true
 
 # Software fallback codecs (private, not exposed in public API)
 # Only enabled on desktop platforms - mobile and wasm use their native decode paths
@@ -39,6 +39,12 @@ num-traits = { workspace = true, optional = true }
 avif-parse = { version = "2.1", optional = true }
 yuv = { version = "0.8.19", optional = true }
 moxcms = { version = "0.9.1", features = ["extended_range"], optional = true }
+
+# Pure-Rust AAC-LC decoding for the targets without a platform AAC decoder
+# (Android and Windows decode through MediaCodec and Media Foundation).
+[target.'cfg(not(any(target_os = "android", target_os = "windows")))'.dependencies]
+symphonia-core = { workspace = true, optional = true }
+symphonia-codec-aac = { workspace = true, optional = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2.workspace = true
@@ -76,7 +82,7 @@ wgpu-hal = { workspace = true, optional = true }
 ndk = { version = "0.9", features = ["media", "bitmap", "api-level-29", "api-level-30"] }
 ndk-sys = "0.6"
 jni.workspace = true
-waterkit-build.workspace = true
+ndk-context.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = ["Win32_Media_MediaFoundation", "Win32_System_Com"] }
@@ -92,9 +98,13 @@ image = { workspace = true, features = ["avif"] }
 
 [dev-dependencies]
 pollster.workspace = true
+hex.workspace = true
 
 [features]
 default = ["gpu", "software-encode"]
+# Packet-oriented AAC decoding (`audio`): MediaCodec on Android, Media
+# Foundation on Windows, a pure-Rust AAC-LC decoder elsewhere.
+aac = ["dep:symphonia-core", "dep:symphonia-codec-aac"]
 # Uploads decoded frames to `wgpu` textures and converts them to linear RGBA on
 # the GPU. Off, the crate decodes to CPU memory only and links no `wgpu`.
 gpu = [
@@ -113,7 +123,7 @@ software-encode = ["dep:rav1e", "dep:num-traits", "software-decode"]
 # VA-API hardware decode/encode on Linux via `cros-codecs`, which compiles
 # `cros-libva` against the system libva headers (>= 2.20). Off by default so a
 # consumer that only decodes still images links no hardware video decoder —
-# video consumers (waterkit-video-player and friends) opt in explicitly.
+# video consumers opt in explicitly.
 vaapi = ["dep:cros-codecs"]
 
 [lints]

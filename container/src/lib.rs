@@ -1,4 +1,4 @@
-//! Media-container support for `WaterKit` video.
+//! Media-container support for mediax video.
 //!
 //! Container parsing remains independent from codecs, networking, graphics,
 //! audio output, and UI so media tooling can reuse it without linking a player.
@@ -18,6 +18,10 @@ pub use demuxer::{
     EmbeddedSubtitleCodec, EmbeddedSubtitleCue, EmbeddedSubtitleTrack, VideoCodec, VideoReader,
     embedded_subtitle_tracks, read_embedded_subtitle_cues,
 };
+pub use mediax_core::{
+    CommonEncryptionScheme, EncryptionSubsample, Error, ProtectionInitData, SampleEncryption,
+    TrackProtection,
+};
 pub use muxer::{CodecType as MuxerCodecType, VideoFormat, VideoWriter};
 pub use progressive::{ProgressiveTrack, ProgressiveTrackReader};
 pub use stream::{
@@ -28,8 +32,4 @@ pub use stream::{
 pub use subtitles::{
     SubtitleCue, active_subtitle_text, parse_hls_webvtt_segment, parse_subrip_document,
     parse_subtitles_from_path, parse_ttml_document, parse_webvtt_document,
-};
-pub use waterkit_video_core::{
-    CommonEncryptionScheme, EncryptionSubsample, Error, ProtectionInitData, SampleEncryption,
-    TrackProtection,
 };

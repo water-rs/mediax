@@ -1,0 +1,27 @@
+# release-plz configuration
+# https://release-plz.ieni.dev/docs/config
+
+[workspace]
+publish_timeout = "30m"
+allow_dirty = false
+git_release_enable = true
+git_tag_enable = true
+
+# The benchmark binary is not published.
+[[package]]
+name = "mediax-bench"
+release = false
+
+# `mediax-processing`'s `filtrate` feature builds through a `[patch.crates-io]`
+# git pin that crates.io drops, and the semver check builds every feature from a
+# copy outside the workspace, where that pin does not apply. The crate stays
+# unreleased until a filtrate release carries the executor API.
+[[package]]
+name = "mediax-processing"
+release = false
+
+# The facade enables `mediax-processing/filtrate` under `full`, which cannot
+# compile in the semver check's out-of-workspace copy for the same reason.
+[[package]]
+name = "mediax"
+semver_check = false

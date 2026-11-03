@@ -4,8 +4,8 @@
 //! upload and the native-YUV to linear-RGBA compute conversion. It is compiled
 //! only with the `gpu` feature, so a decode-only consumer links no `wgpu`.
 
+use mediax_core::VideoColorInfo;
 use std::sync::Arc;
-use waterkit_video_core::VideoColorInfo;
 use wgpu::{
     BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBindingType,
@@ -15,13 +15,13 @@ use wgpu::{
     TextureViewDimension,
 };
 
-#[cfg(waterkit_any_codec)]
+#[cfg(mediax_any_codec)]
 use super::DecodedFrameInner;
 use super::{DecodedFrame, DecodedPixelLayout};
 use crate::{ColorOutputTarget, video_color_uniform};
 use shaderloom::{CompiledShader, ShaderStage};
 
-#[cfg(waterkit_hw_codec_apple)]
+#[cfg(mediax_hw_codec_apple)]
 mod apple;
 
 const YUV_COLOR_SHADER: CompiledShader = include!(concat!(env!("OUT_DIR"), "/yuv_color.rs"));
@@ -44,7 +44,7 @@ impl DecodedFrame {
 /// consumer retains them.
 #[derive(Debug)]
 pub struct DecodedFrameUploader {
-    #[cfg(waterkit_hw_codec_apple)]
+    #[cfg(mediax_hw_codec_apple)]
     apple: Option<apple::AppleFrameUploader>,
     imported_frames: u64,
     uploaded_frames: u64,
@@ -55,7 +55,7 @@ impl DecodedFrameUploader {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            #[cfg(waterkit_hw_codec_apple)]
+            #[cfg(mediax_hw_codec_apple)]
             apple: None,
             imported_frames: 0,
             uploaded_frames: 0,
@@ -81,7 +81,7 @@ impl DecodedFrameUploader {
     /// written to freshly created textures exactly once.
     #[must_use]
     #[cfg_attr(
-        not(waterkit_any_codec),
+        not(mediax_any_codec),
         expect(
             clippy::missing_const_for_fn,
             clippy::needless_pass_by_value,
@@ -93,7 +93,7 @@ impl DecodedFrameUploader {
         decoded: DecodedFrame,
         device: &Device,
         #[cfg_attr(
-            all(waterkit_any_codec, not(waterkit_software_frames)),
+            all(mediax_any_codec, not(mediax_software_frames)),
             expect(
                 unused_variables,
                 reason = "hardware-only builds import IOSurface frames in place and never upload through the queue"
@@ -101,13 +101,13 @@ impl DecodedFrameUploader {
         )]
         queue: &Queue,
     ) -> GpuFrame {
-        #[cfg(waterkit_any_codec)]
+        #[cfg(mediax_any_codec)]
         {
             let width = decoded.width();
             let height = decoded.height();
             let layout = decoded.pixel_layout();
             match decoded.inner {
-                #[cfg(waterkit_hw_codec_apple)]
+                #[cfg(mediax_hw_codec_apple)]
                 DecodedFrameInner::Hardware {
                     pixel_buffer,
                     timestamp_ns,
@@ -118,7 +118,7 @@ impl DecodedFrameUploader {
                         .get_or_insert_with(|| apple::AppleFrameUploader::new(device))
                         .import_frame(device, &pixel_buffer, width, height, layout, timestamp_ns)
                 }
-                #[cfg(waterkit_software_frames)]
+                #[cfg(mediax_software_frames)]
                 DecodedFrameInner::Software {
                     data, timestamp_ns, ..
                 } => {
@@ -127,7 +127,7 @@ impl DecodedFrameUploader {
                 }
             }
         }
-        #[cfg(not(waterkit_any_codec))]
+        #[cfg(not(mediax_any_codec))]
         {
             let _ = (device, queue);
             match decoded.inner {}
@@ -171,7 +171,7 @@ impl std::fmt::Debug for GpuFrame {
 
 impl GpuFrame {
     /// Wraps plane textures imported from a decoded frame's native storage.
-    #[cfg(waterkit_hw_codec_apple)]
+    #[cfg(mediax_hw_codec_apple)]
     pub(super) fn imported(
         y_texture: Texture,
         uv_texture: Texture,
@@ -192,7 +192,7 @@ impl GpuFrame {
 
     /// Creates the plane textures and writes a software-decoded frame into
     /// them exactly once.
-    #[cfg(waterkit_software_frames)]
+    #[cfg(mediax_software_frames)]
     fn uploaded(
         device: &Device,
         queue: &Queue,
@@ -471,12 +471,12 @@ impl LinearRgbaConverter {
     }
 }
 
-#[cfg(all(test, waterkit_software_frames))]
+#[cfg(all(test, mediax_software_frames))]
 mod tests {
     use std::time::Duration;
 
     use half::f16;
-    use waterkit_video_core::{
+    use mediax_core::{
         ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
     };
 
@@ -694,7 +694,7 @@ fn create_video_color_uniform_buffer(
     let uniform = video_color_uniform(color, layout, ColorOutputTarget::LinearHdr);
     let bytes = uniform.to_bytes();
     let buffer = device.create_buffer(&BufferDescriptor {
-        label: Some("WaterKit video color uniform"),
+        label: Some("mediax color uniform"),
         size: 32,
         usage: BufferUsages::UNIFORM,
         mapped_at_creation: true,

@@ -1,12 +1,12 @@
 [package]
-name = "waterkit-video-core"
+name = "mediax-core"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 readme.workspace = true
 repository.workspace = true
-description = "Engine-neutral timing, color, stream, and error types for WaterKit video"
+description = "Engine-neutral timing, color, stream, and error types for mediax"
 keywords = ["video", "media", "timing", "hdr"]
 categories = ["multimedia::video"]
 

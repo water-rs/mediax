@@ -1,13 +1,13 @@
 use half::f16;
 use image::{ColorType, DynamicImage, GenericImageView};
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 use moxcms::{
     CicpColorPrimaries, CicpProfile, ColorProfile, Layout, MatrixCoefficients as CicpMatrix,
     TransferCharacteristics, TransformOptions,
 };
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 use std::io::Cursor;
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 use yuv::{
     YuvBiPlanarImage, YuvConversionMode, YuvRange, YuvStandardMatrix, p010_to_rgba10,
     yuv_nv12_to_rgba,
@@ -18,9 +18,9 @@ use crate::CodecError;
 use crate::image_android;
 #[cfg(target_vendor = "apple")]
 use crate::image_apple;
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 use crate::software::av1::{Av1Decoder, CpuFrame};
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 use crate::{DecodedPixelLayout, SDR_REFERENCE_WHITE_NITS};
 
 /// Pixel formats currently emitted by `decode_image`.
@@ -113,7 +113,7 @@ impl DecodedImage {
 /// # Errors
 ///
 /// Returns [`CodecError::DecodingFailed`] when decoding fails.
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 pub fn decode_image(data: &[u8]) -> Result<DecodedImage, CodecError> {
     if is_avif(data) {
         #[cfg(target_vendor = "apple")]
@@ -129,7 +129,7 @@ pub fn decode_image(data: &[u8]) -> Result<DecodedImage, CodecError> {
 /// # Errors
 ///
 /// Returns [`CodecError::DecodingFailed`] when decoding fails.
-#[cfg(not(all(waterkit_av1_software, any(test, not(target_vendor = "apple")))))]
+#[cfg(not(all(mediax_av1_software, any(test, not(target_vendor = "apple")))))]
 pub fn decode_image(data: &[u8]) -> Result<DecodedImage, CodecError> {
     decode_image_platform(data)
 }
@@ -292,12 +292,12 @@ fn is_avif_brand(brand: [u8; 4]) -> bool {
     brand == *b"avif" || brand == *b"avis"
 }
 
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 fn is_avif(data: &[u8]) -> bool {
     matches!(image::guess_format(data), Ok(image::ImageFormat::Avif))
 }
 
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 fn decode_avif_software(data: &[u8]) -> Result<DecodedImage, CodecError> {
     let mut cursor = Cursor::new(data);
     let avif = avif_parse::AvifData::from_reader(&mut cursor)
@@ -358,7 +358,7 @@ fn decode_avif_software(data: &[u8]) -> Result<DecodedImage, CodecError> {
     ))
 }
 
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 fn decode_av1_item(data: &[u8], item_name: &str) -> Result<CpuFrame, CodecError> {
     let mut decoder = Av1Decoder::new()?;
     decoder
@@ -370,7 +370,7 @@ fn decode_av1_item(data: &[u8], item_name: &str) -> Result<CpuFrame, CodecError>
         })
 }
 
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 fn apply_avif_alpha(
     rgba: &mut [f32],
     alpha_item: &[u8],
@@ -420,7 +420,7 @@ fn apply_avif_alpha(
     Ok(())
 }
 
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 fn decode_avif_linear_rgba(frame: &CpuFrame) -> Result<Vec<f32>, CodecError> {
     let width = frame.width;
     let height = frame.height;
@@ -474,7 +474,7 @@ fn decode_avif_linear_rgba(frame: &CpuFrame) -> Result<Vec<f32>, CodecError> {
     Ok(linear)
 }
 
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 fn decode_avif_yuv(frame: &CpuFrame, pixel_count: usize) -> Result<Vec<f32>, CodecError> {
     let expected_len = frame.layout.packed_len(frame.width, frame.height);
     if frame.data.len() != expected_len {
@@ -556,7 +556,7 @@ fn decode_avif_yuv(frame: &CpuFrame, pixel_count: usize) -> Result<Vec<f32>, Cod
     }
 }
 
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 fn normalized_primaries(value: u8) -> Result<CicpColorPrimaries, CodecError> {
     let primaries = CicpColorPrimaries::try_from(value).map_err(|err| {
         CodecError::DecodingFailed(format!("invalid AVIF color primaries: {err}"))
@@ -577,7 +577,7 @@ fn normalized_primaries(value: u8) -> Result<CicpColorPrimaries, CodecError> {
     }
 }
 
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 fn normalized_transfer(value: u8) -> Result<TransferCharacteristics, CodecError> {
     let transfer = TransferCharacteristics::try_from(value).map_err(|err| {
         CodecError::DecodingFailed(format!("invalid AVIF transfer function: {err}"))
@@ -601,7 +601,7 @@ fn normalized_transfer(value: u8) -> Result<TransferCharacteristics, CodecError>
     }
 }
 
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 const fn is_hdr_transfer(transfer: TransferCharacteristics) -> bool {
     matches!(
         transfer,
@@ -609,7 +609,7 @@ const fn is_hdr_transfer(transfer: TransferCharacteristics) -> bool {
     )
 }
 
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 fn normalized_matrix(value: u8) -> Result<CicpMatrix, CodecError> {
     let matrix = CicpMatrix::try_from(value)
         .map_err(|err| CodecError::DecodingFailed(format!("invalid AVIF matrix: {err}")))?;
@@ -619,7 +619,7 @@ fn normalized_matrix(value: u8) -> Result<CicpMatrix, CodecError> {
     })
 }
 
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 fn encode_linear_rgba16f(rgba: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len() * core::mem::size_of::<u16>());
     for channel in rgba {
@@ -628,7 +628,7 @@ fn encode_linear_rgba16f(rgba: &[f32]) -> Vec<u8> {
     out
 }
 
-#[cfg(all(waterkit_av1_software, any(test, not(target_vendor = "apple"))))]
+#[cfg(all(mediax_av1_software, any(test, not(target_vendor = "apple"))))]
 fn encode_linear_srgb_rgba8(rgba: &[f32]) -> Vec<u8> {
     let encode_unorm8 = |value: f32| {
         let rounded = (value.clamp(0.0, 1.0) * 255.0).round();
@@ -678,7 +678,7 @@ fn encode_rgba16f(image: DynamicImage, color: ColorType) -> (Vec<u8>, bool) {
     (output, has_hdr_headroom)
 }
 
-#[cfg(all(test, waterkit_av1_software))]
+#[cfg(all(test, mediax_av1_software))]
 mod tests {
     use image::{ExtendedColorType, ImageEncoder, codecs::avif::AvifEncoder};
     use moxcms::TransferCharacteristics;

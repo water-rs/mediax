@@ -1,8 +1,8 @@
 use byteorder::{BigEndian, WriteBytesExt};
+use mediax_core::{Error, VideoColorInfo};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use waterkit_video_core::{Error, VideoColorInfo};
 
 type VideoError = Error;
 
@@ -816,7 +816,7 @@ mod tests {
 
     #[test]
     fn color_metadata_roundtrips_through_public_probe() {
-        use waterkit_video_core::{
+        use mediax_core::{
             ColorPrimaries, ColorRange, ContentLightLevel, MatrixCoefficients, TransferFunction,
         };
 

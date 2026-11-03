@@ -4,10 +4,10 @@ use url::Url;
 
 #[cfg(feature = "offline")]
 use {
+    mediax_core::Error,
     serde::{Deserialize, Serialize},
     std::{collections::BTreeSet, num::NonZeroU64},
     uuid::Uuid,
-    waterkit_video_core::Error,
 };
 
 #[cfg(feature = "offline")]
@@ -832,7 +832,7 @@ mod tests {
         use super::{CacheResourceKey, PersistentMediaCache};
         use crate::{MediaByteRange, MediaValidator};
 
-        let root = std::env::temp_dir().join(format!("waterkit-cache-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("mediax-cache-{}", Uuid::new_v4()));
         let cache = AssetCache::new(&root);
         let mut store = block_on(PersistentMediaCache::open(
             &cache,
@@ -904,7 +904,7 @@ mod tests {
         use super::{CacheResourceKey, PersistentMediaCache};
         use crate::MediaValidator;
 
-        let root = std::env::temp_dir().join(format!("waterkit-cache-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("mediax-cache-{}", Uuid::new_v4()));
         let cache = AssetCache::new(&root);
         let mut store = block_on(PersistentMediaCache::open(
             &cache,

@@ -5,8 +5,8 @@ use std::{
 };
 
 use bytes::Bytes;
+use mediax_core::Error;
 use url::Url;
-use waterkit_video_core::Error;
 use zenwave::header::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::{

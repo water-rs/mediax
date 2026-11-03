@@ -1,8 +1,8 @@
 use std::{num::NonZeroU64, time::Duration};
 
+use mediax_core::Error;
 use num_traits::ToPrimitive as _;
 use url::Url;
-use waterkit_video_core::Error;
 
 /// One bitrate/resolution choice that an adaptive presentation can select.
 #[derive(Debug, Clone, PartialEq, Eq)]

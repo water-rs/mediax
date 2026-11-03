@@ -5,14 +5,14 @@ use crate::{
     bitstream::{NalStreamConverter, build_h264_avcc_from_annex_b, build_h265_hvcc_from_annex_b},
     config::decoded_pixel_layout,
 };
+use mediax_core::{
+    ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
+};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr;
 use std::time::Duration;
-use waterkit_video_core::{
-    ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
-};
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMFMediaType, IMFSample, IMFTransform, MF_E_NO_MORE_TYPES,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_FRAME_RATE,

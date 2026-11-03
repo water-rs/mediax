@@ -154,9 +154,9 @@ impl WindowsAacDecoder {
         // PCM once the following unit's timestamp bounds it, so most calls
         // return the previous unit's frame and the first returns none. The
         // decoder must run continuously across access units — AAC's MDCT
-        // overlap-add and the HE-AAC SBR tool carry state between frames, so
-        // this only pumps whatever output is already available; `finish`
-        // drains the held unit.
+        // overlap-add carries state between frames, so this only pumps
+        // whatever output is already available; `finish` drains the held
+        // unit.
         self.collect_output(presentation_time)
     }
 

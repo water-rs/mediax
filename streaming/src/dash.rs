@@ -8,10 +8,10 @@ use dash_mpd_core::{
     AdaptationSet, BaseURL, ContentProtection, MPD, Period, Representation, SegmentBase,
     SegmentList, SegmentTemplate,
 };
+use mediax_core::Error;
 use num_traits::ToPrimitive as _;
 use url::Url;
 use uuid::Uuid;
-use waterkit_video_core::Error;
 
 use crate::{AdaptiveVariant, MediaByteRange, MediaRequest, fetch_media};
 
@@ -527,7 +527,7 @@ pub struct DashSegmentBase {
 /// # Errors
 ///
 /// Returns a streaming error when the request fails, the response is not
-/// UTF-8, or the MPD violates normalized `WaterKit` invariants.
+/// UTF-8, or the MPD violates normalized mediax invariants.
 pub async fn fetch_dash_manifest(request: MediaRequest) -> Result<DashManifest, Error> {
     let response = fetch_media(request).await?;
     let input = std::str::from_utf8(response.bytes())

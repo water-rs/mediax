@@ -1,0 +1,273 @@
+name: CI
+
+# Linux jobs here and in the other workflows run on ubuntu-24.04: the VA-API
+# stack does not build against the libva 2.23 that ubuntu-latest ships (#6).
+
+permissions:
+  contents: read
+  checks: write
+  id-token: write
+
+on:
+  # Integration branches only: a topic branch that also has a pull request
+  # would otherwise run the whole workflow twice for one commit.
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: ["**"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The workflow itself always runs, so the release workflow's `workflow_run`
+  # trigger and the required-check gate see a conclusion for every change; each
+  # job below runs only when the change touches something it reads.
+  changes:
+    name: Changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      format: ${{ steps.filter.outputs.format }}
+      manifests: ${{ steps.filter.outputs.manifests }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/*.wgsl'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'codec/src/fixtures/**'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/**'
+              - '.github/apt.conf'
+            format:
+              - '**/*.rs'
+              - 'rustfmt.toml'
+              - '.rustfmt.toml'
+              - '.github/workflows/ci.yml'
+            manifests:
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+
+  fmt:
+    name: Format
+    needs: changes
+    if: needs.changes.outputs.format == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      # `shaderloom` compiles WGSL to DXIL on Windows and shells out to `dxc`,
+      # which the runner image does not carry.
+      - name: Install DirectX Shader Compiler
+        if: runner.os == 'Windows'
+        uses: tracel-ai/github-actions/install-dxc@295f2fdbae5271f4f8ad56d634e4ff6a95daafc8
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy-${{ matrix.os }}
+      # The root manifest is both the workspace and the `mediax` package, so
+      # without `--workspace` cargo lints only the facade. `--keep-going`
+      # makes one run report the lints of every member.
+      - run: cargo clippy --workspace --all-targets --all-features --keep-going -- -D warnings
+      # A decode-only consumer takes `mediax-codec` without its `gpu` feature
+      # and must link no `wgpu`. Nothing in `--all-features` exercises that
+      # shape, so check and lint it explicitly.
+      - name: Check mediax-codec without GPU output
+        run: cargo check -p mediax-codec --no-default-features --features software-encode
+      - name: Clippy mediax-codec without GPU output
+        run: cargo clippy -p mediax-codec --all-targets --no-default-features --features software-encode -- -D warnings
+
+  cross-clippy:
+    name: Clippy (${{ matrix.target }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-ios
+            os: macos-latest
+          - target: aarch64-linux-android
+            os: ubuntu-24.04
+          - target: wasm32-unknown-unknown
+            os: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux' && matrix.target != 'wasm32-unknown-unknown'
+        uses: ./.github/actions/setup-linux-deps
+      - name: Setup Android NDK
+        if: contains(matrix.target, 'android')
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: true
+      - name: Set Android environment
+        if: contains(matrix.target, 'android')
+        run: |
+          {
+            echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}"
+            echo "CC_aarch64-linux-android=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+            echo "CXX_aarch64-linux-android=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+            echo "AR_aarch64-linux-android=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          } >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cross-${{ matrix.target }}
+      # `mediax-bench` is a host-only benchmark binary.
+      - run: cargo clippy --workspace --exclude mediax-bench --locked --target ${{ matrix.target }} --all-targets --all-features --keep-going -- -D warnings
+
+  coverage:
+    name: Coverage
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        uses: ./.github/actions/setup-linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
+      - run: cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info --exclude mediax-bench
+      - uses: codecov/codecov-action@v4
+        with:
+          use_oidc: true
+          fail_ci_if_error: false
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@v1.49.0
+
+  audit:
+    name: Security Audit
+    needs: changes
+    if: needs.changes.outputs.manifests == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  unused-deps:
+    name: Unused Dependencies
+    needs: changes
+    if: needs.changes.outputs.format == 'true' || needs.changes.outputs.manifests == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-machete
+      - run: cargo machete
+
+  feature-checks:
+    name: Features
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        uses: ./.github/actions/setup-linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu
+      - uses: taiki-e/install-action@cargo-hack
+      - run: cargo hack check --each-feature --no-dev-deps
+      - run: cargo hack check --feature-powerset --no-dev-deps --depth 2
+      # The root package only re-exports `mediax-codec` with its defaults, so
+      # walk that crate's own features too.
+      - run: cargo hack check -p mediax-codec --feature-powerset --no-dev-deps
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Each OS runs a different set of platform backends, so one OS failing
+      # says nothing about the others.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install DirectX Shader Compiler
+        if: runner.os == 'Windows'
+        uses: tracel-ai/github-actions/install-dxc@295f2fdbae5271f4f8ad56d634e4ff6a95daafc8
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest list --workspace --all-targets
+      # `--no-fail-fast`, and running the doctests even when a unit test failed:
+      # report every failing test and doctest of the run, not only the first.
+      - id: unit_tests
+        run: cargo nextest run --workspace --all-features --no-fail-fast
+      - if: ${{ success() || steps.unit_tests.outcome == 'failure' }}
+        run: cargo test --doc --workspace --all-features --no-fail-fast

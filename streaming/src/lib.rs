@@ -1,4 +1,4 @@
-//! Network delivery for `WaterKit` video, built exclusively on Zenwave.
+//! Network delivery for mediax video, built exclusively on Zenwave.
 //!
 //! Protocol implementations live as modules in this crate rather than one
 //! crate per protocol. The crate owns transport, cache identity, redirects,
@@ -49,6 +49,7 @@ pub use license::{
     AnyLicenseServer, LicenseRequest, LicenseResponse, LicenseServer, ZenwaveLicenseServer,
     acquire_license,
 };
+pub use mediax_core::Error;
 #[cfg(feature = "offline")]
 pub use offline::{
     OfflineDownload, OfflineDownloadController, OfflineDownloadEvent, OfflineDownloadEvents,
@@ -62,4 +63,3 @@ pub use segment::{
     FetchedSegment, SegmentLoader, SegmentResource, SegmentStream, StreamedSegmentReceipt,
 };
 pub use url::Url;
-pub use waterkit_video_core::Error;
