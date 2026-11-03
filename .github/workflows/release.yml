@@ -22,7 +22,7 @@ permissions:
 jobs:
   release:
     name: Release unpublished packages
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +31,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       # cargo publish verifies each package by building it; the native
-      # libraries the crates link (libva for mediax-codec, ...) must be
+      # libraries the crates link (EGL for wgpu-hal) must be
       # present here exactly as in the CI workflow, or the verify build fails.
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -50,7 +50,7 @@ jobs:
 
   release-pr:
     name: Prepare the next release
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
     concurrency:
       group: release-plz-${{ github.event.workflow_run.head_branch }}
@@ -62,7 +62,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       # cargo publish verifies each package by building it; the native
-      # libraries the crates link (libva for mediax-codec, ...) must be
+      # libraries the crates link (EGL for wgpu-hal) must be
       # present here exactly as in the CI workflow, or the verify build fails.
       - name: Install Linux dependencies
         if: runner.os == 'Linux'

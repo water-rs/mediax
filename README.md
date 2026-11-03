@@ -2,7 +2,7 @@
 
 Hardware-accelerated, permissively licensed codecs, containers and streaming for Rust.
 
-Video encode and decode go through the platform's own hardware stack: VideoToolbox on Apple platforms, Media Foundation on Windows, MediaCodec on Android and VA-API on Linux. The only software codec is AV1 (rav1e and rav1d). There is deliberately no software H.264 or H.265, so nothing here carries a patent-encumbered or copyleft codec library.
+Video encode and decode go through the platform's own hardware stack: VideoToolbox on Apple platforms, Media Foundation on Windows, and MediaCodec on Android. Linux has no hardware path yet (the VA-API backend is being rewritten, #6). The only software codec is AV1 (rav1e and rav1d). There is deliberately no software H.264 or H.265, so nothing here carries a patent-encumbered or copyleft codec library.
 
 All crates are licensed `MIT OR Apache-2.0`.
 
@@ -19,7 +19,7 @@ All crates are licensed `MIT OR Apache-2.0`.
 
 ## Features
 
-The facade enables only what you ask for: `codec`, `container`, `streaming`, `offline`, `processing`, `filtrate`, plus the codec options `gpu`, `software-decode`, `software-encode`, `vaapi` and `aac`. `vaapi` needs the system libva (2.20 or newer).
+The facade enables only what you ask for: `codec`, `container`, `streaming`, `offline`, `processing`, `filtrate`, plus the codec options `gpu`, `software-decode`, `software-encode` and `aac`.
 
 ## License
 

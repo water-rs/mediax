@@ -49,16 +49,14 @@ filtrate = ["processing", "mediax-processing/filtrate"]
 gpu = ["codec", "mediax-codec/gpu"]
 software-decode = ["codec", "mediax-codec/software-decode"]
 software-encode = ["codec", "mediax-codec/software-encode"]
-# VA-API hardware decode/encode on Linux; needs the system libva.
-vaapi = ["codec", "mediax-codec/vaapi"]
 aac = ["codec", "mediax-codec/aac"]
 full = ["container", "streaming", "offline", "processing", "filtrate", "gpu", "software-encode", "aac"]
 
 [workspace.dependencies]
 mediax-core = { path = "core", version = "0.1.0" }
 # No default features: consumers opt into `gpu` (decoded-frame upload),
-# `software-decode` (rav1d + image decoding), `software-encode` (adds rav1e),
-# `vaapi` and `aac` explicitly.
+# `software-decode` (rav1d + image decoding), `software-encode` (adds rav1e)
+# and `aac` explicitly.
 mediax-codec = { path = "codec", version = "0.1.0", default-features = false }
 mediax-container = { path = "container", version = "0.1.0" }
 mediax-streaming = { path = "streaming", version = "0.1.0" }

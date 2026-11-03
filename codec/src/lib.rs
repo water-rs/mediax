@@ -62,16 +62,9 @@
 #[cfg(feature = "aac")]
 pub mod audio;
 
-#[cfg(any(
-    test,
-    mediax_hw_codec_android,
-    target_os = "linux",
-    mediax_hw_codec_windows
-))]
+#[cfg(any(test, mediax_hw_codec_android, mediax_hw_codec_windows))]
 mod bitstream;
 mod color;
-// The VA-API backend reads its output layout back from the negotiated
-// `DecodedFormat`, so Linux never has to infer it from the codec configuration.
 #[cfg(any(
     test,
     mediax_hw_codec_apple,
@@ -88,12 +81,7 @@ mod image_apple;
 mod software;
 mod sys;
 
-#[cfg(any(
-    test,
-    mediax_hw_codec_android,
-    target_os = "linux",
-    mediax_hw_codec_windows
-))]
+#[cfg(any(test, mediax_hw_codec_android, mediax_hw_codec_windows))]
 pub use bitstream::{ConvertedProtectedSample, NalStreamConverter, annex_b_to_length_prefixed};
 pub use color::{
     ColorOutputTarget, SDR_REFERENCE_WHITE_NITS, VideoColorUniform, YUV_COLOR_SHADER_WGSL,
@@ -322,8 +310,6 @@ enum DecoderInner {
     Android(sys::android::AndroidDecoder),
     #[cfg(mediax_hw_codec_windows)]
     Windows(sys::windows::WindowsDecoder),
-    #[cfg(mediax_hw_codec_vaapi)]
-    Linux(sys::linux::LinuxDecoder),
     #[cfg(mediax_av1_software)]
     Av1(software::av1::Av1Decoder),
 }
@@ -382,11 +368,6 @@ impl Decoder {
                 #[cfg(mediax_hw_codec_windows)]
                 CodecType::H264 | CodecType::H265 => Ok(Self {
                     inner: sys::windows::open_decoder(codec, config, width, height)?,
-                }),
-
-                #[cfg(mediax_hw_codec_vaapi)]
-                CodecType::H264 | CodecType::H265 => Ok(Self {
-                    inner: sys::linux::open_decoder(codec, config, width, height)?,
                 }),
 
                 #[cfg(not(mediax_hw_codec))]
@@ -481,24 +462,6 @@ impl Decoder {
                 Ok(frames)
             }
 
-            #[cfg(mediax_hw_codec_vaapi)]
-            DecoderInner::Linux(ref mut dec) => {
-                let linux_frames = dec.decode(packet)?;
-                let mut frames = Vec::with_capacity(linux_frames.len());
-                for linux_frame in linux_frames {
-                    let frame = DecodedFrame::from_biplanar_data(
-                        linux_frame.data,
-                        linux_frame.width,
-                        linux_frame.height,
-                        linux_frame.timestamp_ns,
-                        linux_frame.layout,
-                        None,
-                    );
-                    frames.push(frame);
-                }
-                Ok(frames)
-            }
-
             #[cfg(mediax_av1_software)]
             DecoderInner::Av1(ref mut dec) => {
                 let cpu_frames = dec.decode(packet)?;
@@ -579,21 +542,6 @@ impl Decoder {
                 .collect()),
             #[cfg(mediax_hw_codec_windows)]
             DecoderInner::Windows(ref mut decoder) => Ok(decoder
-                .drain()?
-                .into_iter()
-                .map(|frame| {
-                    DecodedFrame::from_biplanar_data(
-                        frame.data,
-                        frame.width,
-                        frame.height,
-                        frame.timestamp_ns,
-                        frame.layout,
-                        None,
-                    )
-                })
-                .collect()),
-            #[cfg(mediax_hw_codec_vaapi)]
-            DecoderInner::Linux(ref mut decoder) => Ok(decoder
                 .drain()?
                 .into_iter()
                 .map(|frame| {
@@ -732,17 +680,6 @@ impl Decoder {
                 )
             }
 
-            #[cfg(mediax_hw_codec_vaapi)]
-            DecoderInner::Linux(ref mut dec) => {
-                let linux_frames = dec.decode(packet)?;
-                copy_frames_to_buffer(
-                    linux_frames
-                        .into_iter()
-                        .map(|f| (f.data, f.width, f.height, f.timestamp_ns, f.layout)),
-                    output,
-                )
-            }
-
             #[cfg(mediax_av1_software)]
             DecoderInner::Av1(ref mut dec) => {
                 let cpu_frames = dec.decode(packet)?;
@@ -824,8 +761,6 @@ enum EncoderInner {
     Android(sys::android::AndroidEncoder),
     #[cfg(mediax_hw_codec_windows)]
     Windows(sys::windows::WindowsEncoder),
-    #[cfg(mediax_hw_codec_vaapi)]
-    Linux(sys::linux::LinuxEncoder),
     #[cfg(mediax_av1_software_encode)]
     Av1(Box<software::av1::Av1Encoder>),
 }
@@ -881,11 +816,6 @@ impl Encoder {
                 #[cfg(mediax_hw_codec_windows)]
                 CodecType::H264 | CodecType::H265 => Ok(Self {
                     inner: sys::windows::open_encoder(codec, width, height, color)?,
-                }),
-
-                #[cfg(mediax_hw_codec_vaapi)]
-                CodecType::H264 | CodecType::H265 => Ok(Self {
-                    inner: sys::linux::open_encoder(codec, width, height, color)?,
                 }),
 
                 #[cfg(not(mediax_hw_codec))]
@@ -949,9 +879,6 @@ impl Encoder {
             #[cfg(mediax_hw_codec_windows)]
             EncoderInner::Windows(ref mut enc) => enc.encode_nv12(data),
 
-            #[cfg(mediax_hw_codec_vaapi)]
-            EncoderInner::Linux(ref mut enc) => enc.encode_nv12(data),
-
             #[cfg(mediax_av1_software_encode)]
             EncoderInner::Av1(ref mut enc) => enc.encode_nv12(data),
         }
@@ -1007,8 +934,6 @@ impl Encoder {
             EncoderInner::Android(_) => Ok(Vec::new()),
             #[cfg(mediax_hw_codec_windows)]
             EncoderInner::Windows(ref mut enc) => enc.drain(),
-            #[cfg(mediax_hw_codec_vaapi)]
-            EncoderInner::Linux(_) => Ok(Vec::new()),
             #[cfg(mediax_av1_software_encode)]
             EncoderInner::Av1(ref mut enc) => enc.flush(),
         }
@@ -1029,7 +954,7 @@ impl Encoder {
     #[must_use]
     #[allow(
         clippy::missing_const_for_fn,
-        reason = "non-const on backends that call through to a platform encoder; only the reduced no-vaapi build is const-eligible"
+        reason = "non-const on backends that call through to a platform encoder; only builds without a platform encoder are const-eligible"
     )]
     pub fn codec_config(&self) -> Option<Vec<u8>> {
         match self.inner {
@@ -1043,9 +968,6 @@ impl Encoder {
 
             #[cfg(mediax_hw_codec_windows)]
             EncoderInner::Windows(ref enc) => enc.get_codec_config(),
-
-            #[cfg(mediax_hw_codec_vaapi)]
-            EncoderInner::Linux(ref enc) => enc.get_codec_config(),
 
             #[cfg(mediax_av1_software_encode)]
             EncoderInner::Av1(ref enc) => Some(enc.codec_config()),

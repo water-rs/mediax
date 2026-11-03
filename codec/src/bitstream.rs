@@ -20,7 +20,7 @@ pub enum NalStreamConverter {
         #[cfg(any(test, target_os = "android"))]
         /// Boundary between primary and secondary platform codec data.
         secondary_parameter_set_offset: Option<usize>,
-        #[cfg(any(test, target_os = "linux", target_os = "windows"))]
+        #[cfg(any(test, target_os = "windows"))]
         /// Whether the parameter sets have already been prefixed in-band.
         sent_parameter_sets: bool,
     },
@@ -77,7 +77,7 @@ impl NalStreamConverter {
             parameter_sets: parsed.parameter_sets,
             #[cfg(any(test, target_os = "android"))]
             secondary_parameter_set_offset: parsed.secondary_parameter_set_offset,
-            #[cfg(any(test, target_os = "linux", target_os = "windows"))]
+            #[cfg(any(test, target_os = "windows"))]
             sent_parameter_sets: false,
         })
     }
@@ -156,7 +156,7 @@ impl NalStreamConverter {
         }
     }
 
-    #[cfg(any(test, target_os = "linux", target_os = "windows"))]
+    #[cfg(any(test, target_os = "windows"))]
     /// Converts one access unit and prepends configuration parameter sets once.
     ///
     /// A decoder fed a raw Annex B elementary stream has nowhere else to learn
@@ -357,7 +357,7 @@ fn annex_b_nalus(data: &[u8]) -> Vec<(usize, usize)> {
 /// units — either the parameter sets an encoder prepends to its first IDR
 /// access unit or the raw `MF_MT_MPEG_SEQUENCE_HEADER` blob on Windows.
 /// Returns `None` when the bitstream carries no usable SPS/PPS pair.
-#[cfg(any(mediax_hw_codec_vaapi, mediax_hw_codec_windows))]
+#[cfg(mediax_hw_codec_windows)]
 pub fn build_h264_avcc_from_annex_b(bitstream: &[u8]) -> Option<Vec<u8>> {
     let mut sps = None;
     let mut pps = None;
