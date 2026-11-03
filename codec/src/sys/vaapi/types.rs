@@ -12,14 +12,6 @@
     clippy::struct_field_names,
     reason = "the names are libva's, kept so each field can be found in the header"
 )]
-#![cfg_attr(
-    not(mediax_hw_codec_vaapi),
-    allow(
-        dead_code,
-        reason = "the Linux encoder consumes these; other hosts compile them for the layout tests"
-    )
-)]
-
 use std::ffi::{c_int, c_uint, c_void};
 
 /// `VADisplay`.

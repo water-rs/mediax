@@ -5,17 +5,6 @@
 //! module also compiles in tests on other hosts, where the codecs run against
 //! a test double of the driver.
 
-// The fuzz targets run the decoder against the driver double on hosts that
-// have neither libva nor the encoder, so the loader and the encoder-only code
-// below go unused there.
-#![cfg_attr(
-    all(feature = "fuzzing", not(any(test, mediax_hw_codec_vaapi))),
-    allow(
-        dead_code,
-        reason = "the fuzz build has no libva loader and no encoder"
-    )
-)]
-
 mod api;
 mod bits;
 mod decoder;
@@ -34,7 +23,7 @@ mod types;
 
 #[cfg(mediax_hw_codec_vaapi)]
 pub use decoder::DecodedPicture;
-#[cfg(any(feature = "fuzzing", mediax_hw_codec_vaapi))]
+#[cfg(mediax_hw_codec_vaapi)]
 pub use decoder::VaapiDecoder;
 #[cfg(mediax_hw_codec_vaapi)]
 pub use encoder::VaapiEncoder;
@@ -222,7 +211,7 @@ impl VaapiError {
     }
 
     /// Converts the error of decoding a packet.
-    #[cfg(any(test, feature = "fuzzing", mediax_hw_codec_vaapi))]
+    #[cfg(any(test, mediax_hw_codec_vaapi))]
     pub(crate) fn at_decode(self) -> CodecError {
         if self.is_unsupported() {
             CodecError::Unsupported(self.to_string())

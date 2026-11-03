@@ -6,14 +6,6 @@
 //! reference lists and output order. Nothing here depends on the decoder
 //! API that does the sample reconstruction.
 
-#![cfg_attr(
-    not(mediax_hw_codec_vaapi),
-    allow(
-        dead_code,
-        reason = "the Linux decoder consumes this; other hosts compile it for the tests and fuzz targets"
-    )
-)]
-
 pub mod dpb;
 pub mod error;
 pub mod sequence;

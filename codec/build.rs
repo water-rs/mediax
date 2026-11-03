@@ -26,9 +26,6 @@ fn main() {
         // Linux stays outside `mediax_hw_codec`, which gates the backends
         // that take the shared packet path; VA-API has its own decoder wiring.
         mediax_hw_codec_vaapi: { target_os = "linux" },
-        // The sources of the VA-API decoder: Linux, and any unix host that
-        // builds the fuzz targets against the driver double.
-        mediax_vaapi_decode: { any(target_os = "linux", all(feature = "fuzzing", unix)) },
         mediax_av1_software: { all(
             feature = "software-decode",
             not(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))

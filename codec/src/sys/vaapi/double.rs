@@ -76,6 +76,7 @@ pub struct Picture {
     /// The picture parameters.
     pub parameters: VAPictureParameterBufferH264,
     /// The scaling lists.
+    #[cfg(test)]
     pub scaling: VAIQMatrixBufferH264,
     /// Each slice's parameters and data.
     pub slices: Vec<(VASliceParameterBufferH264, Vec<u8>)>,
@@ -153,17 +154,6 @@ impl Driver {
         Self(pointer)
     }
 
-    fn state(&self) -> &State {
-        // SAFETY: the pointer is live until `drop`, and the decoder is not
-        // inside a call while a test inspects the state.
-        unsafe { &*self.0 }
-    }
-
-    fn state_mut(&mut self) -> &mut State {
-        // SAFETY: as in `state`; tests change the script between calls.
-        unsafe { &mut *self.0 }
-    }
-
     /// The libva entry points, backed by this double.
     #[must_use]
     pub const fn api() -> Api {
@@ -197,6 +187,22 @@ impl Driver {
             get_display_drm,
             libraries: None,
         }
+    }
+}
+
+/// What the decoder tests inspect and script; the fuzz targets only run the
+/// double.
+#[cfg(test)]
+impl Driver {
+    fn state(&self) -> &State {
+        // SAFETY: the pointer is live until `drop`, and the decoder is not
+        // inside a call while a test inspects the state.
+        unsafe { &*self.0 }
+    }
+
+    fn state_mut(&mut self) -> &mut State {
+        // SAFETY: as in `state`; tests change the script between calls.
+        unsafe { &mut *self.0 }
     }
 
     /// Every libva call made so far, in order.
@@ -552,7 +558,7 @@ unsafe extern "C" fn render_picture(
     with_state(display, "vaRenderPicture", |state| {
         let target = state.begun.expect("rendering happens inside a picture");
         let mut parameters = None;
-        let mut scaling = None;
+        let mut scaling: Option<VAIQMatrixBufferH264> = None;
         let mut slices: Vec<(VASliceParameterBufferH264, Vec<u8>)> = Vec::new();
         let mut pending: Option<VASliceParameterBufferH264> = None;
         for index in 0..usize::try_from(count).unwrap() {
@@ -576,10 +582,12 @@ unsafe extern "C" fn render_picture(
             }
         }
         assert!(pending.is_none(), "every slice has data");
+        assert!(scaling.is_some(), "a picture has scaling lists");
         state.submitted = Some(Picture {
             target,
             parameters: parameters.expect("a picture has parameters"),
-            scaling: scaling.expect("a picture has scaling lists"),
+            #[cfg(test)]
+            scaling: scaling.expect("checked above"),
             slices,
             fill: 0,
         });

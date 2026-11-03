@@ -92,12 +92,6 @@ impl Bits {
         self.0.len()
     }
 
-    /// Whether nothing was written.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     /// Writes a flag.
     pub fn bit(&mut self, value: bool) {
         self.0.push(value);
@@ -462,7 +456,11 @@ impl SliceSpec {
             beta_offset_div2: 0,
         }
     }
+}
 
+/// Picture kinds the decoder tests build; the fuzz targets start from an IDR.
+#[cfg(test)]
+impl SliceSpec {
     /// A reference P picture.
     #[must_use]
     pub fn p(frame_num: u32, poc_lsb: u32) -> Self {

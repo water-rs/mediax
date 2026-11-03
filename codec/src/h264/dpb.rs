@@ -325,12 +325,6 @@ impl Dpb {
         })
     }
 
-    /// The number of frame buffers.
-    #[must_use]
-    pub const fn capacity(&self) -> usize {
-        self.seq.capacity
-    }
-
     /// The frame being decoded.
     #[must_use]
     pub fn current(&self) -> Option<FrameView> {

@@ -59,7 +59,7 @@
 
 #![warn(missing_docs)]
 
-#[cfg(any(test, mediax_hw_codec, mediax_hw_codec_vaapi, mediax_vaapi_decode))]
+#[cfg(any(test, mediax_hw_codec, mediax_hw_codec_vaapi))]
 mod annexb;
 #[cfg(feature = "aac")]
 pub mod audio;
@@ -68,7 +68,7 @@ pub mod audio;
     test,
     mediax_hw_codec_android,
     mediax_hw_codec_windows,
-    mediax_vaapi_decode
+    mediax_hw_codec_vaapi
 ))]
 mod bitstream;
 mod color;
@@ -81,10 +81,10 @@ mod color;
 mod config;
 mod encoder_config;
 mod frame;
-#[cfg(all(feature = "fuzzing", unix))]
+#[cfg(all(feature = "fuzzing", mediax_hw_codec_vaapi))]
 #[doc(hidden)]
 pub mod fuzzing;
-#[cfg(any(all(test, unix), mediax_vaapi_decode))]
+#[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
 mod h264;
 pub mod image;
 #[cfg(target_os = "android")]
@@ -98,7 +98,7 @@ mod sys;
     test,
     mediax_hw_codec_android,
     mediax_hw_codec_windows,
-    mediax_vaapi_decode
+    mediax_hw_codec_vaapi
 ))]
 pub use bitstream::{ConvertedProtectedSample, NalStreamConverter, annex_b_to_length_prefixed};
 pub use color::{
