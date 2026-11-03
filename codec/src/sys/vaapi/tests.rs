@@ -109,6 +109,7 @@ impl Handle {
             create_image,
             destroy_image,
             put_image,
+            get_image,
             get_display_drm,
             libraries: None,
         }
@@ -545,6 +546,20 @@ unsafe extern "C" fn put_image(
         assert_eq!((dest_width, dest_height), (64, 48));
         mock.uploads.push(mock.image_data.clone());
         VA_STATUS_SUCCESS
+    })
+}
+
+unsafe extern "C" fn get_image(
+    display: VADisplay,
+    _surface: VASurfaceID,
+    _x: c_int,
+    _y: c_int,
+    _width: c_uint,
+    _height: c_uint,
+    _image: VAImageID,
+) -> VAStatus {
+    with_mock(display, "vaGetImage", |_| {
+        panic!("the encoder reads no surface back")
     })
 }
 

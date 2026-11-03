@@ -1,4 +1,9 @@
-#[cfg(any(test, target_os = "android", target_os = "windows"))]
+#[cfg(any(
+    test,
+    target_os = "android",
+    target_os = "windows",
+    mediax_vaapi_decode
+))]
 use crate::annexb::length_prefixed_to_annex_b;
 use crate::{
     CodecError,
@@ -23,7 +28,7 @@ pub enum NalStreamConverter {
         #[cfg(any(test, target_os = "android"))]
         /// Boundary between primary and secondary platform codec data.
         secondary_parameter_set_offset: Option<usize>,
-        #[cfg(any(test, target_os = "windows"))]
+        #[cfg(any(test, target_os = "windows", mediax_vaapi_decode))]
         /// Whether the parameter sets have already been prefixed in-band.
         sent_parameter_sets: bool,
     },
@@ -80,7 +85,7 @@ impl NalStreamConverter {
             parameter_sets: parsed.parameter_sets,
             #[cfg(any(test, target_os = "android"))]
             secondary_parameter_set_offset: parsed.secondary_parameter_set_offset,
-            #[cfg(any(test, target_os = "windows"))]
+            #[cfg(any(test, target_os = "windows", mediax_vaapi_decode))]
             sent_parameter_sets: false,
         })
     }
@@ -160,7 +165,7 @@ impl NalStreamConverter {
         }
     }
 
-    #[cfg(any(test, target_os = "windows"))]
+    #[cfg(any(test, target_os = "windows", mediax_vaapi_decode))]
     /// Converts one access unit and prepends configuration parameter sets once.
     ///
     /// A decoder fed a raw Annex B elementary stream has nowhere else to learn

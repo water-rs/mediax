@@ -1,12 +1,30 @@
-//! Linux hardware H.264 encoding through VA-API.
+//! Linux hardware H.264 encoding and decoding through VA-API.
 //!
-//! libva is loaded with `dlopen` when an encoder is created, so a host
-//! without it builds and runs, and the constructor reports why there is no
-//! encoder. The module also compiles in tests on other hosts, where the
-//! encoder runs against a test double of the driver.
+//! libva is loaded with `dlopen` when a codec is created, so a host without
+//! it builds and runs, and the constructor reports why there is no codec. The
+//! module also compiles in tests on other hosts, where the codecs run against
+//! a test double of the driver.
+
+// The fuzz targets run the decoder against the driver double on hosts that
+// have neither libva nor the encoder, so the loader and the encoder-only code
+// below go unused there.
+#![cfg_attr(
+    all(feature = "fuzzing", not(any(test, mediax_hw_codec_vaapi))),
+    allow(
+        dead_code,
+        reason = "the fuzz build has no libva loader and no encoder"
+    )
+)]
 
 mod api;
 mod bits;
+mod decoder;
+#[cfg(test)]
+mod decoder_tests;
+mod device;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod double;
+#[cfg(any(test, mediax_hw_codec_vaapi))]
 mod encoder;
 mod headers;
 mod plan;
@@ -15,9 +33,13 @@ mod tests;
 mod types;
 
 #[cfg(mediax_hw_codec_vaapi)]
+pub use decoder::DecodedPicture;
+#[cfg(any(feature = "fuzzing", mediax_hw_codec_vaapi))]
+pub use decoder::VaapiDecoder;
+#[cfg(mediax_hw_codec_vaapi)]
 pub use encoder::VaapiEncoder;
 
-use crate::{CodecError, FrameRate, H264Level, H264Profile};
+use crate::{CodecError, FrameRate, H264Level, H264Profile, h264::H264Error};
 use plan::RateControlMode;
 use thiserror::Error;
 
@@ -79,8 +101,22 @@ pub enum VaapiError {
         profile: H264Profile,
     },
     /// The encode entry point does not take 4:2:0 8-bit surfaces.
-    #[error("the driver's H.264 encoder does not support the YUV 4:2:0 render target format")]
+    #[error("the driver's H.264 codec does not support the YUV 4:2:0 render target format")]
     UnsupportedRtFormat,
+    /// The driver offers no H.264 decode entry point.
+    #[error(
+        "the driver has no H.264 decode entry point (VAEntrypointVLD) for the stream's profile"
+    )]
+    NoDecodeEntrypoint,
+    /// Every surface holds a frame, which a conforming stream cannot cause.
+    #[error("every decoding surface holds a frame")]
+    NoFreeSurface,
+    /// A sample cannot be split into NAL units.
+    #[error("malformed sample framing: {0}")]
+    Framing(String),
+    /// The stream is malformed or uses a feature the decoder lacks.
+    #[error(transparent)]
+    Stream(#[from] H264Error),
     /// The encode entry point lacks the rate control mode.
     #[error("the driver's H.264 encoder does not support {0} rate control")]
     UnsupportedRateControl(RateControlMode),
@@ -155,6 +191,7 @@ impl VaapiError {
                 | Self::NoRenderNode(_)
                 | Self::NoUsableDevice { .. }
                 | Self::NoEncodeEntrypoint { .. }
+                | Self::NoDecodeEntrypoint
                 | Self::UnsupportedRtFormat
                 | Self::UnsupportedRateControl(_)
                 | Self::UnsupportedPackedHeaders { .. }
@@ -163,7 +200,7 @@ impl VaapiError {
                 | Self::LevelExceeded { .. }
                 | Self::FrameRateOutOfRange(_)
                 | Self::UnsupportedCodec(_)
-        )
+        ) || matches!(self, Self::Stream(error) if error.is_unsupported())
     }
 
     /// Converts the error of encoder construction.
@@ -183,6 +220,16 @@ impl VaapiError {
             CodecError::EncodingFailed(self.to_string())
         }
     }
+
+    /// Converts the error of decoding a packet.
+    #[cfg(any(test, feature = "fuzzing", mediax_hw_codec_vaapi))]
+    pub(crate) fn at_decode(self) -> CodecError {
+        if self.is_unsupported() {
+            CodecError::Unsupported(self.to_string())
+        } else {
+            CodecError::DecodingFailed(self.to_string())
+        }
+    }
 }
 
 /// Opens an encoder on the configured render node, or on the first node
@@ -191,5 +238,15 @@ impl VaapiError {
 pub fn open_encoder(config: &crate::EncoderConfig) -> Result<crate::EncoderInner, CodecError> {
     VaapiEncoder::new(config)
         .map(|encoder| crate::EncoderInner::Vaapi(Box::new(encoder)))
+        .map_err(VaapiError::at_open)
+}
+
+/// Opens an H.264 decoder on the first render node that can decode it.
+///
+/// `config` is the `avcC` record of length-prefixed samples.
+#[cfg(mediax_hw_codec_vaapi)]
+pub fn open_decoder(config: Option<&[u8]>) -> Result<crate::DecoderInner, CodecError> {
+    VaapiDecoder::new(config)
+        .map(|decoder| crate::DecoderInner::Vaapi(Box::new(decoder)))
         .map_err(VaapiError::at_open)
 }

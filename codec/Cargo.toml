@@ -88,13 +88,21 @@ jni.workspace = true
 ndk-context.workspace = true
 
 # VA-API is loaded with `dlopen` so a host without libva still builds and runs.
-# The encoder's tests also run against a mock driver on other unix hosts, which need
-# the loader as a dev-dependency.
+# `h264-reader` parses the parameter sets and slice headers of the VA-API
+# decoder. The VA-API code also runs against a test double of the driver on
+# other unix hosts, which need both as dev-dependencies, and in the fuzz
+# targets, which ask for the `fuzzing` feature.
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = { version = "0.9", default-features = false }
+h264-reader = { version = "0.9", default-features = false }
+
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
+libloading = { version = "0.9", default-features = false, optional = true }
+h264-reader = { version = "0.9", default-features = false, optional = true }
 
 [target.'cfg(all(unix, not(target_os = "linux")))'.dev-dependencies]
 libloading = { version = "0.9", default-features = false }
+h264-reader = { version = "0.9", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
@@ -135,6 +143,9 @@ gpu = [
 software-decode = ["dep:rav1d", "dep:avif-parse", "dep:yuv", "dep:moxcms"]
 # AV1 *encode* in software adds `rav1e` on top of the decode stack.
 software-encode = ["dep:rav1e", "dep:num-traits", "software-decode"]
+# Exposes the VA-API H.264 parser, DPB and decoder, with a driver double, to
+# the fuzz targets in `fuzz/` on unix hosts. Not for applications.
+fuzzing = ["dep:libloading", "dep:h264-reader"]
 
 [lints]
 workspace = true

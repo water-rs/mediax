@@ -3,6 +3,9 @@
 use super::{
     VaapiError,
     api::Api,
+    device::{
+        Buffer, Config, Context, Device, Image, PictureBuffers, Surfaces, render_nodes, to_usize,
+    },
     headers::{
         FrameKind, LOG2_MAX_FRAME_NUM, LOG2_MAX_POC_LSB, MACROBLOCK, MAX_NUM_REF_FRAMES,
         PIC_INIT_QP, PackedHeader, SliceHeader, StreamParameters,
@@ -11,44 +14,26 @@ use super::{
     types::{
         MiscParameter, VA_ATTRIB_NOT_SUPPORTED, VA_CODED_BUF_STATUS_BAD_BITSTREAM,
         VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK, VA_ENC_PACKED_HEADER_PICTURE,
-        VA_ENC_PACKED_HEADER_SEQUENCE, VA_ENC_PACKED_HEADER_SLICE, VA_FOURCC_NV12, VA_INVALID_ID,
-        VA_PICTURE_H264_SHORT_TERM_REFERENCE, VA_PROGRESSIVE, VA_RT_FORMAT_YUV420,
-        VA_STATUS_ERROR_UNSUPPORTED_PROFILE, VA_STATUS_SUCCESS, VA_SURFACE_ATTRIB_SETTABLE,
-        VABufferID, VACodedBufferSegment, VAConfigAttrib, VAConfigAttribEncMaxRefFrames,
-        VAConfigAttribEncPackedHeaders, VAConfigAttribRTFormat, VAConfigAttribRateControl,
-        VAConfigID, VAContextID, VADisplay, VAEncCodedBufferType, VAEncMiscParameterBuffer,
-        VAEncMiscParameterBufferType, VAEncMiscParameterTypeFrameRate, VAEncMiscParameterTypeHRD,
-        VAEncMiscParameterTypeRateControl, VAEncPackedHeaderDataBufferType,
-        VAEncPackedHeaderParameterBuffer, VAEncPackedHeaderParameterBufferType,
-        VAEncPackedHeaderPicture, VAEncPackedHeaderSequence, VAEncPackedHeaderSlice,
-        VAEncPictureParameterBufferH264, VAEncPictureParameterBufferType,
+        VA_ENC_PACKED_HEADER_SEQUENCE, VA_ENC_PACKED_HEADER_SLICE, VA_INVALID_ID,
+        VA_PICTURE_H264_SHORT_TERM_REFERENCE, VA_RT_FORMAT_YUV420, VACodedBufferSegment,
+        VAConfigAttrib, VAConfigAttribEncMaxRefFrames, VAConfigAttribEncPackedHeaders,
+        VAConfigAttribRTFormat, VAConfigAttribRateControl, VAEncCodedBufferType,
+        VAEncMiscParameterBuffer, VAEncMiscParameterBufferType, VAEncMiscParameterTypeFrameRate,
+        VAEncMiscParameterTypeHRD, VAEncMiscParameterTypeRateControl,
+        VAEncPackedHeaderDataBufferType, VAEncPackedHeaderParameterBuffer,
+        VAEncPackedHeaderParameterBufferType, VAEncPackedHeaderPicture, VAEncPackedHeaderSequence,
+        VAEncPackedHeaderSlice, VAEncPictureParameterBufferH264, VAEncPictureParameterBufferType,
         VAEncSequenceParameterBufferH264, VAEncSequenceParameterBufferType,
         VAEncSliceParameterBufferH264, VAEncSliceParameterBufferType, VAEntrypointEncSlice,
-        VAEntrypointEncSliceLP, VAGenericValue, VAGenericValueTypeInteger, VAGenericValueUnion,
-        VAImage, VAImageFormat, VAPictureH264, VAProfileH264ConstrainedBaseline, VAProfileH264High,
-        VAProfileH264Main, VAStatus, VASurfaceAttrib, VASurfaceAttribPixelFormat, VASurfaceID,
-        picture_fields, sequence_fields, vui_fields,
+        VAEntrypointEncSliceLP, VAPictureH264, VAProfileH264ConstrainedBaseline, VAProfileH264High,
+        VAProfileH264Main, VASurfaceID, picture_fields, sequence_fields, vui_fields,
     },
 };
 use crate::{
     Bitrate, CodecError, EncodedPacket, EncoderCodec, EncoderConfig, EncoderProfile, FrameOptions,
     H264Profile, H264Settings, annexb::AnnexBPackets, bitstream::build_h264_avcc_from_annex_b,
 };
-use std::{
-    ffi::{CStr, c_int, c_void},
-    fs::File,
-    mem::size_of,
-    os::fd::AsRawFd,
-    path::{Path, PathBuf},
-    ptr,
-    rc::Rc,
-    slice,
-};
-
-/// The directory render nodes live in.
-const DRI_DIRECTORY: &str = "/dev/dri";
-/// The prefix of render node names.
-const RENDER_NODE_PREFIX: &str = "renderD";
+use std::{ffi::c_int, path::Path, ptr, rc::Rc, slice};
 
 /// The input surface plus the two reconstruction surfaces that alternate as
 /// reference and target.
@@ -58,163 +43,6 @@ const MIN_CODED_BUFFER_BYTES: usize = 1 << 16;
 /// Upper bound on the segments of one coded buffer list, which a driver
 /// fills with a handful of NAL units.
 const MAX_CODED_SEGMENTS: usize = 256;
-
-/// A VA display on a render node, terminated when the last user is gone.
-struct Device {
-    api: Api,
-    display: VADisplay,
-    initialized: bool,
-    _node: File,
-}
-
-impl Device {
-    fn open(api: Api, path: &Path) -> Result<Self, VaapiError> {
-        let node = File::options()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|error| VaapiError::DeviceOpen {
-                path: path.display().to_string(),
-                reason: error.to_string(),
-            })?;
-        // SAFETY: `vaGetDisplayDRM` only reads the descriptor, which `node`
-        // keeps open for as long as the display lives.
-        let display = unsafe { (api.get_display_drm)(node.as_raw_fd()) };
-        if display.is_null() {
-            return Err(VaapiError::NoDisplay);
-        }
-        let mut device = Self {
-            api,
-            display,
-            initialized: false,
-            _node: node,
-        };
-        let (mut major, mut minor) = (0, 0);
-        // SAFETY: `display` came from `vaGetDisplayDRM` and the out
-        // parameters are live locals.
-        let status = unsafe { (device.api.initialize)(display, &raw mut major, &raw mut minor) };
-        device.check("vaInitialize", status)?;
-        device.initialized = true;
-        tracing::debug!(major, minor, node = %path.display(), "VA-API display initialised");
-        Ok(device)
-    }
-
-    fn check(&self, call: &'static str, status: VAStatus) -> Result<(), VaapiError> {
-        if status == VA_STATUS_SUCCESS {
-            return Ok(());
-        }
-        // SAFETY: `vaErrorStr` takes any status and returns a static string.
-        let text = unsafe { (self.api.error_str)(status) };
-        let message = if text.is_null() {
-            String::from("unknown error")
-        } else {
-            // SAFETY: a non-null result is a NUL-terminated static string.
-            unsafe { CStr::from_ptr(text) }
-                .to_string_lossy()
-                .into_owned()
-        };
-        Err(VaapiError::Driver {
-            call,
-            status,
-            message,
-        })
-    }
-
-    /// Reports a failed teardown call; nothing more can be done with it.
-    fn log_teardown(&self, call: &'static str, status: VAStatus) {
-        if let Err(error) = self.check(call, status) {
-            tracing::warn!(%error, "VA-API teardown failed");
-        }
-    }
-}
-
-impl Drop for Device {
-    fn drop(&mut self) {
-        if self.initialized {
-            // SAFETY: the display was initialised and every object created
-            // on it has been destroyed, as the owners hold an `Rc<Device>`.
-            let status = unsafe { (self.api.terminate)(self.display) };
-            self.log_teardown("vaTerminate", status);
-        }
-    }
-}
-
-/// A `VAConfigID`.
-struct Config {
-    device: Rc<Device>,
-    id: VAConfigID,
-}
-
-impl Drop for Config {
-    fn drop(&mut self) {
-        // SAFETY: `id` came from `vaCreateConfig` on this display.
-        let status = unsafe { (self.device.api.destroy_config)(self.device.display, self.id) };
-        self.device.log_teardown("vaDestroyConfig", status);
-    }
-}
-
-/// The surfaces: the input first, then the two reconstruction targets.
-struct Surfaces {
-    device: Rc<Device>,
-    ids: [VASurfaceID; SURFACE_COUNT as usize],
-}
-
-impl Drop for Surfaces {
-    fn drop(&mut self) {
-        // SAFETY: the ids came from `vaCreateSurfaces` on this display.
-        let status = unsafe {
-            (self.device.api.destroy_surfaces)(
-                self.device.display,
-                self.ids.as_mut_ptr(),
-                c_int::from(SURFACE_COUNT),
-            )
-        };
-        self.device.log_teardown("vaDestroySurfaces", status);
-    }
-}
-
-/// A `VAContextID`.
-struct Context {
-    device: Rc<Device>,
-    id: VAContextID,
-}
-
-impl Drop for Context {
-    fn drop(&mut self) {
-        // SAFETY: `id` came from `vaCreateContext` on this display.
-        let status = unsafe { (self.device.api.destroy_context)(self.device.display, self.id) };
-        self.device.log_teardown("vaDestroyContext", status);
-    }
-}
-
-/// A `VABufferID`, destroyed on drop.
-struct Buffer {
-    device: Rc<Device>,
-    id: VABufferID,
-}
-
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        // SAFETY: `id` came from `vaCreateBuffer` on this display.
-        let status = unsafe { (self.device.api.destroy_buffer)(self.device.display, self.id) };
-        self.device.log_teardown("vaDestroyBuffer", status);
-    }
-}
-
-/// The staging `VAImage` frames are written through.
-struct Image {
-    device: Rc<Device>,
-    image: VAImage,
-}
-
-impl Drop for Image {
-    fn drop(&mut self) {
-        // SAFETY: the image came from `vaCreateImage` on this display.
-        let status =
-            unsafe { (self.device.api.destroy_image)(self.device.display, self.image.image_id) };
-        self.device.log_teardown("vaDestroyImage", status);
-    }
-}
 
 /// What an encoder is built from, independent of the render node.
 #[derive(Debug, Clone, Copy)]
@@ -366,10 +194,21 @@ impl VaapiEncoder {
         )?;
         device.check_capabilities(stream, entrypoint)?;
         let config = create_config(&device, stream, entrypoint)?;
-        let surfaces = create_surfaces(&device, stream)?;
-        let context = create_context(&device, &config, &surfaces, stream)?;
+        let surfaces = Surfaces::create(
+            &device,
+            stream.coded_width,
+            stream.coded_height,
+            usize::from(SURFACE_COUNT),
+        )?;
+        let context = Context::create(
+            &device,
+            &config,
+            stream.coded_width,
+            stream.coded_height,
+            &surfaces,
+        )?;
         let coded_buffer = create_coded_buffer(&device, &context, stream)?;
-        let image = create_image(&device, stream)?;
+        let image = Image::create(&device, stream.coded_width, stream.coded_height)?;
 
         let parameter_sets = stream.parameters.annex_b_parameter_sets()?;
         let codec_config = build_h264_avcc_from_annex_b(&parameter_sets);
@@ -476,19 +315,8 @@ impl VaapiEncoder {
         if image.num_planes != 2 {
             return Err(VaapiError::BufferTooSmall("image planes"));
         }
-        let mut mapped: *mut c_void = ptr::null_mut();
-        // SAFETY: `image.buf` is the image's buffer and `mapped` a live local.
-        let status = unsafe { (device.api.map_buffer)(device.display, image.buf, &raw mut mapped) };
-        device.check("vaMapBuffer", status)?;
-        let copied = if mapped.is_null() {
-            Err(VaapiError::BufferTooSmall("image"))
-        } else {
-            // SAFETY: the driver maps `data_size` bytes at `mapped` until the
-            // buffer is unmapped below, and nothing else touches them.
-            let bytes = unsafe {
-                slice::from_raw_parts_mut(mapped.cast::<u8>(), to_usize(image.data_size)?)
-            };
-            let parameters = &self.stream.parameters;
+        let parameters = &self.stream.parameters;
+        device.with_mapped_bytes(image.buf, to_usize(image.data_size)?, "image", |bytes| {
             copy_nv12_padded(
                 frame,
                 (parameters.width as usize, parameters.height as usize),
@@ -499,11 +327,7 @@ impl VaapiEncoder {
                 ),
                 layout,
             )
-        };
-        // SAFETY: the buffer was mapped above.
-        let status = unsafe { (device.api.unmap_buffer)(device.display, image.buf) };
-        device.check("vaUnmapBuffer", status)?;
-        copied?;
+        })?;
         // SAFETY: the surface and image belong to this display; the previous
         // frame was synchronised, so the surface is idle.
         let status = unsafe {
@@ -530,36 +354,51 @@ impl VaapiEncoder {
             FrameKind::Idr => None,
             FrameKind::P => Some(self.reference.ok_or(VaapiError::MissingReference)?),
         };
-        let mut buffers = FrameBuffers::new(&self.device, self.context.id);
+        let mut buffers = PictureBuffers::new(&self.device, self.context.id);
         let idr = plan.kind == FrameKind::Idr;
         let parameters = &self.stream.parameters;
         if idr {
             buffers.add(VAEncSequenceParameterBufferType, &self.sequence_parameter())?;
         }
         if idr || self.rate_changed {
-            buffers.add_misc(
+            add_misc(
+                &mut buffers,
                 VAEncMiscParameterTypeRateControl,
                 self.rate.misc_rate_control(),
             )?;
         }
         if idr {
-            buffers.add_misc(
+            add_misc(
+                &mut buffers,
                 VAEncMiscParameterTypeFrameRate,
                 misc_frame_rate(parameters.frame_rate)?,
             )?;
         }
         if idr || self.rate_changed {
-            buffers.add_misc(VAEncMiscParameterTypeHRD, self.rate.misc_hrd())?;
+            add_misc(
+                &mut buffers,
+                VAEncMiscParameterTypeHRD,
+                self.rate.misc_hrd(),
+            )?;
         }
         buffers.add(
             VAEncPictureParameterBufferType,
             &self.picture_parameter(plan, reconstruction, reference),
         )?;
         if idr {
-            buffers.add_packed(VAEncPackedHeaderSequence, &parameters.packed_sps()?)?;
-            buffers.add_packed(VAEncPackedHeaderPicture, &parameters.packed_pps())?;
+            add_packed(
+                &mut buffers,
+                VAEncPackedHeaderSequence,
+                &parameters.packed_sps()?,
+            )?;
+            add_packed(
+                &mut buffers,
+                VAEncPackedHeaderPicture,
+                &parameters.packed_pps(),
+            )?;
         }
-        buffers.add_packed(
+        add_packed(
+            &mut buffers,
             VAEncPackedHeaderSlice,
             &parameters.packed_slice_header(&SliceHeader {
                 kind: plan.kind,
@@ -573,32 +412,7 @@ impl VaapiEncoder {
             &self.slice_parameter(plan, reference),
         )?;
 
-        let device = &*self.device;
-        let input = self.surfaces.ids[0];
-        // SAFETY: the context and the input surface belong to this display.
-        let status = unsafe { (device.api.begin_picture)(device.display, self.context.id, input) };
-        device.check("vaBeginPicture", status)?;
-        let count = c_int::try_from(buffers.ids.len())
-            .map_err(|_| VaapiError::SizeOutOfRange("buffer count"))?;
-        // SAFETY: `buffers.ids` are live buffers of this context.
-        let rendered = device.check("vaRenderPicture", unsafe {
-            (device.api.render_picture)(
-                device.display,
-                self.context.id,
-                buffers.ids.as_mut_ptr(),
-                count,
-            )
-        });
-        // SAFETY: a picture was begun on this context; it must be ended
-        // whether or not rendering succeeded.
-        let ended = device.check("vaEndPicture", unsafe {
-            (device.api.end_picture)(device.display, self.context.id)
-        });
-        rendered?;
-        ended?;
-        // SAFETY: the surface belongs to this display.
-        let status = unsafe { (device.api.sync_surface)(device.display, input) };
-        device.check("vaSyncSurface", status)
+        buffers.render(self.surfaces.ids[0])
     }
 
     fn sequence_parameter(&self) -> VAEncSequenceParameterBufferH264 {
@@ -736,19 +550,9 @@ impl VaapiEncoder {
 
     /// Copies the coded buffer's segments into one Annex B byte string.
     fn read_coded_buffer(&self) -> Result<Vec<u8>, VaapiError> {
-        let device = &*self.device;
-        let mut mapped: *mut c_void = ptr::null_mut();
-        // SAFETY: the coded buffer belongs to this display and `mapped` is a
-        // live local.
-        let status = unsafe {
-            (device.api.map_buffer)(device.display, self.coded_buffer.id, &raw mut mapped)
-        };
-        device.check("vaMapBuffer", status)?;
-        let access_unit = collect_segments(mapped.cast::<VACodedBufferSegment>());
-        // SAFETY: the buffer was mapped above.
-        let status = unsafe { (device.api.unmap_buffer)(device.display, self.coded_buffer.id) };
-        device.check("vaUnmapBuffer", status)?;
-        access_unit
+        self.device.with_mapping(self.coded_buffer.id, |mapped| {
+            collect_segments(mapped.cast::<VACodedBufferSegment>())
+        })
     }
 }
 
@@ -756,29 +560,11 @@ impl Device {
     /// Returns the slice encode entry point the driver offers for `profile`:
     /// the regular one when present, else the low-power one.
     fn encode_entrypoint(&self, profile: c_int) -> Result<Option<c_int>, VaapiError> {
-        // SAFETY: the display is initialised.
-        let capacity = unsafe { (self.api.max_num_entrypoints)(self.display) };
-        let mut entrypoints = vec![0; usize::try_from(capacity).unwrap_or_default()];
-        let mut count = 0;
-        // SAFETY: `entrypoints` holds `vaMaxNumEntrypoints` elements.
-        let status = unsafe {
-            (self.api.query_config_entrypoints)(
-                self.display,
-                profile,
-                entrypoints.as_mut_ptr(),
-                &raw mut count,
-            )
-        };
-        if status == VA_STATUS_ERROR_UNSUPPORTED_PROFILE {
-            return Ok(None);
-        }
-        self.check("vaQueryConfigEntrypoints", status)?;
-        let offered = entrypoints
-            .get(..usize::try_from(count).unwrap_or_default())
-            .unwrap_or_default();
-        Ok([VAEntrypointEncSlice, VAEntrypointEncSliceLP]
-            .into_iter()
-            .find(|entrypoint| offered.contains(entrypoint)))
+        Ok(self.entrypoints(profile)?.and_then(|offered| {
+            [VAEntrypointEncSlice, VAEntrypointEncSliceLP]
+                .into_iter()
+                .find(|entrypoint| offered.contains(entrypoint))
+        }))
     }
 
     /// Checks the entry point takes the render target format, the rate
@@ -880,74 +666,7 @@ fn create_config(
         )
     };
     device.check("vaCreateConfig", status)?;
-    Ok(Config {
-        device: Rc::clone(device),
-        id,
-    })
-}
-
-fn create_surfaces(device: &Rc<Device>, stream: &Stream) -> Result<Surfaces, VaapiError> {
-    let mut attribute = VASurfaceAttrib {
-        type_: VASurfaceAttribPixelFormat,
-        flags: VA_SURFACE_ATTRIB_SETTABLE,
-        value: VAGenericValue {
-            type_: VAGenericValueTypeInteger,
-            value: VAGenericValueUnion {
-                i: i32::from_ne_bytes(VA_FOURCC_NV12.to_ne_bytes()),
-            },
-        },
-    };
-    let mut ids = [VA_INVALID_ID; SURFACE_COUNT as usize];
-    // SAFETY: the pointers and counts describe live locals.
-    let status = unsafe {
-        (device.api.create_surfaces)(
-            device.display,
-            VA_RT_FORMAT_YUV420,
-            stream.coded_width,
-            stream.coded_height,
-            ids.as_mut_ptr(),
-            u32::from(SURFACE_COUNT),
-            &raw mut attribute,
-            1,
-        )
-    };
-    device.check("vaCreateSurfaces", status)?;
-    Ok(Surfaces {
-        device: Rc::clone(device),
-        ids,
-    })
-}
-
-fn create_context(
-    device: &Rc<Device>,
-    config: &Config,
-    surfaces: &Surfaces,
-    stream: &Stream,
-) -> Result<Context, VaapiError> {
-    let width = c_int::try_from(stream.coded_width)
-        .map_err(|_| VaapiError::SizeOutOfRange("frame width"))?;
-    let height = c_int::try_from(stream.coded_height)
-        .map_err(|_| VaapiError::SizeOutOfRange("frame height"))?;
-    let mut targets = surfaces.ids;
-    let mut id = VA_INVALID_ID;
-    // SAFETY: the pointers and the count describe live locals.
-    let status = unsafe {
-        (device.api.create_context)(
-            device.display,
-            config.id,
-            width,
-            height,
-            VA_PROGRESSIVE,
-            targets.as_mut_ptr(),
-            c_int::from(SURFACE_COUNT),
-            &raw mut id,
-        )
-    };
-    device.check("vaCreateContext", status)?;
-    Ok(Context {
-        device: Rc::clone(device),
-        id,
-    })
+    Ok(Config::new(Rc::clone(device), id))
 }
 
 fn create_coded_buffer(
@@ -973,132 +692,37 @@ fn create_coded_buffer(
         )
     };
     device.check("vaCreateBuffer", status)?;
-    Ok(Buffer {
-        device: Rc::clone(device),
-        id,
-    })
+    Ok(Buffer::new(Rc::clone(device), id))
 }
 
-fn create_image(device: &Rc<Device>, stream: &Stream) -> Result<Image, VaapiError> {
-    // SAFETY: the display is initialised.
-    let capacity = unsafe { (device.api.max_num_image_formats)(device.display) };
-    let mut formats = vec![VAImageFormat::default(); usize::try_from(capacity).unwrap_or_default()];
-    let mut count = 0;
-    // SAFETY: `formats` holds `vaMaxNumImageFormats` elements.
-    let status = unsafe {
-        (device.api.query_image_formats)(device.display, formats.as_mut_ptr(), &raw mut count)
-    };
-    device.check("vaQueryImageFormats", status)?;
-    let mut format = formats
-        .get(..usize::try_from(count).unwrap_or_default())
-        .unwrap_or_default()
-        .iter()
-        .find(|format| format.fourcc == VA_FOURCC_NV12)
-        .copied()
-        .ok_or(VaapiError::NoNv12ImageFormat)?;
-    let width = c_int::try_from(stream.coded_width)
-        .map_err(|_| VaapiError::SizeOutOfRange("frame width"))?;
-    let height = c_int::try_from(stream.coded_height)
-        .map_err(|_| VaapiError::SizeOutOfRange("frame height"))?;
-    let mut image = VAImage::default();
-    // SAFETY: the pointers refer to live locals.
-    let status = unsafe {
-        (device.api.create_image)(
-            device.display,
-            &raw mut format,
-            width,
-            height,
-            &raw mut image,
-        )
-    };
-    device.check("vaCreateImage", status)?;
-    Ok(Image {
-        device: Rc::clone(device),
-        image,
-    })
+/// Adds a misc parameter buffer of `payload`.
+fn add_misc<T>(buffers: &mut PictureBuffers, kind: u32, payload: T) -> Result<(), VaapiError> {
+    buffers.add(
+        VAEncMiscParameterBufferType,
+        &MiscParameter {
+            header: VAEncMiscParameterBuffer { type_: kind },
+            payload,
+        },
+    )
 }
 
-/// The buffers recorded for one picture, destroyed when it is done.
-struct FrameBuffers<'a> {
-    device: &'a Rc<Device>,
-    context: VAContextID,
-    ids: Vec<VABufferID>,
-}
-
-impl<'a> FrameBuffers<'a> {
-    const fn new(device: &'a Rc<Device>, context: VAContextID) -> Self {
-        Self {
-            device,
-            context,
-            ids: Vec::new(),
-        }
-    }
-
-    fn add_raw(&mut self, kind: u32, size: usize, data: *mut c_void) -> Result<(), VaapiError> {
-        let size = u32::try_from(size).map_err(|_| VaapiError::SizeOutOfRange("buffer"))?;
-        let mut id = VA_INVALID_ID;
-        // SAFETY: libva copies `size` bytes from `data`, which points at a
-        // live value of that size; `id` is a live local.
-        let status = unsafe {
-            (self.device.api.create_buffer)(
-                self.device.display,
-                self.context,
-                kind,
-                size,
-                1,
-                data,
-                &raw mut id,
-            )
-        };
-        self.device.check("vaCreateBuffer", status)?;
-        self.ids.push(id);
-        Ok(())
-    }
-
-    /// Adds a buffer holding a copy of `value`.
-    fn add<T>(&mut self, kind: u32, value: &T) -> Result<(), VaapiError> {
-        self.add_raw(kind, size_of::<T>(), ptr::from_ref(value).cast_mut().cast())
-    }
-
-    /// Adds a misc parameter buffer of `payload`.
-    fn add_misc<T>(&mut self, kind: u32, payload: T) -> Result<(), VaapiError> {
-        self.add(
-            VAEncMiscParameterBufferType,
-            &MiscParameter {
-                header: VAEncMiscParameterBuffer { type_: kind },
-                payload,
-            },
-        )
-    }
-
-    /// Adds a packed header's parameter and data buffers.
-    fn add_packed(&mut self, kind: u32, header: &PackedHeader) -> Result<(), VaapiError> {
-        self.add(
-            VAEncPackedHeaderParameterBufferType,
-            &VAEncPackedHeaderParameterBuffer {
-                type_: kind,
-                bit_length: header.bit_length,
-                // The headers carry their emulation prevention bytes.
-                has_emulation_bytes: 1,
-                va_reserved: [0; 4],
-            },
-        )?;
-        self.add_raw(
-            VAEncPackedHeaderDataBufferType,
-            header.data.len(),
-            header.data.as_ptr().cast_mut().cast(),
-        )
-    }
-}
-
-impl Drop for FrameBuffers<'_> {
-    fn drop(&mut self) {
-        for &id in &self.ids {
-            // SAFETY: `id` came from `vaCreateBuffer` on this display.
-            let status = unsafe { (self.device.api.destroy_buffer)(self.device.display, id) };
-            self.device.log_teardown("vaDestroyBuffer", status);
-        }
-    }
+/// Adds a packed header's parameter and data buffers.
+fn add_packed(
+    buffers: &mut PictureBuffers,
+    kind: u32,
+    header: &PackedHeader,
+) -> Result<(), VaapiError> {
+    buffers.add(
+        VAEncPackedHeaderParameterBufferType,
+        &VAEncPackedHeaderParameterBuffer {
+            type_: kind,
+            bit_length: header.bit_length,
+            // The headers carry their emulation prevention bytes.
+            has_emulation_bytes: 1,
+            va_reserved: [0; 4],
+        },
+    )?;
+    buffers.add_bytes(VAEncPackedHeaderDataBufferType, &header.data)
 }
 
 /// Concatenates the segments of a mapped coded buffer.
@@ -1156,30 +780,4 @@ fn reference_picture(reference: Reference) -> VAPictureH264 {
 /// A POC is below 2^16, so it always fits.
 fn poc_value(poc: u32) -> i32 {
     i32::try_from(poc).unwrap_or(i32::MAX)
-}
-
-fn to_usize(value: u32) -> Result<usize, VaapiError> {
-    usize::try_from(value).map_err(|_| VaapiError::SizeOutOfRange("size"))
-}
-
-/// Lists the DRM render nodes, in name order.
-fn render_nodes() -> Result<Vec<PathBuf>, VaapiError> {
-    let entries =
-        std::fs::read_dir(DRI_DIRECTORY).map_err(|_| VaapiError::NoRenderNode(DRI_DIRECTORY))?;
-    let mut nodes: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(RENDER_NODE_PREFIX)
-        })
-        .map(|entry| entry.path())
-        .collect();
-    nodes.sort();
-    if nodes.is_empty() {
-        Err(VaapiError::NoRenderNode(DRI_DIRECTORY))
-    } else {
-        Ok(nodes)
-    }
 }
