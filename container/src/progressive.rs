@@ -10,7 +10,7 @@ use bytes::Bytes;
 use mediax_core::{Error, FrameRate};
 use transmux::Fmp4Demux;
 
-use crate::demuxer::{IndexedTrackSamples, SampleMeta, index_track_samples};
+use crate::demuxer::{IndexedTrackSamples, MovieTimeline, SampleMeta, index_track_samples};
 use crate::isobmff::read_top_level_box;
 use crate::parameters::rational;
 use crate::stream::{
@@ -100,6 +100,7 @@ impl ProgressiveTrackReader {
         let path = path.as_ref();
         let movie = read_top_level_box(path, *b"moov")?
             .ok_or_else(|| Error::Container(String::from("progressive media has no moov box")))?;
+        let timeline = MovieTimeline::parse(&movie)?;
         let media = Fmp4Demux::new()
             .unpackage(&movie)
             .map_err(|error| Error::Container(error.to_string()))?;
@@ -146,16 +147,16 @@ impl ProgressiveTrackReader {
                     "MP4 {kind:?} track {track_id} disappeared after probing"
                 ))
             })?;
-            let indexed = index_track_samples(path, mp4_track)?;
+            let indexed = index_track_samples(path, mp4_track, &timeline)?;
             let info = match constant_frame_rate(&indexed.metas, info.timescale()) {
                 Some(frame_rate) if kind == TrackKind::Video => info.with_frame_rate(frame_rate),
                 _ => info,
             };
-            let presentation_end = indexed.metas.iter().fold(0_u64, |end, sample| {
+            let presentation_end = indexed.metas.iter().fold(0_i64, |end, sample| {
                 end.max(
                     sample
                         .presentation_time
-                        .saturating_add(u64::from(sample.duration)),
+                        .saturating_add(i64::from(sample.duration)),
                 )
             });
             let duration = media_duration(presentation_end, info.timescale());
@@ -393,18 +394,8 @@ impl ProgressiveTrackReader {
         self.sample_index = self.sample_index.saturating_add(1);
         let encoded = EncodedSample::new(
             track_id,
-            MediaTime::new(
-                i64::try_from(sample_metadata.decode_time).map_err(|_| {
-                    Error::Container(String::from("MP4 decode timestamp exceeds i64"))
-                })?,
-                timescale,
-            ),
-            MediaTime::new(
-                i64::try_from(sample_metadata.presentation_time).map_err(|_| {
-                    Error::Container(String::from("MP4 presentation timestamp exceeds i64"))
-                })?,
-                timescale,
-            ),
+            MediaTime::new(sample_metadata.decode_time, timescale),
+            MediaTime::new(sample_metadata.presentation_time, timescale),
             MediaTime::new(i64::from(sample_metadata.duration), timescale),
             sample_metadata.is_keyframe,
             data,
@@ -425,18 +416,21 @@ fn constant_frame_rate(metas: &[SampleMeta], timescale: std::num::NonZeroU32) ->
     rational(u64::from(timescale.get()), u64::from(ticks))
 }
 
-fn media_duration(ticks: u64, timescale: std::num::NonZeroU32) -> Duration {
-    Duration::from_nanos(ticks.saturating_mul(1_000_000_000) / u64::from(timescale.get()))
+/// `ticks` as a duration; a time before the presentation starts is zero.
+fn media_duration(ticks: i64, timescale: std::num::NonZeroU32) -> Duration {
+    Duration::from_nanos(
+        ticks.max(0).cast_unsigned().saturating_mul(1_000_000_000) / u64::from(timescale.get()),
+    )
 }
 
-fn duration_to_ticks(duration: Duration, timescale: std::num::NonZeroU32) -> Result<u64, Error> {
+fn duration_to_ticks(duration: Duration, timescale: std::num::NonZeroU32) -> Result<i64, Error> {
     let ticks = duration
         .as_nanos()
         .checked_mul(u128::from(timescale.get()))
         .ok_or_else(|| Error::Container(String::from("media seek timestamp overflow")))?
         / 1_000_000_000;
-    u64::try_from(ticks)
-        .map_err(|_| Error::Container(String::from("media seek timestamp exceeds u64 ticks")))
+    i64::try_from(ticks)
+        .map_err(|_| Error::Container(String::from("media seek timestamp exceeds i64 ticks")))
 }
 
 #[cfg(test)]
