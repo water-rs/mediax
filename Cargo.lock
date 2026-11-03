@@ -2201,6 +2201,7 @@ dependencies = [
  "env_logger",
  "mediax-codec",
  "mediax-core",
+ "rand 0.10.3",
 ]
 
 [[package]]

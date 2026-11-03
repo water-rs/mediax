@@ -1,0 +1,38 @@
+name: Bench
+
+permissions:
+  contents: read
+
+# Release-build encoder benchmark on the Linux runner, run on demand.
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    name: Bench (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        uses: ./.github/actions/setup-linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench
+      - run: cargo build --locked --release -p mediax-bench
+      - name: Run the benchmark
+        shell: bash
+        run: |
+          set -o pipefail
+          target/release/mediax-bench | tee bench.txt
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### mediax-bench on $(nproc) CPUs: $(lscpu | sed -n 's/^Model name: *//p')"
+            echo '```'
+            cat bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
