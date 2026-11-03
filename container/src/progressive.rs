@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use broadcast_common::Unpackage as _;
 use bytes::Bytes;
-use mediax_core::Error;
+use mediax_core::{Error, FrameRate};
 use transmux::Fmp4Demux;
 
-use crate::demuxer::{IndexedTrackSamples, index_track_samples};
+use crate::demuxer::{IndexedTrackSamples, SampleMeta, index_track_samples};
 use crate::isobmff::read_top_level_box;
+use crate::parameters::rational;
 use crate::stream::{
     EncodedSample, MediaTime, TrackId, TrackInfo, TrackKind, track_info_from_spec,
 };
@@ -146,6 +147,10 @@ impl ProgressiveTrackReader {
                 ))
             })?;
             let indexed = index_track_samples(path, mp4_track)?;
+            let info = match constant_frame_rate(&indexed.metas, info.timescale()) {
+                Some(frame_rate) if kind == TrackKind::Video => info.with_frame_rate(frame_rate),
+                _ => info,
+            };
             let presentation_end = indexed.metas.iter().fold(0_u64, |end, sample| {
                 end.max(
                     sample
@@ -409,6 +414,17 @@ impl ProgressiveTrackReader {
     }
 }
 
+/// The frame rate the sample table declares: every sample but the last, which
+/// a muxer may truncate, lasts the same time.
+fn constant_frame_rate(metas: &[SampleMeta], timescale: std::num::NonZeroU32) -> Option<FrameRate> {
+    let (last, body) = metas.split_last()?;
+    let ticks = body.first().map_or(last.duration, |sample| sample.duration);
+    if body.iter().any(|sample| sample.duration != ticks) {
+        return None;
+    }
+    rational(u64::from(timescale.get()), u64::from(ticks))
+}
+
 fn media_duration(ticks: u64, timescale: std::num::NonZeroU32) -> Duration {
     Duration::from_nanos(ticks.saturating_mul(1_000_000_000) / u64::from(timescale.get()))
 }
@@ -588,7 +604,7 @@ mod tests {
                     profile_compatibility: 0,
                     level_indication: 30,
                     length_size_minus_one: 3,
-                    sps: vec![AvcSps(vec![0x67, 0x42, 0x00, 0x1e, 0xe9, 0x01, 0x40])],
+                    sps: vec![AvcSps(crate::parameters::tests::avc_sps(None))],
                     pps: vec![AvcPps(vec![0x68, 0xce, 0x06, 0xe2])],
                     chroma_format: None,
                     bit_depth_luma_minus8: None,

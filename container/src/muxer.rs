@@ -694,7 +694,7 @@ fn time_to_sample(deltas: &[u32]) -> TimeToSampleBox {
 }
 
 /// The sample entry and configuration box for `info`'s codec.
-fn codec_config(info: &TrackInfo) -> Result<CodecConfig, Error> {
+pub fn codec_config(info: &TrackInfo) -> Result<CodecConfig, Error> {
     let expected = match info.codec() {
         Codec::H264 | Codec::H265 | Codec::Av1 => TrackKind::Video,
         Codec::Aac => TrackKind::Audio,
@@ -712,16 +712,19 @@ fn codec_config(info: &TrackInfo) -> Result<CodecConfig, Error> {
         )));
     }
     let config = info.decoder_configuration();
-    let record = |fourcc: &[u8; 4]| match config.get(4..8) {
-        Some(tag) if tag == fourcc => &config[8..],
-        _ => config,
+    // H.264, H.265 and AV1 configurations are always the whole box.
+    let record = || {
+        config.get(8..).ok_or_else(|| {
+            Error::Container(String::from(
+                "codec configuration shorter than a box header",
+            ))
+        })
     };
     match info.codec() {
         Codec::H264 => {
             let (width, height) = video_size(info)?;
             Ok(CodecConfig::Avc {
-                config: AVCConfigurationBox::parse_body(record(b"avcC"))
-                    .map_err(container_error)?,
+                config: AVCConfigurationBox::parse_body(record()?).map_err(container_error)?,
                 width,
                 height,
             })
@@ -729,8 +732,7 @@ fn codec_config(info: &TrackInfo) -> Result<CodecConfig, Error> {
         Codec::H265 => {
             let (width, height) = video_size(info)?;
             Ok(CodecConfig::Hevc {
-                config: HEVCConfigurationBox::parse_body(record(b"hvcC"))
-                    .map_err(container_error)?,
+                config: HEVCConfigurationBox::parse_body(record()?).map_err(container_error)?,
                 width,
                 height,
             })
@@ -738,7 +740,7 @@ fn codec_config(info: &TrackInfo) -> Result<CodecConfig, Error> {
         Codec::Av1 => {
             let (width, height) = video_size(info)?;
             Ok(CodecConfig::Av1 {
-                config: Av1ConfigurationBox::parse(record(b"av1C")).map_err(container_error)?,
+                config: Av1ConfigurationBox::parse(record()?).map_err(container_error)?,
                 width,
                 height,
             })
@@ -899,4 +901,4 @@ fn container_error(error: impl std::fmt::Display) -> Error {
 }
 
 #[cfg(test)]
-mod tests;
+pub mod tests;

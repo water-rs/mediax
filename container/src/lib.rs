@@ -9,7 +9,9 @@ mod color;
 mod demuxer;
 mod isobmff;
 mod muxer;
+mod parameters;
 mod progressive;
+mod reader;
 mod stream;
 mod subtitles;
 
@@ -23,7 +25,9 @@ pub use mediax_core::{
     TrackProtection,
 };
 pub use muxer::{ContainerFormat, Muxer};
+pub use parameters::{ChromaFormat, VideoLevel, VideoParameters};
 pub use progressive::{ProgressiveTrack, ProgressiveTrackReader};
+pub use reader::{MediaFile, MediaFormat, MediaTrack};
 pub use stream::{
     AudioLayout, CmafChunkDemuxer, CmafDemuxer, CmafInitialization, CmafMediaSegment, Codec,
     EncodedSample, MediaTime, MpegTsDemuxer, MpegTsEvent, TimedMetadata, TrackId, TrackInfo,
