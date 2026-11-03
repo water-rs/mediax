@@ -8,8 +8,8 @@ use mediax_codec::{CodecType, Decoder};
 use mediax_container::EncodedSample;
 use serde_json::Value;
 use support::{
-    AUDIO_ID, Container, FRAMES, HEIGHT, VIDEO_ID, Video, WIDTH, assert_same_samples, encode,
-    fixture_path, mediax, path_arg, read_samples, same_time, scratch, write_fixture,
+    AUDIO_ID, Container, HEIGHT, VIDEO_ID, Video, WIDTH, assert_same_samples, encode, fixture_path,
+    mediax, path_arg, read_samples, same_time, scratch, write_fixture,
 };
 
 fn probe(path: &Path) -> Value {
@@ -69,8 +69,11 @@ fn timeline(video_in: &[EncodedSample], video_out: &[EncodedSample]) -> String {
     )
 }
 
-/// Asserts the transcoded `output` against the source's samples.
-fn assert_transcoded(source: &Path, output: &Path, codec: Video, label: &str) {
+/// Asserts the transcoded `output` against the source's samples: the output
+/// samples present at exactly the times of the source frames the encoder kept.
+/// Unless `may_drop`, the encoder kept every frame, so the times match the
+/// source's one for one.
+fn assert_transcoded(source: &Path, output: &Path, codec: Video, may_drop: bool, label: &str) {
     let report = probe(output);
     let video = &report["tracks"][0];
     assert_eq!(video["id"], VIDEO_ID, "{label}");
@@ -91,8 +94,13 @@ fn assert_transcoded(source: &Path, output: &Path, codec: Video, label: &str) {
     // sample. The AV1 encoder never drops.
     let (video_out, video_in) = (&output_samples[&VIDEO_ID], &source_samples[&VIDEO_ID]);
     assert_eq!(video["sample_count"], video_out.len(), "{label}");
-    if codec == Video::Av1 {
-        assert_eq!(video_out.len(), FRAMES, "{label}: frame count");
+    if !may_drop {
+        assert_eq!(
+            video_out.len(),
+            video_in.len(),
+            "{label}: frame count\n{}",
+            timeline(video_in, video_out)
+        );
     }
     assert!(!video_out.is_empty() && video_out.len() <= video_in.len());
     let mut kept = vec![false; video_in.len()];
@@ -153,7 +161,7 @@ fn check_from_av1(target: Video, extension: &str) {
         "{label}: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert_transcoded(&source, &output, target, &label);
+    assert_transcoded(&source, &output, target, false, &label);
 }
 
 #[test]
@@ -195,7 +203,7 @@ fn check_into_av1(source_codec: Video, decoder: CodecType) {
         "{label}: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert_transcoded(&source, &output, Video::Av1, &label);
+    assert_transcoded(&source, &output, Video::Av1, false, &label);
 }
 
 #[test]
@@ -231,7 +239,7 @@ fn a_starved_bitrate_keeps_the_times_of_the_frames_the_encoder_kept() {
             "{label}: {}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert_transcoded(&source, &output, target, &label);
+        assert_transcoded(&source, &output, target, true, &label);
     }
 }
 

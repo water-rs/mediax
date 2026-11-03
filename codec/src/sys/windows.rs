@@ -11,7 +11,7 @@ use crate::{
 use mediax_core::{
     ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr;
@@ -421,6 +421,13 @@ pub struct WindowsEncoder {
     /// The presentation time of the last packet that came without a
     /// `MFSampleExtension_DecodeTimestamp`; the next must follow it.
     last_undated_presentation: Option<Duration>,
+    /// Presentation times submitted whose frames have not come out yet.
+    pending: BTreeSet<Duration>,
+    /// The presentation time of the first submitted frame.
+    first_submitted: Option<Duration>,
+    /// How far the transform's output clock runs ahead of the input times, in
+    /// nanoseconds, known from the first output sample.
+    clock_lead: Option<i64>,
     output_stream_info: MFT_OUTPUT_STREAM_INFO,
     codec_config: Option<Vec<u8>>,
     packets: AnnexBPackets,
@@ -440,9 +447,10 @@ impl fmt::Debug for WindowsEncoder {
 /// One encoded output sample with the times Media Foundation stamped on it.
 struct OutputSample {
     data: Vec<u8>,
-    /// `IMFSample::GetSampleTime`: the presentation time the input frame
-    /// carried.
-    presentation_time: Duration,
+    /// `IMFSample::GetSampleTime`. The transform stamps it from its own frame
+    /// clock, so it is not an input frame's time; see
+    /// [`WindowsEncoder::resolve_frame`].
+    sample_time: Duration,
     /// `MFSampleExtension_DecodeTimestamp` in nanoseconds, when the transform
     /// sets it (it does for streams with B-frames).
     decode_time_nanos: Option<i64>,
@@ -649,6 +657,9 @@ impl WindowsEncoder {
                 height,
                 frame_rate: config.frame_rate,
                 last_undated_presentation: None,
+                pending: BTreeSet::new(),
+                first_submitted: None,
+                clock_lead: None,
                 output_stream_info,
                 codec_config,
                 packets: AnnexBPackets::new(
@@ -727,6 +738,12 @@ impl WindowsEncoder {
                 .ProcessInput(0, &input_sample, 0)
                 .map_err(|e| CodecError::EncodingFailed(format!("ProcessInput: {e}")))?;
         }
+        if !self.pending.insert(presentation_time) {
+            return Err(CodecError::EncodingFailed(format!(
+                "presentation time {presentation_time:?} was submitted twice"
+            )));
+        }
+        self.first_submitted.get_or_insert(presentation_time);
 
         let raw = self.pump_output_samples()?;
         self.frame_packets(raw)
@@ -769,25 +786,73 @@ impl WindowsEncoder {
         }
         raw.into_iter()
             .map(|sample| {
+                let (presentation_time, lead) = self.resolve_frame(sample.sample_time)?;
                 let decode_time_nanos = if let Some(decode_time) = sample.decode_time_nanos {
-                    decode_time
+                    decode_time.checked_sub(lead).ok_or_else(|| {
+                        CodecError::EncodingFailed("encoded sample decode time underflows".into())
+                    })?
                 } else {
                     if self
                         .last_undated_presentation
-                        .is_some_and(|last| sample.presentation_time <= last)
+                        .is_some_and(|last| presentation_time <= last)
                     {
                         return Err(CodecError::EncodingFailed(
                             "the encoder reordered frames without reporting decode timestamps"
                                 .into(),
                         ));
                     }
-                    self.last_undated_presentation = Some(sample.presentation_time);
-                    signed_nanos(sample.presentation_time)?
+                    self.last_undated_presentation = Some(presentation_time);
+                    signed_nanos(presentation_time)?
                 };
                 self.packets
-                    .packet(sample.data, sample.presentation_time, decode_time_nanos)
+                    .packet(sample.data, presentation_time, decode_time_nanos)
             })
             .collect()
+    }
+
+    /// The submitted frame an output sample encodes, and the encoder's lead.
+    ///
+    /// The transform does not echo input sample times: it stamps output from
+    /// its own frame clock, which runs a fixed lead ahead of the inputs (its
+    /// reorder delay) so decode times never pass presentation times. The first
+    /// output sample is always the first input frame, which gives the lead;
+    /// every later sample encodes the pending frame nearest to its sample time
+    /// minus the lead, within half a frame period.
+    fn resolve_frame(&mut self, sample_time: Duration) -> Result<(Duration, i64), CodecError> {
+        let stamped = signed_nanos(sample_time)?;
+        let lead = if let Some(lead) = self.clock_lead {
+            lead
+        } else {
+            let first = self.first_submitted.ok_or_else(|| {
+                CodecError::EncodingFailed("the encoder emitted before any input".into())
+            })?;
+            let lead = stamped - signed_nanos(first)?;
+            self.clock_lead = Some(lead);
+            lead
+        };
+        let target = Duration::from_nanos(u64::try_from(stamped - lead).map_err(|_| {
+            CodecError::EncodingFailed("encoded sample precedes the first input frame".into())
+        })?);
+        let half_period = Duration::from_nanos(
+            1_000_000_000 * u64::from(self.frame_rate.denominator().get())
+                / u64::from(self.frame_rate.numerator().get())
+                / 2,
+        );
+        let before = self.pending.range(..=target).next_back().copied();
+        let after = self.pending.range(target..).next().copied();
+        let nearest = [before, after]
+            .into_iter()
+            .flatten()
+            .min_by_key(|candidate| candidate.abs_diff(target))
+            .filter(|candidate| candidate.abs_diff(target) <= half_period)
+            .ok_or_else(|| {
+                CodecError::EncodingFailed(format!(
+                    "encoded sample time {sample_time:?} (lead {lead} ns) matches no pending \
+                     input frame within half a frame period"
+                ))
+            })?;
+        self.pending.remove(&nearest);
+        Ok((nearest, lead))
     }
 
     /// Pump every output sample the transform can currently produce, one
@@ -825,9 +890,9 @@ impl WindowsEncoder {
                         if let Some(sample) = output_sample.as_ref()
                             && let Ok(data) = extract_sample_data(sample)
                         {
-                            let (presentation_time, decode_time_nanos) = sample_times(sample)?;
+                            let (sample_time, decode_time_nanos) = sample_times(sample)?;
                             tracing::debug!(
-                                sample_time_100ns = presentation_time.as_nanos() / 100,
+                                sample_time_100ns = sample_time.as_nanos() / 100,
                                 decode_timestamp_100ns = ?decode_time_nanos.map(|nanos| nanos / 100),
                                 duration_100ns = ?sample.GetSampleDuration().ok(),
                                 bytes = data.len(),
@@ -835,7 +900,7 @@ impl WindowsEncoder {
                             );
                             packets.push(OutputSample {
                                 data,
-                                presentation_time,
+                                sample_time,
                                 decode_time_nanos,
                             });
                         }

@@ -303,9 +303,8 @@ pub struct EncodedPacket {
     /// Whether this is a random access point: an IDR for H.264 and H.265, a
     /// key frame for AV1.
     pub keyframe: bool,
-    /// The presentation time the frame was submitted with, to the resolution
-    /// of the platform encoder's own clock (100 ns for Media Foundation, 1 us
-    /// for `MediaCodec`, exact for the others).
+    /// The presentation time the frame was submitted with. Exact, except for
+    /// `MediaCodec`, which carries 1 us.
     pub presentation_time: Duration,
     /// The time the frame is decoded at, in signed nanoseconds on the
     /// encoder's decode timeline, as the platform encoder reports it. Decode
