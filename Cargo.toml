@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "codec", "container", "streaming", "processing", "bench"]
+members = ["core", "codec", "container", "streaming", "processing", "cli", "bench"]
 
 [workspace.package]
 version = "0.1.0"
@@ -77,6 +77,8 @@ zenwave = { version = "0.7.1", default-features = false, features = ["hyper-back
 hex = "0.4"
 bytes = "1.12"
 pollster = "1.0"
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "color"] }
+askama = { version = "0.16.1", default-features = false, features = ["derive", "std"] }
 
 # Decoders only. `default-formats` also pulls `image`'s AVIF *encoder*
 # (ravif -> rav1e); the one place that encodes AVIF is a `mediax-codec` test,
@@ -143,3 +145,21 @@ filtrate = { git = "https://github.com/water-rs/cherenkov", branch = "dev" }
 filtrate-core = { git = "https://github.com/water-rs/cherenkov", branch = "dev" }
 filtrate-derive = { git = "https://github.com/water-rs/cherenkov", branch = "dev" }
 cherenkov-shader = { git = "https://github.com/water-rs/cherenkov", branch = "dev" }
+
+# The software AV1 codecs are far too slow with the development profile's
+# debug assertions and without optimisation for the tests that encode and
+# decode real frames; the rest of the workspace keeps the development profile.
+[profile.dev.package.rav1e]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.package.rav1d]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

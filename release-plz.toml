@@ -7,6 +7,13 @@ allow_dirty = false
 git_release_enable = true
 git_tag_enable = true
 
+# The command-line binary is built by the `dist.yml` workflow, which runs on
+# this tag and creates the GitHub release with the binaries attached.
+[[package]]
+name = "mediax-cli"
+git_tag_name = "cli/v{{ version }}"
+git_release_enable = false
+
 # The benchmark binary is not published.
 [[package]]
 name = "mediax-bench"

@@ -1,0 +1,29 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.33.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "aarch64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
+# The generated workflow lives in dist.yml: release.yml is release-plz's, and
+# crates.io trusted publishing is bound to that file name.
+allow-dirty = ["ci"]
+
+# rav1e assembles its x86_64 SIMD kernels with nasm.
+[dist.dependencies.apt]
+nasm = { version = "*", targets = ["x86_64-unknown-linux-gnu"] }
+
+[dist.dependencies.chocolatey]
+nasm = { version = "*", targets = ["x86_64-pc-windows-msvc"] }
