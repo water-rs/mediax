@@ -259,8 +259,9 @@ fn to_planar(nv12: &[u8], luma_len: usize) -> Vec<u8> {
     let (luma, chroma) = nv12.split_at(luma_len);
     let mut planar = Vec::with_capacity(nv12.len());
     planar.extend_from_slice(luma);
-    planar.extend(chroma.chunks_exact(2).map(|pair| pair[0]));
-    planar.extend(chroma.chunks_exact(2).map(|pair| pair[1]));
+    let (pairs, _) = chroma.as_chunks::<2>();
+    planar.extend(pairs.iter().map(|[cb, _]| *cb));
+    planar.extend(pairs.iter().map(|[_, cr]| *cr));
     planar
 }
 
@@ -286,7 +287,7 @@ fn conformance(vector: &Vector) -> Result<(), String> {
         u32::try_from(vector.height).unwrap(),
     )
     .map_err(|error| format!("cannot open the decoder: {error}"))?;
-    let mut decoded: Vec<Vec<u8>> = Vec::new();
+    let mut pictures: Vec<Vec<u8>> = Vec::new();
     let mut collect = |frames: DecodeStream| -> Result<(), String> {
         for frame in frames {
             let frame = frame.map_err(|error| format!("decode failed: {error}"))?;
@@ -304,7 +305,7 @@ fn conformance(vector: &Vector) -> Result<(), String> {
                     "a frame holds {written} bytes, expected {frame_len}"
                 ));
             }
-            decoded.push(to_planar(&nv12, luma_len));
+            pictures.push(to_planar(&nv12, luma_len));
         }
         Ok(())
     };
@@ -315,13 +316,13 @@ fn conformance(vector: &Vector) -> Result<(), String> {
     collect(decoder.drain())?;
 
     let expected = reference.len() / frame_len;
-    if decoded.len() != expected {
+    if pictures.len() != expected {
         return Err(format!(
             "decoded {} frames, expected {expected}",
-            decoded.len()
+            pictures.len()
         ));
     }
-    for (index, (got, want)) in decoded
+    for (index, (got, want)) in pictures
         .iter()
         .zip(reference.chunks_exact(frame_len))
         .enumerate()
