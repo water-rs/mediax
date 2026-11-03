@@ -1,5 +1,8 @@
 name: CI
 
+# Linux jobs here and in the other workflows run on ubuntu-24.04: the VA-API
+# stack does not build against the libva 2.23 that ubuntu-latest ships (#6).
+
 permissions:
   contents: read
   checks: write
