@@ -1,0 +1,42 @@
+File:     {{ file }}
+Format:   {{ format }}
+{% if let Some(duration) = duration %}Duration: {{ duration }}
+{% endif %}Tracks:   {{ tracks.len() }}
+{% for track in tracks %}
+Track {{ track.id }}: {{ track.kind }}, {{ track.codec }}{% if let Some(language) = track.language %}, language {{ language }}{% endif %}
+{%- if let Some(video) = track.video %}
+  Resolution:  {{ video.width }}x{{ video.height }}
+{%- if let Some(frame_rate) = video.frame_rate %}
+  Frame rate:  {{ frame_rate.fps }} fps ({{ frame_rate.numerator }}/{{ frame_rate.denominator }})
+{%- endif %}
+{%- if let Some(profile) = video.profile %}
+  Profile:     {{ profile }}
+{%- endif %}
+{%- if let Some(level) = video.level %}
+  Level:       {{ level }}
+{%- endif %}
+{%- if let Some(bit_depth) = video.bit_depth %}
+  Bit depth:   {{ bit_depth }}
+{%- endif %}
+{%- if let Some(chroma) = video.chroma %}
+  Chroma:      {{ chroma }}
+{%- endif %}
+  Colour:      {{ video.color.primaries }} primaries, {{ video.color.transfer }} transfer, {{ video.color.matrix }} matrix, {{ video.color.range }} range
+{%- if let Some(light) = video.color.content_light_level %}
+  Light level: MaxCLL {{ light.max_content }} nits, MaxFALL {{ light.max_frame_average }} nits
+{%- endif %}
+{%- if video.color.dolby_vision %}
+  Dolby Vision
+{%- endif %}
+{%- endif %}
+{%- if let Some(audio) = track.audio %}
+  Sample rate: {{ audio.sample_rate }} Hz
+  Channels:    {{ audio.channels }}
+{%- endif %}
+{%- if let Some(duration) = track.duration_seconds %}
+  Duration:    {{ "{:.3}"|format(duration) }} s
+{%- endif %}
+{%- if let Some(count) = track.sample_count %}
+  Samples:     {{ count }}
+{%- endif %}
+{% endfor %}

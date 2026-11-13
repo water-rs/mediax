@@ -8,8 +8,8 @@ use std::{
 };
 
 use bytes::Bytes;
+use mediax_core::Error;
 use url::Url;
-use waterkit_video_core::Error;
 use zenwave::{
     Method, ResponseExt as _,
     header::{HeaderMap, HeaderName, HeaderValue},

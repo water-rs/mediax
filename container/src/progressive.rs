@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use broadcast_common::Unpackage as _;
 use bytes::Bytes;
+use mediax_core::{Error, FrameRate};
 use transmux::Fmp4Demux;
-use waterkit_video_core::Error;
 
-use crate::demuxer::{IndexedTrackSamples, index_track_samples};
+use crate::demuxer::{IndexedTrackSamples, MovieTimeline, SampleMeta, index_track_samples};
 use crate::isobmff::read_top_level_box;
+use crate::parameters::rational;
 use crate::stream::{
     EncodedSample, MediaTime, TrackId, TrackInfo, TrackKind, track_info_from_spec,
 };
@@ -85,7 +86,7 @@ impl ProgressiveTrackReader {
     /// # Errors
     ///
     /// Returns an error for malformed ISO BMFF metadata or a sample table
-    /// whose codec parameters cannot be represented by the `WaterKit` contract.
+    /// whose codec parameters cannot be represented by the mediax contract.
     pub fn open(path: impl AsRef<Path>, kind: TrackKind) -> Result<Self, Error> {
         let mp4_kind = match kind {
             TrackKind::Audio => mp4::TrackType::Audio,
@@ -99,6 +100,7 @@ impl ProgressiveTrackReader {
         let path = path.as_ref();
         let movie = read_top_level_box(path, *b"moov")?
             .ok_or_else(|| Error::Container(String::from("progressive media has no moov box")))?;
+        let timeline = MovieTimeline::parse(&movie)?;
         let media = Fmp4Demux::new()
             .unpackage(&movie)
             .map_err(|error| Error::Container(error.to_string()))?;
@@ -145,12 +147,16 @@ impl ProgressiveTrackReader {
                     "MP4 {kind:?} track {track_id} disappeared after probing"
                 ))
             })?;
-            let indexed = index_track_samples(path, mp4_track)?;
-            let presentation_end = indexed.metas.iter().fold(0_u64, |end, sample| {
+            let indexed = index_track_samples(path, mp4_track, &timeline)?;
+            let info = match constant_frame_rate(&indexed.metas, info.timescale()) {
+                Some(frame_rate) if kind == TrackKind::Video => info.with_frame_rate(frame_rate),
+                _ => info,
+            };
+            let presentation_end = indexed.metas.iter().fold(0_i64, |end, sample| {
                 end.max(
                     sample
                         .presentation_time
-                        .saturating_add(u64::from(sample.duration)),
+                        .saturating_add(i64::from(sample.duration)),
                 )
             });
             let duration = media_duration(presentation_end, info.timescale());
@@ -388,18 +394,8 @@ impl ProgressiveTrackReader {
         self.sample_index = self.sample_index.saturating_add(1);
         let encoded = EncodedSample::new(
             track_id,
-            MediaTime::new(
-                i64::try_from(sample_metadata.decode_time).map_err(|_| {
-                    Error::Container(String::from("MP4 decode timestamp exceeds i64"))
-                })?,
-                timescale,
-            ),
-            MediaTime::new(
-                i64::try_from(sample_metadata.presentation_time).map_err(|_| {
-                    Error::Container(String::from("MP4 presentation timestamp exceeds i64"))
-                })?,
-                timescale,
-            ),
+            MediaTime::new(sample_metadata.decode_time, timescale),
+            MediaTime::new(sample_metadata.presentation_time, timescale),
             MediaTime::new(i64::from(sample_metadata.duration), timescale),
             sample_metadata.is_keyframe,
             data,
@@ -409,18 +405,32 @@ impl ProgressiveTrackReader {
     }
 }
 
-fn media_duration(ticks: u64, timescale: std::num::NonZeroU32) -> Duration {
-    Duration::from_nanos(ticks.saturating_mul(1_000_000_000) / u64::from(timescale.get()))
+/// The frame rate the sample table declares: every sample but the last, which
+/// a muxer may truncate, lasts the same time.
+fn constant_frame_rate(metas: &[SampleMeta], timescale: std::num::NonZeroU32) -> Option<FrameRate> {
+    let (last, body) = metas.split_last()?;
+    let ticks = body.first().map_or(last.duration, |sample| sample.duration);
+    if body.iter().any(|sample| sample.duration != ticks) {
+        return None;
+    }
+    rational(u64::from(timescale.get()), u64::from(ticks))
 }
 
-fn duration_to_ticks(duration: Duration, timescale: std::num::NonZeroU32) -> Result<u64, Error> {
+/// `ticks` as a duration; a time before the presentation starts is zero.
+fn media_duration(ticks: i64, timescale: std::num::NonZeroU32) -> Duration {
+    Duration::from_nanos(
+        ticks.max(0).cast_unsigned().saturating_mul(1_000_000_000) / u64::from(timescale.get()),
+    )
+}
+
+fn duration_to_ticks(duration: Duration, timescale: std::num::NonZeroU32) -> Result<i64, Error> {
     let ticks = duration
         .as_nanos()
         .checked_mul(u128::from(timescale.get()))
         .ok_or_else(|| Error::Container(String::from("media seek timestamp overflow")))?
         / 1_000_000_000;
-    u64::try_from(ticks)
-        .map_err(|_| Error::Container(String::from("media seek timestamp exceeds u64 ticks")))
+    i64::try_from(ticks)
+        .map_err(|_| Error::Container(String::from("media seek timestamp exceeds i64 ticks")))
 }
 
 #[cfg(test)]
@@ -588,7 +598,7 @@ mod tests {
                     profile_compatibility: 0,
                     level_indication: 30,
                     length_size_minus_one: 3,
-                    sps: vec![AvcSps(vec![0x67, 0x42, 0x00, 0x1e, 0xe9, 0x01, 0x40])],
+                    sps: vec![AvcSps(crate::parameters::tests::avc_sps(None))],
                     pps: vec![AvcPps(vec![0x68, 0xce, 0x06, 0xe2])],
                     chroma_format: None,
                     bit_depth_luma_minus8: None,

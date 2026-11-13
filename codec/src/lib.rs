@@ -12,6 +12,7 @@
 //!   linked at all.
 //! - `software-decode` and `software-encode` (default; implies decode): the
 //!   desktop platforms.
+//! - `aac`: packet-oriented AAC decoding in [`audio`].
 //!
 //! # Example
 //!
@@ -58,52 +59,77 @@
 
 #![warn(missing_docs)]
 
+#[cfg(any(test, mediax_hw_codec, mediax_hw_codec_vaapi))]
+mod annexb;
+#[cfg(feature = "aac")]
+pub mod audio;
+
 #[cfg(any(
     test,
-    waterkit_hw_codec_android,
-    target_os = "linux",
-    waterkit_hw_codec_windows
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
 ))]
 mod bitstream;
 mod color;
-// The VA-API backend reads its output layout back from the negotiated
-// `DecodedFormat`, so Linux never has to infer it from the codec configuration.
 #[cfg(any(
     test,
-    waterkit_hw_codec_apple,
-    waterkit_hw_codec_android,
-    waterkit_hw_codec_windows
+    mediax_hw_codec_apple,
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows
 ))]
 mod config;
+mod encoder_config;
 mod frame;
-mod image;
+#[cfg(any(all(feature = "fuzzing", mediax_hw_codec_vaapi), all(test, unix)))]
+#[doc(hidden)]
+pub mod fuzzing;
+#[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
+mod h264;
+#[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
+mod h265;
+pub mod image;
 #[cfg(target_os = "android")]
 pub(crate) mod image_android;
 #[cfg(target_vendor = "apple")]
 mod image_apple;
+#[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
+mod rbsp;
 mod software;
 mod sys;
 
 #[cfg(any(
     test,
-    waterkit_hw_codec_android,
-    target_os = "linux",
-    waterkit_hw_codec_windows
+    mediax_hw_codec_android,
+    mediax_hw_codec_windows,
+    mediax_hw_codec_vaapi
 ))]
 pub use bitstream::{ConvertedProtectedSample, NalStreamConverter, annex_b_to_length_prefixed};
 pub use color::{
     ColorOutputTarget, SDR_REFERENCE_WHITE_NITS, VideoColorUniform, YUV_COLOR_SHADER_WGSL,
     video_color_uniform,
 };
+pub use encoder_config::{
+    Bitrate, BitstreamFormat, EncodedPacket, EncoderCodec, EncoderConfig, EncoderProfile,
+    EvenDimension, FrameOptions, FrameRate, H264Level, H264Profile, H264Settings, H265Settings,
+};
 pub use frame::{DecodedFrame, DecodedPixelLayout};
 #[cfg(feature = "gpu")]
 pub use frame::{DecodedFrameUploader, GpuFrame, LinearRgbaConverter};
 pub use image::{DecodedImage, DecodedPixelFormat, decode_image, decode_image_platform};
-pub use waterkit_video_core::CicpColor;
+pub use mediax_core::CicpColor;
 
 use std::{time::Duration, vec::IntoIter};
 use thiserror::Error;
-use waterkit_video_core::VideoColorInfo;
+
+/// Routes `tracing` events to the test harness's captured output.
+#[cfg(all(test, any(mediax_hw_codec_apple, mediax_av1_software_encode)))]
+pub(crate) fn init_test_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+}
 
 /// Codec error type.
 #[derive(Debug, Clone, Error)]
@@ -265,32 +291,46 @@ impl std::fmt::Debug for DecodeIntoStream {
 
 /// Streaming iterator over encoded packets.
 ///
-/// Created by [`Encoder::encode_nv12`] or [`Encoder::encode_iosurface`]. Yields encoded data packets one at a time.
+/// Created by [`Encoder::encode_nv12`] or, on Apple, `Encoder::encode_pixel_buffer`.
+/// Yields the access units the encoder finished for the submitted frame:
+/// usually one, none while a lookahead encoder buffers, or the error once.
 pub struct EncodeStream {
     inner: EncodeStreamInner,
 }
 
 enum EncodeStreamInner {
-    /// Successful encode - yields the packet once.
-    Packet(Option<Vec<u8>>),
+    /// Successful encode - yields the finished packets.
+    Packets(IntoIter<EncodedPacket>),
     /// Encode error - yields the error once, then empty.
     Error(Option<CodecError>),
 }
 
+impl EncodeStream {
+    fn new(result: Result<Vec<EncodedPacket>, CodecError>) -> Self {
+        Self {
+            inner: match result {
+                Ok(packets) => EncodeStreamInner::Packets(packets.into_iter()),
+                Err(error) => EncodeStreamInner::Error(Some(error)),
+            },
+        }
+    }
+}
+
 impl Iterator for EncodeStream {
-    type Item = Result<Vec<u8>, CodecError>;
+    type Item = Result<EncodedPacket, CodecError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.inner {
-            EncodeStreamInner::Packet(packet) => packet.take().map(Ok),
+            EncodeStreamInner::Packets(packets) => packets.next().map(Ok),
             EncodeStreamInner::Error(err) => err.take().map(Err),
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match &self.inner {
-            EncodeStreamInner::Packet(Some(_)) | EncodeStreamInner::Error(Some(_)) => (1, Some(1)),
-            EncodeStreamInner::Packet(None) | EncodeStreamInner::Error(None) => (0, Some(0)),
+            EncodeStreamInner::Packets(packets) => packets.size_hint(),
+            EncodeStreamInner::Error(Some(_)) => (1, Some(1)),
+            EncodeStreamInner::Error(None) => (0, Some(0)),
         }
     }
 }
@@ -312,15 +352,17 @@ pub struct Decoder {
 enum DecoderInner {
     #[cfg(target_arch = "wasm32")]
     Unsupported,
-    #[cfg(waterkit_hw_codec_apple)]
+    #[cfg(mediax_hw_codec_apple)]
     Apple(sys::apple::AppleDecoder),
-    #[cfg(waterkit_hw_codec_android)]
+    #[cfg(mediax_hw_codec_android)]
     Android(sys::android::AndroidDecoder),
-    #[cfg(waterkit_hw_codec_windows)]
+    #[cfg(mediax_hw_codec_windows)]
     Windows(sys::windows::WindowsDecoder),
-    #[cfg(waterkit_hw_codec_vaapi)]
-    Linux(sys::linux::LinuxDecoder),
-    #[cfg(waterkit_av1_software)]
+    #[cfg(mediax_hw_codec_vaapi)]
+    VaapiH264(Box<sys::vaapi::H264Decoder>),
+    #[cfg(mediax_hw_codec_vaapi)]
+    VaapiH265(Box<sys::vaapi::HevcDecoder>),
+    #[cfg(mediax_av1_software)]
     Av1(software::av1::Av1Decoder),
 }
 
@@ -353,7 +395,7 @@ impl Decoder {
             let _ = (config, width, height);
             let _ = DecoderInner::Unsupported;
             Err(CodecError::Unsupported(format!(
-                "{codec:?} decoding is not supported by waterkit-codec on WebAssembly"
+                "{codec:?} decoding is not supported by mediax-codec on WebAssembly"
             )))
         }
 
@@ -361,41 +403,42 @@ impl Decoder {
         {
             // With no hardware decoder backend these stay unused: the AV1
             // software decoder reads dimensions from the bitstream itself.
-            #[cfg(not(waterkit_hw_codec))]
+            // The VA-API decoder reads the dimensions from the SPS.
+            #[cfg(not(mediax_hw_codec))]
             let _ = (config, width, height);
 
             match codec {
-                #[cfg(waterkit_hw_codec_apple)]
+                #[cfg(mediax_hw_codec_vaapi)]
+                CodecType::H264 | CodecType::H265 => Ok(Self {
+                    inner: sys::vaapi::open_decoder(codec, config)?,
+                }),
+
+                #[cfg(mediax_hw_codec_apple)]
                 CodecType::H264 | CodecType::H265 => Ok(Self {
                     inner: sys::apple::open_decoder(codec, config, width, height)?,
                 }),
 
-                #[cfg(waterkit_hw_codec_android)]
+                #[cfg(mediax_hw_codec_android)]
                 CodecType::H264 | CodecType::H265 => Ok(Self {
                     inner: sys::android::open_decoder(codec, config, width, height)?,
                 }),
 
-                #[cfg(waterkit_hw_codec_windows)]
+                #[cfg(mediax_hw_codec_windows)]
                 CodecType::H264 | CodecType::H265 => Ok(Self {
                     inner: sys::windows::open_decoder(codec, config, width, height)?,
                 }),
 
-                #[cfg(waterkit_hw_codec_vaapi)]
-                CodecType::H264 | CodecType::H265 => Ok(Self {
-                    inner: sys::linux::open_decoder(codec, config, width, height)?,
-                }),
-
-                #[cfg(not(waterkit_hw_codec))]
+                #[cfg(not(any(mediax_hw_codec, mediax_hw_codec_vaapi)))]
                 CodecType::H264 | CodecType::H265 => Err(CodecError::Unsupported(format!(
                     "{codec:?} hardware decoding not available on this platform"
                 ))),
 
-                #[cfg(waterkit_av1_software)]
+                #[cfg(mediax_av1_software)]
                 CodecType::Av1 => Ok(Self {
                     inner: DecoderInner::Av1(software::av1::Av1Decoder::new()?),
                 }),
 
-                #[cfg(not(waterkit_av1_software))]
+                #[cfg(not(mediax_av1_software))]
                 CodecType::Av1 => Err(CodecError::Unsupported(
                     "AV1 software decoding not available on this platform".into(),
                 )),
@@ -420,28 +463,28 @@ impl Decoder {
         }
     }
 
-    #[cfg(not(waterkit_any_codec))]
+    #[cfg(not(mediax_any_codec))]
     fn decode_inner(&self, packet: DecodePacket<'_>) -> Result<Vec<DecodedFrame>, CodecError> {
         let _ = packet;
         match self.inner {
             #[cfg(target_arch = "wasm32")]
             DecoderInner::Unsupported => Err(CodecError::Unsupported(String::from(
-                "video decoding is not supported by waterkit-codec on WebAssembly",
+                "video decoding is not supported by mediax-codec on WebAssembly",
             ))),
         }
     }
 
-    #[cfg(waterkit_any_codec)]
+    #[cfg(mediax_any_codec)]
     fn decode_inner(&mut self, packet: DecodePacket<'_>) -> Result<Vec<DecodedFrame>, CodecError> {
         match self.inner {
-            #[cfg(waterkit_hw_codec_apple)]
+            #[cfg(mediax_hw_codec_apple)]
             DecoderInner::Apple(ref mut dec) => Ok(dec
                 .decode_to_iosurface(packet)?
                 .iter()
                 .map(DecodedFrame::from_iosurface)
                 .collect()),
 
-            #[cfg(waterkit_hw_codec_android)]
+            #[cfg(mediax_hw_codec_android)]
             DecoderInner::Android(ref mut dec) => {
                 let android_frames = dec.decode(packet)?;
                 let mut frames = Vec::with_capacity(android_frames.len());
@@ -459,7 +502,7 @@ impl Decoder {
                 Ok(frames)
             }
 
-            #[cfg(waterkit_hw_codec_windows)]
+            #[cfg(mediax_hw_codec_windows)]
             DecoderInner::Windows(ref mut dec) => {
                 let windows_frames = dec.decode(packet)?;
                 let mut frames = Vec::with_capacity(windows_frames.len());
@@ -477,25 +520,12 @@ impl Decoder {
                 Ok(frames)
             }
 
-            #[cfg(waterkit_hw_codec_vaapi)]
-            DecoderInner::Linux(ref mut dec) => {
-                let linux_frames = dec.decode(packet)?;
-                let mut frames = Vec::with_capacity(linux_frames.len());
-                for linux_frame in linux_frames {
-                    let frame = DecodedFrame::from_biplanar_data(
-                        linux_frame.data,
-                        linux_frame.width,
-                        linux_frame.height,
-                        linux_frame.timestamp_ns,
-                        linux_frame.layout,
-                        None,
-                    );
-                    frames.push(frame);
-                }
-                Ok(frames)
-            }
+            #[cfg(mediax_hw_codec_vaapi)]
+            DecoderInner::VaapiH264(ref mut dec) => vaapi_decode(&mut **dec, packet),
+            #[cfg(mediax_hw_codec_vaapi)]
+            DecoderInner::VaapiH265(ref mut dec) => vaapi_decode(&mut **dec, packet),
 
-            #[cfg(waterkit_av1_software)]
+            #[cfg(mediax_av1_software)]
             DecoderInner::Av1(ref mut dec) => {
                 let cpu_frames = dec.decode(packet)?;
                 let mut frames = Vec::with_capacity(cpu_frames.len());
@@ -539,26 +569,26 @@ impl Decoder {
         }
     }
 
-    #[cfg(not(waterkit_any_codec))]
+    #[cfg(not(mediax_any_codec))]
     fn drain_inner(&self) -> Result<Vec<DecodedFrame>, CodecError> {
         match self.inner {
             #[cfg(target_arch = "wasm32")]
             DecoderInner::Unsupported => Err(CodecError::Unsupported(String::from(
-                "video decoding is not supported by waterkit-codec on WebAssembly",
+                "video decoding is not supported by mediax-codec on WebAssembly",
             ))),
         }
     }
 
-    #[cfg(waterkit_any_codec)]
+    #[cfg(mediax_any_codec)]
     fn drain_inner(&mut self) -> Result<Vec<DecodedFrame>, CodecError> {
         match self.inner {
-            #[cfg(waterkit_hw_codec_apple)]
+            #[cfg(mediax_hw_codec_apple)]
             DecoderInner::Apple(ref mut decoder) => Ok(decoder
                 .drain()?
                 .iter()
                 .map(DecodedFrame::from_iosurface)
                 .collect()),
-            #[cfg(waterkit_hw_codec_android)]
+            #[cfg(mediax_hw_codec_android)]
             DecoderInner::Android(ref mut decoder) => Ok(decoder
                 .drain()?
                 .into_iter()
@@ -573,7 +603,7 @@ impl Decoder {
                     )
                 })
                 .collect()),
-            #[cfg(waterkit_hw_codec_windows)]
+            #[cfg(mediax_hw_codec_windows)]
             DecoderInner::Windows(ref mut decoder) => Ok(decoder
                 .drain()?
                 .into_iter()
@@ -588,22 +618,11 @@ impl Decoder {
                     )
                 })
                 .collect()),
-            #[cfg(waterkit_hw_codec_vaapi)]
-            DecoderInner::Linux(ref mut decoder) => Ok(decoder
-                .drain()?
-                .into_iter()
-                .map(|frame| {
-                    DecodedFrame::from_biplanar_data(
-                        frame.data,
-                        frame.width,
-                        frame.height,
-                        frame.timestamp_ns,
-                        frame.layout,
-                        None,
-                    )
-                })
-                .collect()),
-            #[cfg(waterkit_av1_software)]
+            #[cfg(mediax_hw_codec_vaapi)]
+            DecoderInner::VaapiH264(ref mut decoder) => vaapi_drain(&mut **decoder),
+            #[cfg(mediax_hw_codec_vaapi)]
+            DecoderInner::VaapiH265(ref mut decoder) => vaapi_drain(&mut **decoder),
+            #[cfg(mediax_av1_software)]
             DecoderInner::Av1(ref mut decoder) => Ok(decoder
                 .drain()?
                 .into_iter()
@@ -647,7 +666,7 @@ impl Decoder {
         }
     }
 
-    #[cfg(not(waterkit_any_codec))]
+    #[cfg(not(mediax_any_codec))]
     fn decode_into_inner(
         &self,
         packet: DecodePacket<'_>,
@@ -657,19 +676,19 @@ impl Decoder {
         match self.inner {
             #[cfg(target_arch = "wasm32")]
             DecoderInner::Unsupported => Err(CodecError::Unsupported(String::from(
-                "video decoding is not supported by waterkit-codec on WebAssembly",
+                "video decoding is not supported by mediax-codec on WebAssembly",
             ))),
         }
     }
 
-    #[cfg(waterkit_any_codec)]
+    #[cfg(mediax_any_codec)]
     fn decode_into_inner(
         &mut self,
         packet: DecodePacket<'_>,
         output: &mut [u8],
     ) -> Result<Vec<FrameInfo>, CodecError> {
         match self.inner {
-            #[cfg(waterkit_hw_codec_apple)]
+            #[cfg(mediax_hw_codec_apple)]
             DecoderInner::Apple(ref mut dec) => {
                 let surfaces = dec.decode_to_iosurface(packet)?;
                 let mut infos = Vec::with_capacity(surfaces.len());
@@ -706,7 +725,7 @@ impl Decoder {
                 Ok(infos)
             }
 
-            #[cfg(waterkit_hw_codec_android)]
+            #[cfg(mediax_hw_codec_android)]
             DecoderInner::Android(ref mut dec) => {
                 let android_frames = dec.decode(packet)?;
                 copy_frames_to_buffer(
@@ -717,7 +736,7 @@ impl Decoder {
                 )
             }
 
-            #[cfg(waterkit_hw_codec_windows)]
+            #[cfg(mediax_hw_codec_windows)]
             DecoderInner::Windows(ref mut dec) => {
                 let windows_frames = dec.decode(packet)?;
                 copy_frames_to_buffer(
@@ -728,18 +747,12 @@ impl Decoder {
                 )
             }
 
-            #[cfg(waterkit_hw_codec_vaapi)]
-            DecoderInner::Linux(ref mut dec) => {
-                let linux_frames = dec.decode(packet)?;
-                copy_frames_to_buffer(
-                    linux_frames
-                        .into_iter()
-                        .map(|f| (f.data, f.width, f.height, f.timestamp_ns, f.layout)),
-                    output,
-                )
-            }
+            #[cfg(mediax_hw_codec_vaapi)]
+            DecoderInner::VaapiH264(ref mut dec) => vaapi_decode_into(&mut **dec, packet, output),
+            #[cfg(mediax_hw_codec_vaapi)]
+            DecoderInner::VaapiH265(ref mut dec) => vaapi_decode_into(&mut **dec, packet, output),
 
-            #[cfg(waterkit_av1_software)]
+            #[cfg(mediax_av1_software)]
             DecoderInner::Av1(ref mut dec) => {
                 let cpu_frames = dec.decode(packet)?;
                 copy_frames_to_buffer(
@@ -753,8 +766,79 @@ impl Decoder {
     }
 }
 
+/// The presentation time of a packet in the nanoseconds frames carry.
+#[cfg(mediax_hw_codec_vaapi)]
+fn timestamp_ns(time: Duration) -> u64 {
+    u64::try_from(time.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Decodes a packet on a VA-API decoder.
+#[cfg(mediax_hw_codec_vaapi)]
+fn vaapi_decode(
+    decoder: &mut impl sys::vaapi::VaapiDecoder,
+    packet: DecodePacket<'_>,
+) -> Result<Vec<DecodedFrame>, CodecError> {
+    decoder
+        .decode(packet.data(), timestamp_ns(packet.presentation_time()))
+        .map(vaapi_frames)
+        .map_err(sys::vaapi::VaapiError::at_decode)
+}
+
+/// Drains a VA-API decoder.
+#[cfg(mediax_hw_codec_vaapi)]
+fn vaapi_drain(
+    decoder: &mut impl sys::vaapi::VaapiDecoder,
+) -> Result<Vec<DecodedFrame>, CodecError> {
+    decoder
+        .drain()
+        .map(vaapi_frames)
+        .map_err(sys::vaapi::VaapiError::at_decode)
+}
+
+/// Decodes a packet on a VA-API decoder into a caller's buffer.
+#[cfg(mediax_hw_codec_vaapi)]
+fn vaapi_decode_into(
+    decoder: &mut impl sys::vaapi::VaapiDecoder,
+    packet: DecodePacket<'_>,
+    output: &mut [u8],
+) -> Result<Vec<FrameInfo>, CodecError> {
+    let pictures = decoder
+        .decode(packet.data(), timestamp_ns(packet.presentation_time()))
+        .map_err(sys::vaapi::VaapiError::at_decode)?;
+    copy_frames_to_buffer(
+        pictures.into_iter().map(|picture| {
+            (
+                picture.data,
+                picture.width,
+                picture.height,
+                picture.timestamp_ns,
+                picture.layout,
+            )
+        }),
+        output,
+    )
+}
+
+/// Wraps the frames of the VA-API decoder.
+#[cfg(mediax_hw_codec_vaapi)]
+fn vaapi_frames(pictures: Vec<sys::vaapi::DecodedPicture>) -> Vec<DecodedFrame> {
+    pictures
+        .into_iter()
+        .map(|picture| {
+            DecodedFrame::from_biplanar_data(
+                picture.data,
+                picture.width,
+                picture.height,
+                picture.timestamp_ns,
+                picture.layout,
+                None,
+            )
+        })
+        .collect()
+}
+
 /// Helper to copy decoded frames to an output buffer.
-#[cfg(waterkit_software_frames)]
+#[cfg(mediax_software_frames)]
 fn copy_frames_to_buffer(
     frames: impl Iterator<Item = (Vec<u8>, u32, u32, u64, DecodedPixelLayout)>,
     output: &mut [u8],
@@ -789,23 +873,6 @@ fn copy_frames_to_buffer(
     Ok(infos)
 }
 
-/// How an [`Encoder`] trades compression efficiency for latency.
-///
-/// The profile is chosen at construction because software encoders bake
-/// their threading and speed preset into the context; it cannot be
-/// switched on the fly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum EncoderProfile {
-    /// Compression-first encoding for offline jobs: balanced speed preset
-    /// and a modest thread count (rav1e preset 6 on four threads).
-    #[default]
-    Offline,
-    /// Latency-first encoding for live capture: the fastest settings each
-    /// backend offers (rav1e's maximum speed preset on every available
-    /// core; hardware encoders are already realtime).
-    Realtime,
-}
-
 /// Unified video encoder with automatic hardware/software selection.
 pub struct Encoder {
     inner: EncoderInner,
@@ -814,15 +881,15 @@ pub struct Encoder {
 enum EncoderInner {
     #[cfg(target_arch = "wasm32")]
     Unsupported,
-    #[cfg(waterkit_hw_codec_apple)]
+    #[cfg(mediax_hw_codec_apple)]
     Apple(sys::apple::AppleEncoder),
-    #[cfg(waterkit_hw_codec_android)]
+    #[cfg(mediax_hw_codec_android)]
     Android(sys::android::AndroidEncoder),
-    #[cfg(waterkit_hw_codec_windows)]
+    #[cfg(mediax_hw_codec_windows)]
     Windows(sys::windows::WindowsEncoder),
-    #[cfg(waterkit_hw_codec_vaapi)]
-    Linux(sys::linux::LinuxEncoder),
-    #[cfg(waterkit_av1_software_encode)]
+    #[cfg(mediax_hw_codec_vaapi)]
+    Vaapi(Box<sys::vaapi::VaapiEncoder>),
+    #[cfg(mediax_av1_software_encode)]
     Av1(Box<software::av1::Av1Encoder>),
 }
 
@@ -833,191 +900,249 @@ impl std::fmt::Debug for Encoder {
 }
 
 impl Encoder {
-    /// Create a new encoder tuned for `profile` and signal `color` on its output.
+    /// Create a new encoder from `config`.
     ///
-    /// `color` must describe the colorimetry of the NV12 samples passed to
-    /// [`Self::encode_nv12`].
+    /// `config.color` must describe the colorimetry of the samples passed to
+    /// [`Self::encode_nv12`] (and, for BGRA pixel buffers, the YCbCr
+    /// colorimetry the encoder converts them to).
     ///
     /// # Errors
     ///
-    /// Returns error if no suitable encoder is available.
-    pub fn new(
-        codec: CodecType,
-        width: u32,
-        height: u32,
-        profile: EncoderProfile,
-        color: VideoColorInfo,
-    ) -> Result<Self, CodecError> {
+    /// Returns [`CodecError::InitializationFailed`] or
+    /// [`CodecError::Unsupported`] when no suitable encoder is available for
+    /// the configuration.
+    pub fn new(config: EncoderConfig) -> Result<Self, CodecError> {
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = (width, height, profile, color);
             let _ = EncoderInner::Unsupported;
             Err(CodecError::Unsupported(format!(
-                "{codec:?} encoding is not supported by waterkit-codec on WebAssembly"
+                "{:?} encoding is not supported by mediax-codec on WebAssembly",
+                config.codec.codec_type()
             )))
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            #[cfg(not(any(waterkit_hw_codec, waterkit_av1_software_encode)))]
-            let _ = (width, height, color);
-            #[cfg(not(waterkit_av1_software_encode))]
-            let _ = profile;
-            match codec {
-                #[cfg(waterkit_hw_codec_apple)]
-                CodecType::H264 | CodecType::H265 => Ok(Self {
-                    inner: sys::apple::open_encoder(codec, width, height, color)?,
+            match config.codec {
+                #[cfg(mediax_hw_codec_apple)]
+                EncoderCodec::H264(_) | EncoderCodec::H265(_) => Ok(Self {
+                    inner: sys::apple::open_encoder(&config)?,
                 }),
 
-                #[cfg(waterkit_hw_codec_android)]
-                CodecType::H264 | CodecType::H265 => Ok(Self {
-                    inner: sys::android::open_encoder(codec, width, height, color)?,
+                #[cfg(mediax_hw_codec_android)]
+                EncoderCodec::H264(_) | EncoderCodec::H265(_) => Ok(Self {
+                    inner: sys::android::open_encoder(&config)?,
                 }),
 
-                #[cfg(waterkit_hw_codec_windows)]
-                CodecType::H264 | CodecType::H265 => Ok(Self {
-                    inner: sys::windows::open_encoder(codec, width, height, color)?,
+                #[cfg(mediax_hw_codec_windows)]
+                EncoderCodec::H264(_) | EncoderCodec::H265(_) => Ok(Self {
+                    inner: sys::windows::open_encoder(&config)?,
                 }),
 
-                #[cfg(waterkit_hw_codec_vaapi)]
-                CodecType::H264 | CodecType::H265 => Ok(Self {
-                    inner: sys::linux::open_encoder(codec, width, height, color)?,
+                #[cfg(mediax_hw_codec_vaapi)]
+                EncoderCodec::H264(_) => Ok(Self {
+                    inner: sys::vaapi::open_encoder(&config)?,
                 }),
 
-                #[cfg(not(waterkit_hw_codec))]
-                CodecType::H264 | CodecType::H265 => Err(CodecError::Unsupported(format!(
-                    "{codec:?} hardware encoding not available on this platform"
+                #[cfg(not(mediax_hw_codec))]
+                EncoderCodec::H265(_) => Err(CodecError::Unsupported(format!(
+                    "{:?} hardware encoding not available on this platform",
+                    config.codec.codec_type()
                 ))),
 
-                #[cfg(waterkit_av1_software_encode)]
-                CodecType::Av1 => Ok(Self {
-                    inner: EncoderInner::Av1(Box::new(software::av1::Av1Encoder::new(
-                        width as usize,
-                        height as usize,
-                        profile,
-                        color,
-                    )?)),
+                #[cfg(not(any(mediax_hw_codec, mediax_hw_codec_vaapi)))]
+                EncoderCodec::H264(_) => Err(CodecError::Unsupported(format!(
+                    "{:?} hardware encoding not available on this platform",
+                    config.codec.codec_type()
+                ))),
+
+                #[cfg(mediax_av1_software_encode)]
+                EncoderCodec::Av1 => Ok(Self {
+                    inner: EncoderInner::Av1(Box::new(software::av1::Av1Encoder::new(&config)?)),
                 }),
 
-                #[cfg(not(waterkit_av1_software_encode))]
-                CodecType::Av1 => Err(CodecError::Unsupported(
+                #[cfg(not(mediax_av1_software_encode))]
+                EncoderCodec::Av1 => Err(CodecError::Unsupported(
                     "AV1 software encoding not available on this platform".into(),
                 )),
             }
         }
     }
 
-    /// Encode a frame from NV12 data.
+    /// Change the target bitrate of the running stream.
     ///
-    /// Returns a streaming iterator yielding encoded packets.
-    pub fn encode_nv12(&mut self, data: &[u8]) -> EncodeStream {
-        let result = self.encode_nv12_inner(data);
-        match result {
-            Ok(packet) => EncodeStream {
-                inner: EncodeStreamInner::Packet(Some(packet)),
-            },
-            Err(e) => EncodeStream {
-                inner: EncodeStreamInner::Error(Some(e)),
-            },
+    /// On the hardware backends (`VideoToolbox`, Media Foundation, `MediaCodec`,
+    /// VA-API) the new rate applies from the next submitted frame. The software AV1
+    /// encoder (rav1e) cannot change its rate mid-stream, so the new bitrate
+    /// is held and applied by rebuilding the encoder context at the next
+    /// keyframe: [`Self::encode_nv12`] after this call encodes the frame as a
+    /// keyframe (a new coded video sequence with a fresh sequence header) and
+    /// every frame from there on uses the new rate. Frames rav1e still holds
+    /// from before the call are emitted first, at the old rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::EncodingFailed`] when the platform rejects the
+    /// rate, and [`CodecError::Unsupported`] when the bitrate does not fit the
+    /// platform's rate property.
+    pub fn set_bitrate(&mut self, bitrate: Bitrate) -> Result<(), CodecError> {
+        match self.inner {
+            #[cfg(target_arch = "wasm32")]
+            EncoderInner::Unsupported => {
+                let _ = bitrate;
+                Err(CodecError::Unsupported(String::from(
+                    "video encoding is not supported by mediax-codec on WebAssembly",
+                )))
+            }
+            #[cfg(mediax_hw_codec_apple)]
+            EncoderInner::Apple(ref mut enc) => enc.set_bitrate(bitrate),
+            #[cfg(mediax_hw_codec_android)]
+            EncoderInner::Android(ref mut enc) => enc.set_bitrate(bitrate),
+            #[cfg(mediax_hw_codec_windows)]
+            EncoderInner::Windows(ref mut enc) => enc.set_bitrate(bitrate),
+            #[cfg(mediax_hw_codec_vaapi)]
+            EncoderInner::Vaapi(ref mut enc) => enc.set_bitrate(bitrate),
+            #[cfg(mediax_av1_software_encode)]
+            EncoderInner::Av1(ref mut enc) => {
+                enc.set_bitrate(bitrate);
+                Ok(())
+            }
         }
     }
 
-    #[cfg(not(any(waterkit_hw_codec, waterkit_av1_software_encode)))]
-    fn encode_nv12_inner(&self, data: &[u8]) -> Result<Vec<u8>, CodecError> {
-        let _ = data;
+    /// Encode a frame from NV12 data.
+    ///
+    /// `presentation_time` is the frame's presentation time; the packet that
+    /// encodes it reports the same time (see [`EncodedPacket`]). A frame the
+    /// encoder drops yields no packet. `options.keyframe` makes this frame an
+    /// IDR (a random access point). Returns a streaming iterator yielding the
+    /// packets finished by this call, which with a reordering or lookahead
+    /// encoder belong to earlier frames than the one submitted.
+    pub fn encode_nv12(
+        &mut self,
+        data: &[u8],
+        presentation_time: Duration,
+        options: FrameOptions,
+    ) -> EncodeStream {
+        EncodeStream::new(self.encode_nv12_inner(data, presentation_time, options))
+    }
+
+    #[cfg(not(any(mediax_hw_codec, mediax_hw_codec_vaapi, mediax_av1_software_encode)))]
+    fn encode_nv12_inner(
+        &self,
+        data: &[u8],
+        presentation_time: Duration,
+        options: FrameOptions,
+    ) -> Result<Vec<EncodedPacket>, CodecError> {
+        let _ = (data, presentation_time, options);
         match self.inner {
             #[cfg(target_arch = "wasm32")]
             EncoderInner::Unsupported => Err(CodecError::Unsupported(String::from(
-                "video encoding is not supported by waterkit-codec on WebAssembly",
+                "video encoding is not supported by mediax-codec on WebAssembly",
             ))),
         }
     }
 
-    #[cfg(any(waterkit_hw_codec, waterkit_av1_software_encode))]
-    fn encode_nv12_inner(&mut self, data: &[u8]) -> Result<Vec<u8>, CodecError> {
+    #[cfg(any(mediax_hw_codec, mediax_hw_codec_vaapi, mediax_av1_software_encode))]
+    fn encode_nv12_inner(
+        &mut self,
+        data: &[u8],
+        presentation_time: Duration,
+        options: FrameOptions,
+    ) -> Result<Vec<EncodedPacket>, CodecError> {
         match self.inner {
-            #[cfg(waterkit_hw_codec_apple)]
-            EncoderInner::Apple(ref mut enc) => enc.encode_nv12(data),
+            #[cfg(mediax_hw_codec_apple)]
+            EncoderInner::Apple(ref mut enc) => enc.encode_nv12(data, presentation_time, options),
 
-            #[cfg(waterkit_hw_codec_android)]
-            EncoderInner::Android(ref mut enc) => enc.encode_nv12(data),
+            #[cfg(mediax_hw_codec_android)]
+            EncoderInner::Android(ref mut enc) => enc.encode_nv12(data, presentation_time, options),
 
-            #[cfg(waterkit_hw_codec_windows)]
-            EncoderInner::Windows(ref mut enc) => enc.encode_nv12(data),
+            #[cfg(mediax_hw_codec_windows)]
+            EncoderInner::Windows(ref mut enc) => enc.encode_nv12(data, presentation_time, options),
 
-            #[cfg(waterkit_hw_codec_vaapi)]
-            EncoderInner::Linux(ref mut enc) => enc.encode_nv12(data),
+            #[cfg(mediax_hw_codec_vaapi)]
+            EncoderInner::Vaapi(ref mut enc) => enc.encode_nv12(data, presentation_time, options),
 
-            #[cfg(waterkit_av1_software_encode)]
-            EncoderInner::Av1(ref mut enc) => enc.encode_nv12(data),
+            #[cfg(mediax_av1_software_encode)]
+            EncoderInner::Av1(ref mut enc) => enc.encode_nv12(data, presentation_time, options),
         }
     }
 
-    /// Encode directly from an `IOSurface` (zero-copy, Apple only).
+    /// Encode a frame straight from a `CVPixelBuffer` (Apple only).
     ///
-    /// Returns a streaming iterator yielding encoded packets.
-    #[cfg(waterkit_hw_codec_apple)]
-    pub fn encode_iosurface(&mut self, iosurface_ptr: u64) -> EncodeStream {
-        let result = self.encode_iosurface_inner(iosurface_ptr);
-        match result {
-            Ok(packet) => EncodeStream {
-                inner: EncodeStreamInner::Packet(Some(packet)),
-            },
-            Err(e) => EncodeStream {
-                inner: EncodeStreamInner::Error(Some(e)),
-            },
+    /// BGRA (`32BGRA`) and NV12 (`420YpCbCr8BiPlanar`, video or full range)
+    /// buffers are accepted at the configured size; `VideoToolbox` converts
+    /// BGRA on the GPU/media engine, so no CPU pixel conversion happens. An
+    /// `IOSurface`-backed buffer is encoded without a copy.
+    ///
+    /// Returns a streaming iterator yielding the finished packets.
+    #[cfg(mediax_hw_codec_apple)]
+    pub fn encode_pixel_buffer(
+        &mut self,
+        buffer: &objc2_core_video::CVPixelBuffer,
+        presentation_time: Duration,
+        options: FrameOptions,
+    ) -> EncodeStream {
+        EncodeStream::new(self.encode_pixel_buffer_inner(buffer, presentation_time, options))
+    }
+
+    #[cfg(mediax_hw_codec_apple)]
+    fn encode_pixel_buffer_inner(
+        &mut self,
+        buffer: &objc2_core_video::CVPixelBuffer,
+        presentation_time: Duration,
+        options: FrameOptions,
+    ) -> Result<Vec<EncodedPacket>, CodecError> {
+        match self.inner {
+            EncoderInner::Apple(ref mut enc) => {
+                enc.encode_pixel_buffer(buffer, presentation_time, options)
+            }
+            #[cfg(mediax_av1_software_encode)]
+            EncoderInner::Av1(_) => Err(CodecError::Unsupported(
+                "pixel-buffer encoding is not supported for AV1".into(),
+            )),
         }
     }
 
     /// Drain frames the encoder still holds after the last `encode_nv12`.
     ///
-    /// Most hardware backends in this crate emit bitstream synchronously per
-    /// `encode_nv12` call, so flushing them yields no packets. The Media
-    /// Foundation encoder buffers frames for lookahead and only emits its
-    /// tail here, and the software AV1 encoder queues input internally and
-    /// emits the held frames here as well; each returned packet is one
-    /// encoded frame.
+    /// `MediaCodec` and VA-API emit bitstream synchronously per frame, so
+    /// flushing them yields no packets. `VideoToolbox` in the offline profile
+    /// reorders frames and emits the tail here, the Media Foundation encoder
+    /// buffers frames for lookahead and only emits its tail here, and the
+    /// software AV1 encoder queues input internally and emits the held frames
+    /// here as well; each returned packet is one encoded frame.
     ///
     /// # Errors
     /// Returns [`CodecError::EncodingFailed`] when the drain fails.
     #[cfg_attr(
         not(any(
-            waterkit_av1_software_encode,
-            waterkit_hw_codec_windows,
+            mediax_av1_software_encode,
+            mediax_hw_codec_apple,
+            mediax_hw_codec_windows,
             target_arch = "wasm32"
         )),
         expect(
             clippy::missing_const_for_fn,
-            reason = "only the software AV1, Windows and wasm32 arms are non-const; the other hardware-only builds reduce to `Ok(Vec::new())`"
+            reason = "only the software AV1, Apple, Windows and wasm32 arms are non-const; the other hardware-only builds reduce to `Ok(Vec::new())`"
         )
     )]
-    pub fn flush(&mut self) -> Result<Vec<Vec<u8>>, CodecError> {
+    pub fn flush(&mut self) -> Result<Vec<EncodedPacket>, CodecError> {
         match self.inner {
             #[cfg(target_arch = "wasm32")]
             EncoderInner::Unsupported => Err(CodecError::Unsupported(String::from(
-                "video encoding is not supported by waterkit-codec on WebAssembly",
+                "video encoding is not supported by mediax-codec on WebAssembly",
             ))),
-            #[cfg(waterkit_hw_codec_apple)]
-            EncoderInner::Apple(_) => Ok(Vec::new()),
-            #[cfg(waterkit_hw_codec_android)]
+            #[cfg(mediax_hw_codec_apple)]
+            EncoderInner::Apple(ref mut enc) => enc.flush(),
+            #[cfg(mediax_hw_codec_android)]
             EncoderInner::Android(_) => Ok(Vec::new()),
-            #[cfg(waterkit_hw_codec_windows)]
+            #[cfg(mediax_hw_codec_windows)]
             EncoderInner::Windows(ref mut enc) => enc.drain(),
-            #[cfg(waterkit_hw_codec_vaapi)]
-            EncoderInner::Linux(_) => Ok(Vec::new()),
-            #[cfg(waterkit_av1_software_encode)]
+            #[cfg(mediax_hw_codec_vaapi)]
+            EncoderInner::Vaapi(_) => Ok(Vec::new()),
+            #[cfg(mediax_av1_software_encode)]
             EncoderInner::Av1(ref mut enc) => enc.flush(),
-        }
-    }
-
-    #[cfg(waterkit_hw_codec_apple)]
-    fn encode_iosurface_inner(&mut self, iosurface_ptr: u64) -> Result<Vec<u8>, CodecError> {
-        match self.inner {
-            EncoderInner::Apple(ref mut enc) => enc.encode_iosurface(iosurface_ptr),
-            #[cfg(waterkit_av1_software_encode)]
-            EncoderInner::Av1(_) => Err(CodecError::Unsupported(
-                "IOSurface encoding not supported for AV1".into(),
-            )),
         }
     }
 
@@ -1025,25 +1150,25 @@ impl Encoder {
     #[must_use]
     #[allow(
         clippy::missing_const_for_fn,
-        reason = "non-const on backends that call through to a platform encoder; only the reduced no-vaapi build is const-eligible"
+        reason = "non-const on backends that call through to a platform encoder; only builds without a platform encoder are const-eligible"
     )]
     pub fn codec_config(&self) -> Option<Vec<u8>> {
         match self.inner {
             #[cfg(target_arch = "wasm32")]
             EncoderInner::Unsupported => None,
-            #[cfg(waterkit_hw_codec_apple)]
+            #[cfg(mediax_hw_codec_apple)]
             EncoderInner::Apple(ref enc) => enc.get_codec_config(),
 
-            #[cfg(waterkit_hw_codec_android)]
+            #[cfg(mediax_hw_codec_android)]
             EncoderInner::Android(ref enc) => enc.get_codec_config(),
 
-            #[cfg(waterkit_hw_codec_windows)]
+            #[cfg(mediax_hw_codec_windows)]
             EncoderInner::Windows(ref enc) => enc.get_codec_config(),
 
-            #[cfg(waterkit_hw_codec_vaapi)]
-            EncoderInner::Linux(ref enc) => enc.get_codec_config(),
+            #[cfg(mediax_hw_codec_vaapi)]
+            EncoderInner::Vaapi(ref enc) => enc.codec_config(),
 
-            #[cfg(waterkit_av1_software_encode)]
+            #[cfg(mediax_av1_software_encode)]
             EncoderInner::Av1(ref enc) => Some(enc.codec_config()),
         }
     }

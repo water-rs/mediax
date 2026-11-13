@@ -1,928 +1,920 @@
-use byteorder::{BigEndian, WriteBytesExt};
+//! Multi-track MP4 and MOV muxer.
+//!
+//! Sample payloads stream into one `mdat` as they are written; the sample
+//! tables, edit lists and codec configuration are assembled into a trailing
+//! `moov` by [`Muxer::finish`]. The box layer is `transmux`'s typed ISO BMFF
+//! model (the same one the demuxer parses with), so sample entries and
+//! configuration boxes are produced by a maintained writer; this module owns
+//! the sample tables and the file layout.
+
+use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
-use waterkit_video_core::{Error, VideoColorInfo};
 
-type VideoError = Error;
+use broadcast_common::{Parse, Serialize};
+use mediax_core::{Error, VideoColorInfo};
+use transmux::OpaqueBox as EntryBox;
+use transmux::box_types::box_iter;
+use transmux::mp4esds::{
+    DecoderConfigDescriptor, DecoderSpecificInfo, ESDescriptor, EsdsBox, SLConfigDescriptor,
+};
+use transmux::sample_entries::{OpaqueBox, SampleEntryChild};
+use transmux::{
+    AVCConfigurationBox, Av1ConfigurationBox, ChunkLargeOffsetBox, ChunkOffsetBox, CodecConfig,
+    CompositionOffsetBox, CttsEntry, EditBox, EditListBox, EditListEntry, FileTypeBox,
+    HEVCConfigurationBox, MovieBox, SampleEntryVariant, SampleSizeBox, SampleToChunkBox, StblChild,
+    StscEntry, SttsEntry, SyncSampleBox, TimeToSampleBox, TrackSpec, build_init_segment,
+};
 
-/// Payload length of the `ftyp` box this muxer emits.
-const FTYP_CONTENT_LEN: u64 = 12;
+use crate::demuxer::EMPTY_EDIT;
+use crate::stream::{Codec, EncodedSample, TrackId, TrackInfo, TrackKind};
 
-/// Total length in bytes of the `ftyp` box this muxer emits.
-const FTYP_BOX_LEN: u64 = 8 + FTYP_CONTENT_LEN;
+/// `mdat` header: `size == 1` marks a 64-bit `largesize`, patched by
+/// [`Muxer::finish`] once the payload length is known.
+const MDAT_HEADER_LEN: u64 = 16;
 
-/// Video container format.
+/// Offset of the `largesize` field inside the `mdat` header.
+const MDAT_LARGESIZE_OFFSET: u64 = 8;
+
+/// ISO/IEC 14496-1 object type indication of MPEG-4 audio.
+const OBJECT_TYPE_MPEG4_AUDIO: u8 = 0x40;
+
+/// ISO/IEC 14496-1 stream type of audio.
+const STREAM_TYPE_AUDIO: u8 = 0x05;
+
+/// Container flavour a [`Muxer`] writes.
+///
+/// The format selects the `ftyp` brand: ISO base media (`isom`) for MP4,
+/// `QuickTime` (`qt  `) for MOV.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VideoFormat {
-    /// MP4 container (most compatible).
+pub enum ContainerFormat {
+    /// MP4 (ISO/IEC 14496-14).
     #[default]
     Mp4,
-    /// MOV container (Apple `QuickTime`).
+    /// MOV (Apple `QuickTime`).
     Mov,
 }
 
-/// Video codec type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CodecType {
-    /// H.264/AVC codec.
-    H264,
-    /// H.265/HEVC codec.
-    #[default]
-    H265,
-    /// AV1 codec.
-    Av1,
+impl ContainerFormat {
+    fn file_type(self) -> FileTypeBox {
+        match self {
+            Self::Mp4 => FileTypeBox {
+                major_brand: *b"isom",
+                minor_version: 512,
+                compatible_brands: vec![*b"isom", *b"iso2", *b"mp41"],
+            },
+            Self::Mov => FileTypeBox {
+                major_brand: *b"qt  ",
+                minor_version: 20_050_300,
+                compatible_brands: vec![*b"qt  "],
+            },
+        }
+    }
 }
 
-/// Video writer for creating MP4/MOV files.
+/// Writer of MP4 and MOV files with any number of H.264, H.265 or AV1 video
+/// tracks and AAC audio tracks.
 ///
-/// Note: This is a simplified writer. For production use, consider
-/// using the full mp4 crate API or `AVFoundation` on Apple platforms.
+/// Tracks are declared with [`add_track`](Self::add_track) from a
+/// [`TrackInfo`]; samples are [`EncodedSample`]s in the form the container
+/// stores them: length-prefixed NAL units for H.264 and H.265, temporal units
+/// without their temporal delimiter for AV1, raw access units for AAC. Samples
+/// of one track are written in decode order and the call order across tracks
+/// is the interleave order in the file.
+///
+/// A track's timeline starts at its first sample's decode time. The container
+/// stores that start through an edit list, so a track that begins later than
+/// another keeps its offset, but a reader that ignores edit lists, like this
+/// crate's [`ProgressiveTrackReader`](crate::ProgressiveTrackReader), reports
+/// decode times relative to it. A sample's duration is the gap to the next
+/// sample's decode time; the declared duration only applies to a track's last
+/// sample.
+///
+/// In a MOV, AAC tracks carry the `QuickTime` variable-bitrate marker and a
+/// `chan` layout, without which `AVFoundation` refuses to open the file.
+///
+/// The writer buffers no payload, only a few words of table data per sample.
 #[derive(Debug)]
-pub struct VideoWriter {
-    file: BufWriter<File>,
-    width: u32,
-    height: u32,
-    fps: u32,
-    codec: CodecType,
-    color: VideoColorInfo,
-    samples: Vec<(Vec<u8>, bool)>, // (data, is_keyframe)
-    codec_config: Option<Vec<u8>>,
+pub struct Muxer<W> {
+    out: W,
+    format: ContainerFormat,
+    /// File offset of the `mdat` box.
+    mdat_start: u64,
+    /// File offset the next sample is written at.
+    position: u64,
+    tracks: BTreeMap<TrackId, MuxTrack>,
+    /// The track the open chunk belongs to; a sample of another track opens a
+    /// new chunk.
+    open_chunk: Option<TrackId>,
 }
 
-// Minimal manual MOV muxer to avoid mp4 crate limitations
-impl VideoWriter {
-    /// Create a new video writer.
-    ///
-    /// # Arguments
-    /// * `path` - Output file path (.mp4 or .mov)
-    /// * `width` - Video width in pixels
-    /// * `height` - Video height in pixels
-    /// * `fps` - Frames per second
-    /// * `codec` - Video codec (H264 or H265)
-    /// * `color` - Color description signaled in the sample entry
+impl Muxer<BufWriter<File>> {
+    /// Creates `path` and starts a file of `format` in it.
     ///
     /// # Errors
-    /// Returns [`VideoError::Io`] if the file cannot be created.
-    pub fn new<P: AsRef<Path>>(
-        path: P,
-        width: u32,
-        height: u32,
-        fps: u32,
-        codec: CodecType,
-        color: VideoColorInfo,
-    ) -> Result<Self, VideoError> {
-        let file = File::create(path)?;
-        let writer_buf = BufWriter::new(file);
+    ///
+    /// Returns an I/O error when the file cannot be created or written.
+    pub fn create(path: impl AsRef<Path>, format: ContainerFormat) -> Result<Self, Error> {
+        Self::new(BufWriter::new(File::create(path)?), format)
+    }
+}
 
+impl<W: Write + Seek> Muxer<W> {
+    /// Starts a file of `format` at the writer's current position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the file header cannot be written.
+    pub fn new(mut out: W, format: ContainerFormat) -> Result<Self, Error> {
+        let ftyp = format.file_type();
+        let mut header = vec![0; ftyp.serialized_len()];
+        ftyp.serialize_into(&mut header).map_err(container_error)?;
+        header.extend_from_slice(&1_u32.to_be_bytes());
+        header.extend_from_slice(b"mdat");
+        header.extend_from_slice(&0_u64.to_be_bytes());
+
+        let start = out.stream_position()?;
+        out.write_all(&header)?;
+        let mdat_start = start + header.len() as u64 - MDAT_HEADER_LEN;
         Ok(Self {
-            file: writer_buf,
-            width,
-            height,
-            fps,
-            codec,
-            color,
-            samples: Vec::new(),
-            codec_config: None,
+            out,
+            format,
+            mdat_start,
+            position: mdat_start + MDAT_HEADER_LEN,
+            tracks: BTreeMap::new(),
+            open_chunk: None,
         })
     }
 
-    /// Set codec configuration (hvcC/avcC atom data).
-    pub fn set_codec_config(&mut self, config: Vec<u8>) {
-        self.codec_config = Some(config);
+    /// Returns the container format being written.
+    #[must_use]
+    pub const fn format(&self) -> ContainerFormat {
+        self.format
     }
 
-    /// Write a video sample (encoded frame).
+    /// Declares a track; its [`TrackInfo::id`] addresses its samples.
     ///
     /// # Errors
-    /// Returns an error if the sample cannot be written (currently always returns Ok).
-    pub fn write_sample(&mut self, data: &[u8], is_keyframe: bool) -> Result<(), VideoError> {
-        self.samples.push((data.to_vec(), is_keyframe));
+    ///
+    /// Returns an error when the id is already declared, the codec is not
+    /// H.264, H.265, AV1 or AAC, the configuration cannot be parsed, or the
+    /// track needs signaling the muxer cannot write (Dolby Vision, Common
+    /// Encryption).
+    pub fn add_track(&mut self, info: TrackInfo) -> Result<(), Error> {
+        let id = info.id();
+        if self.tracks.contains_key(&id) {
+            return Err(Error::Container(format!(
+                "track {} is already declared",
+                id.get()
+            )));
+        }
+        if info.protection().is_some() {
+            return Err(Error::Unsupported(String::from(
+                "the muxer does not write Common Encryption tracks",
+            )));
+        }
+        if info.video_color_info().is_some_and(|c| c.dolby_vision) {
+            return Err(Error::Unsupported(String::from(
+                "the muxer cannot signal Dolby Vision",
+            )));
+        }
+        let spec = TrackSpec::new(id.get(), info.timescale().get(), codec_config(&info)?);
+        self.tracks.insert(
+            id,
+            MuxTrack {
+                info,
+                spec,
+                samples: Vec::new(),
+                chunks: Vec::new(),
+            },
+        );
         Ok(())
     }
 
-    /// Finish writing and close the file.
+    /// Appends a sample to its track.
     ///
     /// # Errors
-    /// Returns [`VideoError::Io`] if writing to the file fails, or
-    /// [`VideoError::Container`] if a value does not fit its container field.
-    #[allow(clippy::too_many_lines)]
-    pub fn finish(self) -> Result<(), VideoError> {
-        let Self {
-            file: mut w,
-            width,
-            height,
-            fps,
-            codec,
-            color,
-            samples,
-            codec_config,
-        } = self;
-
-        let Some(codec_config) = codec_config else {
-            return Err(VideoError::Container(String::from(
-                "codec configuration must be set before finishing the video container",
+    ///
+    /// Returns an error when the sample's track is not declared, its
+    /// timestamps are not in the track's timescale, its decode time does not
+    /// advance, its composition offset or duration do not fit the container,
+    /// it is empty or encrypted, or the write fails.
+    pub fn write_sample(&mut self, sample: &EncodedSample) -> Result<(), Error> {
+        let id = sample.track_id();
+        let track = self
+            .tracks
+            .get_mut(&id)
+            .ok_or_else(|| Error::Container(format!("sample for undeclared track {}", id.get())))?;
+        if sample.encryption().is_some() {
+            return Err(Error::Unsupported(String::from(
+                "the muxer does not write encrypted samples",
             )));
-        };
+        }
+        let size = u32::try_from(sample.data().len())
+            .map_err(|_| Error::Container(String::from("sample exceeds the u32 size field")))?;
+        if size == 0 {
+            return Err(Error::Container(format!(
+                "track {} has an empty sample",
+                id.get()
+            )));
+        }
+        let record = track.record(sample, size)?;
 
-        // 1. Write ftyp
-        write_ftyp(&mut w)?;
+        if self.open_chunk != Some(id) {
+            track.chunks.push(Chunk {
+                offset: self.position,
+                samples: 0,
+            });
+            self.open_chunk = Some(id);
+        }
+        if let Some(chunk) = track.chunks.last_mut() {
+            chunk.samples += 1;
+        }
+        track.samples.push(record);
+        self.out.write_all(sample.data())?;
+        self.position += u64::from(size);
+        Ok(())
+    }
 
-        // 2. Write mdat
-        let mdat_data_size = samples
-            .iter()
-            .try_fold(0_u64, |total, (data, _)| {
-                total.checked_add(data.len() as u64)
+    /// Completes the file: finalizes the `mdat` size and writes the `moov`.
+    /// Returns the underlying writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no track was declared, a track has no samples, a
+    /// value does not fit its container field, or the write fails.
+    pub fn finish(mut self) -> Result<W, Error> {
+        let moov = self.moov()?;
+
+        self.out
+            .seek(SeekFrom::Start(self.mdat_start + MDAT_LARGESIZE_OFFSET))?;
+        self.out
+            .write_all(&(self.position - self.mdat_start).to_be_bytes())?;
+        self.out.seek(SeekFrom::Start(self.position))?;
+        self.out.write_all(&moov)?;
+        self.out.flush()?;
+        Ok(self.out)
+    }
+
+    /// Ticks per second of the movie header: the least common multiple of the
+    /// track timescales, so an edit list expresses every track's start
+    /// exactly. Track timelines keep their own timescales.
+    fn movie_timescale(&self) -> Result<u32, Error> {
+        self.tracks
+            .values()
+            .try_fold(1_u32, |movie, track| {
+                let timescale = track.info.timescale().get();
+                (movie / gcd(movie, timescale)).checked_mul(timescale)
             })
             .ok_or_else(|| {
-                VideoError::Container(String::from("mdat payload size overflows u64"))
-            })?;
-        write_box_header(&mut w, b"mdat", mdat_data_size)?;
+                Error::Unsupported(String::from(
+                    "the track timescales have no common movie timescale that fits u32",
+                ))
+            })
+    }
 
-        let mut table = SampleTable {
-            sizes: Vec::with_capacity(samples.len()),
-            offsets: Vec::with_capacity(samples.len()),
-            sync: Vec::new(),
-        };
-        let mut current_offset = first_sample_offset(mdat_data_size);
-
-        for (index, (data, is_keyframe)) in samples.iter().enumerate() {
-            w.write_all(data)?;
-            table.sizes.push(u32::try_from(data.len()).map_err(|_| {
-                VideoError::Container(String::from("sample size exceeds the u32 stsz field"))
-            })?);
-            table.offsets.push(current_offset);
-            current_offset = current_offset
-                .checked_add(data.len() as u64)
-                .ok_or_else(|| {
-                    VideoError::Container(String::from("sample offset overflows u64"))
-                })?;
-
-            if *is_keyframe {
-                table.sync.push(u32::try_from(index + 1).map_err(|_| {
-                    VideoError::Container(String::from("sample index exceeds the u32 stss field"))
-                })?); // 1-based index
-            }
+    fn moov(&self) -> Result<Vec<u8>, Error> {
+        if self.tracks.is_empty() {
+            return Err(Error::Container(String::from(
+                "a file needs at least one track",
+            )));
         }
+        let spans = self
+            .tracks
+            .values()
+            .map(MuxTrack::span)
+            .collect::<Result<Vec<_>, _>>()?;
+        let movie_timescale = self.movie_timescale()?;
 
-        // 3. Write moov
-        let moov = build_moov(width, height, fps, codec, &codec_config, &table, color)?;
-        write_box_header(&mut w, b"moov", moov.len() as u64)?;
-        w.write_all(&moov)?;
+        let specs: Vec<TrackSpec> = self.tracks.values().map(|t| t.spec.clone()).collect();
+        let init = build_init_segment(&specs, movie_timescale).map_err(container_error)?;
+        let mut moov = box_iter(&init)
+            .scan(0_usize, |offset, step| {
+                let start = *offset;
+                Some(step.map(|(boxed, consumed)| {
+                    *offset += consumed;
+                    (boxed.header.box_type, start..*offset)
+                }))
+            })
+            .find_map(|step| match step {
+                Ok((box_type, range)) if box_type.is(b"moov") => Some(range),
+                _ => None,
+            })
+            .ok_or_else(|| Error::Container(String::from("initialization has no moov")))
+            .and_then(|range| MovieBox::parse(&init[range]).map_err(container_error))?;
+        moov.mvex = None;
 
-        w.flush()?;
-        Ok(())
-    }
+        let mut movie_duration = 0;
+        for ((trak, track), span) in moov.tracks.iter_mut().zip(self.tracks.values()).zip(&spans) {
+            let presentation = span.presentation(movie_timescale)?;
+            movie_duration = movie_duration.max(presentation.duration);
+            trak.tkhd.version = header_version(presentation.duration);
+            trak.tkhd.duration = presentation.duration;
+            trak.edts = presentation
+                .edits
+                .map(|elst| EditBox::new(Some(elst), Vec::new()));
 
-    /// Get the number of frames written.
-    #[must_use]
-    pub const fn frame_count(&self) -> u64 {
-        self.samples.len() as u64
-    }
+            let mdia = trak
+                .mdia
+                .as_mut()
+                .ok_or_else(|| Error::Container(String::from("track skeleton has no mdia")))?;
+            let mdhd = mdia
+                .mdhd
+                .as_mut()
+                .ok_or_else(|| Error::Container(String::from("track skeleton has no mdhd")))?;
+            mdhd.version = header_version(span.media_duration);
+            mdhd.duration = span.media_duration;
+            let stbl = mdia
+                .minf
+                .as_mut()
+                .and_then(|minf| minf.stbl.as_mut())
+                .ok_or_else(|| Error::Container(String::from("track skeleton has no stbl")))?;
+            let stsd = stbl
+                .children
+                .iter()
+                .position(|child| matches!(child, StblChild::Stsd(_)))
+                .map(|index| stbl.children.swap_remove(index))
+                .ok_or_else(|| Error::Container(String::from("track skeleton has no stsd")))?;
+            stbl.children = track.sample_table(stsd, span, self.format)?;
+        }
+        moov.mvhd.version = header_version(movie_duration);
+        moov.mvhd.duration = movie_duration;
 
-    /// Get video dimensions.
-    #[must_use]
-    pub const fn dimensions(&self) -> (u32, u32) {
-        (self.width, self.height)
+        let mut bytes = vec![0; moov.serialized_len()];
+        let written = moov.serialize_into(&mut bytes).map_err(container_error)?;
+        bytes.truncate(written);
+        Ok(bytes)
     }
 }
 
-fn write_ftyp<W: Write>(w: &mut W) -> std::io::Result<()> {
-    write_box_header(w, b"ftyp", FTYP_CONTENT_LEN)?;
-    w.write_all(b"qt  ")?; // Major brand
-    w.write_u32::<BigEndian>(20_050_300)?; // Minor version
-    w.write_all(b"qt  ")?; // Compatible brands
+/// One declared track and the sample tables collected for it.
+#[derive(Debug)]
+struct MuxTrack {
+    info: TrackInfo,
+    spec: TrackSpec,
+    samples: Vec<SampleRecord>,
+    chunks: Vec<Chunk>,
+}
+
+/// The table data of one written sample.
+#[derive(Debug, Clone, Copy)]
+struct SampleRecord {
+    decode_time: i64,
+    composition_offset: i32,
+    /// Declared duration, in track ticks.
+    duration: u32,
+    size: u32,
+    sync: bool,
+}
+
+/// Consecutive samples of one track stored contiguously in `mdat`.
+#[derive(Debug, Clone, Copy)]
+struct Chunk {
+    offset: u64,
+    samples: u32,
+}
+
+/// A track's extent on its own and on the movie timeline.
+#[derive(Debug)]
+struct TrackSpan {
+    timescale: u32,
+    /// Decode time of the first sample.
+    first_decode: i64,
+    /// Earliest presentation time.
+    start: i64,
+    /// Latest presentation end.
+    end: i64,
+    /// `stts` deltas, one per sample.
+    deltas: Vec<u32>,
+    media_duration: u64,
+}
+
+/// A track's placement on the movie timeline.
+#[derive(Debug)]
+struct Presentation {
+    /// `tkhd` duration in movie ticks.
+    duration: u64,
+    edits: Option<EditListBox>,
+}
+
+impl MuxTrack {
+    /// Validates `sample` against the track and the sample before it.
+    fn record(&self, sample: &EncodedSample, size: u32) -> Result<SampleRecord, Error> {
+        let timescale = self.info.timescale();
+        let id = self.info.id().get();
+        let decode = sample.decode_time();
+        let presentation = sample.presentation_time();
+        let duration = sample.duration();
+        for time in [decode, presentation, duration] {
+            if time.timescale() != timescale {
+                return Err(Error::Container(format!(
+                    "track {id} has timescale {timescale} but a sample is timed in {}",
+                    time.timescale()
+                )));
+            }
+        }
+        if let Some(previous) = self.samples.last()
+            && decode.ticks() <= previous.decode_time
+        {
+            return Err(Error::Container(format!(
+                "track {id} decode time {} does not advance past {}",
+                decode.ticks(),
+                previous.decode_time
+            )));
+        }
+        let composition_offset = presentation
+            .ticks()
+            .checked_sub(decode.ticks())
+            .and_then(|offset| i32::try_from(offset).ok())
+            .ok_or_else(|| {
+                Error::Container(format!(
+                    "track {id} composition offset does not fit the ctts field"
+                ))
+            })?;
+        let duration = u32::try_from(duration.ticks()).map_err(|_| {
+            Error::Container(format!("track {id} sample duration does not fit u32"))
+        })?;
+        Ok(SampleRecord {
+            decode_time: decode.ticks(),
+            composition_offset,
+            duration,
+            size,
+            sync: sample.is_keyframe(),
+        })
+    }
+
+    fn span(&self) -> Result<TrackSpan, Error> {
+        let id = self.info.id().get();
+        let timescale = self.info.timescale().get();
+        let (Some(first), Some(last)) = (self.samples.first(), self.samples.last()) else {
+            return Err(Error::Container(format!("track {id} has no samples")));
+        };
+        let mut deltas = Vec::with_capacity(self.samples.len());
+        for pair in self.samples.windows(2) {
+            let delta = u32::try_from(pair[1].decode_time - pair[0].decode_time).map_err(|_| {
+                Error::Container(format!(
+                    "track {id} decode delta does not fit the stts field"
+                ))
+            })?;
+            deltas.push(delta);
+        }
+        deltas.push(last.duration);
+
+        let mut start = i64::MAX;
+        let mut end = i64::MIN;
+        for (record, delta) in self.samples.iter().zip(&deltas) {
+            let presentation = record.decode_time + i64::from(record.composition_offset);
+            start = start.min(presentation);
+            end = end.max(presentation + i64::from(*delta));
+        }
+        if start < first.decode_time {
+            return Err(Error::Container(format!(
+                "track {id} presents a sample before its first decode time"
+            )));
+        }
+        Ok(TrackSpan {
+            timescale,
+            first_decode: first.decode_time,
+            start,
+            end,
+            media_duration: deltas.iter().map(|&delta| u64::from(delta)).sum(),
+            deltas,
+        })
+    }
+
+    /// Builds the `stbl` children of the track around its sample entry.
+    fn sample_table(
+        &self,
+        mut stsd: StblChild,
+        span: &TrackSpan,
+        format: ContainerFormat,
+    ) -> Result<Vec<StblChild>, Error> {
+        if let (ContainerFormat::Mov, StblChild::Stsd(entries)) = (format, &mut stsd)
+            && self.info.kind() == TrackKind::Audio
+        {
+            let entry = entries
+                .entries
+                .first_mut()
+                .ok_or_else(|| Error::Container(String::from("track has no sample entry")))?;
+            quicktime_sound_description(entry)?;
+        }
+        if let (StblChild::Stsd(entries), Some(color)) = (&mut stsd, self.info.video_color_info())
+            && self.info.kind() == TrackKind::Video
+        {
+            let entry = entries
+                .entries
+                .first_mut()
+                .ok_or_else(|| Error::Container(String::from("track has no sample entry")))?;
+            signal_color(entry, color)?;
+        }
+
+        let mut children = vec![stsd, StblChild::Stts(time_to_sample(&span.deltas))];
+        if let Some(sync) = self.sync_samples()? {
+            children.push(StblChild::Stss(sync));
+        }
+        if let Some(offsets) = self.composition_offsets() {
+            children.push(StblChild::Ctts(offsets));
+        }
+        children.push(StblChild::Stsc(self.sample_to_chunk()));
+        children.push(StblChild::Stsz(SampleSizeBox {
+            version: 0,
+            flags: 0,
+            sample_size: 0,
+            sample_count: count_u32(self.samples.len())?,
+            entries: self.samples.iter().map(|record| record.size).collect(),
+        }));
+        children.push(self.chunk_offsets());
+        Ok(children)
+    }
+
+    /// The `stss` table, or `None` when every sample is a sync sample.
+    fn sync_samples(&self) -> Result<Option<SyncSampleBox>, Error> {
+        if self.samples.iter().all(|record| record.sync) {
+            return Ok(None);
+        }
+        let entries = self
+            .samples
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.sync)
+            .map(|(index, _)| count_u32(index + 1))
+            .collect::<Result<_, _>>()?;
+        Ok(Some(SyncSampleBox {
+            version: 0,
+            flags: 0,
+            entries,
+        }))
+    }
+
+    /// The `ctts` table, or `None` when no sample is reordered. Signed offsets
+    /// need version 1.
+    fn composition_offsets(&self) -> Option<CompositionOffsetBox> {
+        if self
+            .samples
+            .iter()
+            .all(|record| record.composition_offset == 0)
+        {
+            return None;
+        }
+        let mut entries: Vec<CttsEntry> = Vec::new();
+        for record in &self.samples {
+            match entries.last_mut() {
+                Some(last) if last.sample_offset == record.composition_offset => {
+                    last.sample_count += 1;
+                }
+                _ => entries.push(CttsEntry {
+                    sample_count: 1,
+                    sample_offset: record.composition_offset,
+                }),
+            }
+        }
+        let signed = self
+            .samples
+            .iter()
+            .any(|record| record.composition_offset < 0);
+        Some(CompositionOffsetBox {
+            version: u8::from(signed),
+            flags: 0,
+            entries,
+        })
+    }
+
+    fn sample_to_chunk(&self) -> SampleToChunkBox {
+        let mut entries: Vec<StscEntry> = Vec::new();
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            if entries
+                .last()
+                .is_none_or(|last| last.samples_per_chunk != chunk.samples)
+            {
+                entries.push(StscEntry {
+                    first_chunk: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                    samples_per_chunk: chunk.samples,
+                    sample_description_index: 1,
+                });
+            }
+        }
+        SampleToChunkBox {
+            version: 0,
+            flags: 0,
+            entries,
+        }
+    }
+
+    /// `stco`, or `co64` once an offset passes 32 bits.
+    fn chunk_offsets(&self) -> StblChild {
+        let offsets: Result<Vec<u32>, _> = self
+            .chunks
+            .iter()
+            .map(|chunk| u32::try_from(chunk.offset))
+            .collect();
+        offsets.map_or_else(
+            |_| {
+                StblChild::Co64(ChunkLargeOffsetBox {
+                    version: 0,
+                    flags: 0,
+                    entries: self.chunks.iter().map(|chunk| chunk.offset).collect(),
+                })
+            },
+            |entries| {
+                StblChild::Stco(ChunkOffsetBox {
+                    version: 0,
+                    flags: 0,
+                    entries,
+                })
+            },
+        )
+    }
+}
+
+impl TrackSpan {
+    /// Places the track on the movie timeline, which starts at zero and ticks
+    /// at `movie_timescale`.
+    ///
+    /// A late start becomes an empty edit and a composition lead-in (the
+    /// presentation of the first sample after its decode time) becomes the
+    /// start of the media edit. Samples presenting before zero are pre-roll:
+    /// they are decoded but the edit starts at the media time that presents
+    /// at zero.
+    fn presentation(&self, movie_timescale: u32) -> Result<Presentation, Error> {
+        let shown = self.start.max(0);
+        let empty = u64::try_from(rescale(shown, self.timescale, movie_timescale)?)
+            .map_err(|_| Error::Container(String::from("track starts before the movie")))?;
+        let media_time = shown - self.first_decode;
+        if empty == 0 && media_time == 0 {
+            return Ok(Presentation {
+                duration: rescale_unsigned(self.media_duration, self.timescale, movie_timescale)?,
+                edits: None,
+            });
+        }
+        let segment = rescale_unsigned(
+            u64::try_from(self.end - shown)
+                .map_err(|_| Error::Container(String::from("track ends before it starts")))?,
+            self.timescale,
+            movie_timescale,
+        )?;
+        let mut entries = Vec::with_capacity(2);
+        if empty > 0 {
+            entries.push(EditListEntry {
+                segment_duration: empty,
+                media_time: EMPTY_EDIT,
+                media_rate_integer: 1,
+                media_rate_fraction: 0,
+            });
+        }
+        entries.push(EditListEntry {
+            segment_duration: segment,
+            media_time,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        });
+        let wide = entries.iter().any(|entry| {
+            u32::try_from(entry.segment_duration).is_err()
+                || i32::try_from(entry.media_time).is_err()
+        });
+        Ok(Presentation {
+            duration: empty + segment,
+            edits: Some(EditListBox {
+                version: u8::from(wide),
+                flags: 0,
+                entries,
+            }),
+        })
+    }
+}
+
+/// Run-length codes per-sample decode deltas.
+fn time_to_sample(deltas: &[u32]) -> TimeToSampleBox {
+    let mut entries: Vec<SttsEntry> = Vec::new();
+    for &delta in deltas {
+        match entries.last_mut() {
+            Some(last) if last.sample_delta == delta => last.sample_count += 1,
+            _ => entries.push(SttsEntry {
+                sample_count: 1,
+                sample_delta: delta,
+            }),
+        }
+    }
+    TimeToSampleBox {
+        version: 0,
+        flags: 0,
+        entries,
+    }
+}
+
+/// The sample entry and configuration box for `info`'s codec.
+pub fn codec_config(info: &TrackInfo) -> Result<CodecConfig, Error> {
+    let expected = match info.codec() {
+        Codec::H264 | Codec::H265 | Codec::Av1 => TrackKind::Video,
+        Codec::Aac => TrackKind::Audio,
+        other => {
+            return Err(Error::Unsupported(format!(
+                "the muxer writes H.264, H.265, AV1 and AAC tracks, not {other:?}"
+            )));
+        }
+    };
+    if info.kind() != expected {
+        return Err(Error::Container(format!(
+            "{:?} track declared as {:?}",
+            info.codec(),
+            info.kind()
+        )));
+    }
+    let config = info.decoder_configuration();
+    // H.264, H.265 and AV1 configurations are always the whole box.
+    let record = || {
+        config.get(8..).ok_or_else(|| {
+            Error::Container(String::from(
+                "codec configuration shorter than a box header",
+            ))
+        })
+    };
+    match info.codec() {
+        Codec::H264 => {
+            let (width, height) = video_size(info)?;
+            Ok(CodecConfig::Avc {
+                config: AVCConfigurationBox::parse_body(record()?).map_err(container_error)?,
+                width,
+                height,
+            })
+        }
+        Codec::H265 => {
+            let (width, height) = video_size(info)?;
+            Ok(CodecConfig::Hevc {
+                config: HEVCConfigurationBox::parse_body(record()?).map_err(container_error)?,
+                width,
+                height,
+            })
+        }
+        Codec::Av1 => {
+            let (width, height) = video_size(info)?;
+            Ok(CodecConfig::Av1 {
+                config: Av1ConfigurationBox::parse(record()?).map_err(container_error)?,
+                width,
+                height,
+            })
+        }
+        _ => {
+            let layout = info.audio_layout().ok_or_else(|| {
+                Error::Container(String::from("an audio track needs its audio layout"))
+            })?;
+            let channel_count = u16::try_from(layout.channels.get()).map_err(|_| {
+                Error::Container(String::from("channel count does not fit the u16 field"))
+            })?;
+            let specific_info = DecoderSpecificInfo::new(config.to_vec());
+            let decoder = DecoderConfigDescriptor::new(
+                OBJECT_TYPE_MPEG4_AUDIO,
+                STREAM_TYPE_AUDIO,
+                false,
+                0,
+                0,
+                0,
+                Some(specific_info),
+            );
+            Ok(CodecConfig::Aac {
+                esds: EsdsBox::new(ESDescriptor::new(
+                    0,
+                    0,
+                    Some(decoder),
+                    Some(SLConfigDescriptor::predefined_two()),
+                )),
+                channel_count,
+                sample_rate: layout.sample_rate.get(),
+                sample_size: layout.sample_size,
+            })
+        }
+    }
+}
+
+fn video_size(info: &TrackInfo) -> Result<(u16, u16), Error> {
+    let dimensions = info
+        .video_dimensions()
+        .ok_or_else(|| Error::Container(String::from("a video track needs its dimensions")))?;
+    let field = |pixels: std::num::NonZeroU32| {
+        u16::try_from(pixels.get()).map_err(|_| {
+            Error::Container(format!("{pixels} pixels exceed the u16 sample-entry field"))
+        })
+    };
+    Ok((field(dimensions.width)?, field(dimensions.height)?))
+}
+
+/// Appends `colr` (and `clli` when the content light level is known) to a
+/// video sample entry.
+fn signal_color(entry: &mut SampleEntryVariant, color: VideoColorInfo) -> Result<(), Error> {
+    let cicp = color.cicp();
+    let mut nclx = Vec::with_capacity(11);
+    nclx.extend_from_slice(b"nclx");
+    nclx.extend_from_slice(&u16::from(cicp.primaries).to_be_bytes());
+    nclx.extend_from_slice(&u16::from(cicp.transfer).to_be_bytes());
+    nclx.extend_from_slice(&u16::from(cicp.matrix).to_be_bytes());
+    nclx.push(u8::from(cicp.full_range) << 7);
+    let mut boxes = vec![(*b"colr", nclx)];
+    if let Some(light) = color.content_light_level {
+        let mut clli = Vec::with_capacity(4);
+        clli.extend_from_slice(&light.max_content_light_level().to_be_bytes());
+        clli.extend_from_slice(&light.max_frame_average_light_level().to_be_bytes());
+        boxes.push((*b"clli", clli));
+    }
+    match entry {
+        SampleEntryVariant::Avc1(entry) => entry.extra_boxes.extend(
+            boxes
+                .into_iter()
+                .map(|(box_type, data)| OpaqueBox { box_type, data }),
+        ),
+        SampleEntryVariant::Hevc1(entry) => entry.extra_boxes.extend(
+            boxes
+                .into_iter()
+                .map(|(box_type, data)| OpaqueBox { box_type, data }),
+        ),
+        SampleEntryVariant::Av01(entry) => {
+            for (box_type, data) in boxes {
+                let size = u32::try_from(data.len() + 8)
+                    .map_err(|_| Error::Container(String::from("color box too large")))?;
+                let mut bytes = size.to_be_bytes().to_vec();
+                bytes.extend_from_slice(&box_type);
+                bytes.extend_from_slice(&data);
+                entry.children.push(SampleEntryChild::Other(bytes));
+            }
+        }
+        _ => {
+            return Err(Error::Container(String::from(
+                "unexpected video sample entry",
+            )));
+        }
+    }
     Ok(())
 }
 
-/// Per-sample table data collected while streaming `mdat` payloads.
-struct SampleTable {
-    /// `stsz` entries: each sample's byte length.
-    sizes: Vec<u32>,
-    /// `stco`/`co64` entries: each sample's absolute file offset.
-    offsets: Vec<u64>,
-    /// `stss` entries: 1-based indices of sync samples.
-    sync: Vec<u32>,
-}
-
-/// Build the serialized `moov` box content (everything after its header).
+/// Marks an ISO `mp4a` entry as `QuickTime` variable-bitrate audio
+/// (`compression_ID` -2) and adds the `chan` channel layout, which is what
+/// `AVFoundation` requires of a MOV's audio.
 ///
-/// `table.offsets` are absolute byte offsets into the file; a `co64` box is
-/// emitted instead of `stco` as soon as one does not fit 32 bits.
-#[allow(clippy::too_many_lines)]
-fn build_moov(
-    width: u32,
-    height: u32,
-    fps: u32,
-    codec: CodecType,
-    codec_config: &[u8],
-    table: &SampleTable,
-    color: VideoColorInfo,
-) -> Result<Vec<u8>, VideoError> {
-    let sample_count = u32::try_from(table.sizes.len()).map_err(|_| {
-        VideoError::Container(String::from("sample count exceeds the u32 table fields"))
-    })?;
+/// The full `QuickTime` sound description (version 1 with a `wave` atom) also
+/// opens in `AVFoundation`, but the `mp4` crate this crate demuxes with cannot
+/// parse it, so the entry keeps the ISO layout.
+fn quicktime_sound_description(entry: &mut SampleEntryVariant) -> Result<(), Error> {
+    /// `compression_ID` marking variable-bitrate audio, then a zero packet size.
+    const VBR_COMPRESSION_ID: [u8; 4] = [0xff, 0xfe, 0, 0];
 
-    let mut moov = Vec::new();
-    {
-        let w = &mut moov;
-        // mvhd
-        {
-            let mut mvhd = Vec::new();
-            let mw = &mut mvhd;
-            mw.write_u32::<BigEndian>(0)?; // Version/Flags
-            mw.write_u32::<BigEndian>(0)?; // Creation time
-            mw.write_u32::<BigEndian>(0)?; // Modification time
-            mw.write_u32::<BigEndian>(fps)?; // Timescale
-            mw.write_u32::<BigEndian>(sample_count)?; // Duration (assuming 1 unit per frame with timescale=fps)
-            mw.write_u32::<BigEndian>(0x0001_0000)?; // Rate (1.0)
-            mw.write_u16::<BigEndian>(0x0100)?; // Volume (1.0)
-            mw.write_all(&[0u8; 10])?; // Reserved
-            // Matrix (unity)
-            mw.write_u32::<BigEndian>(0x0001_0000)?;
-            mw.write_u32::<BigEndian>(0)?;
-            mw.write_u32::<BigEndian>(0)?;
-            mw.write_u32::<BigEndian>(0)?;
-            mw.write_u32::<BigEndian>(0x0001_0000)?;
-            mw.write_u32::<BigEndian>(0)?;
-            mw.write_u32::<BigEndian>(0)?;
-            mw.write_u32::<BigEndian>(0)?;
-            mw.write_u32::<BigEndian>(0x4000_0000)?;
-            mw.write_all(&[0u8; 24])?; // Pre-defined
-            mw.write_u32::<BigEndian>(2)?; // Next track ID
-
-            write_box_header(w, b"mvhd", mvhd.len() as u64)?;
-            w.write_all(&mvhd)?;
-        }
-
-        // trak
-        {
-            let mut trak = Vec::new();
-            let tw = &mut trak;
-
-            // tkhd
-            {
-                let mut tkhd = Vec::new();
-                let thw = &mut tkhd;
-                thw.write_u32::<BigEndian>(0x0000_0001)?; // Version/Flags (Enabled/InPresentation)
-                thw.write_u32::<BigEndian>(0)?; // Creation time
-                thw.write_u32::<BigEndian>(0)?; // Modification time
-                thw.write_u32::<BigEndian>(1)?; // Track ID
-                thw.write_u32::<BigEndian>(0)?; // Reserved
-                thw.write_u32::<BigEndian>(sample_count)?; // Duration
-                thw.write_all(&[0u8; 8])?; // Reserved
-                thw.write_u16::<BigEndian>(0)?; // Layer
-                thw.write_u16::<BigEndian>(0)?; // Alt group
-                thw.write_u16::<BigEndian>(0)?; // Volume
-                thw.write_u16::<BigEndian>(0)?; // Reserved
-                // Matrix (unity)
-                thw.write_all(&[
-                    // Same matrix as mvhd
-                    0x00, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01, 0x00,
-                    0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x00, 0x00, 0x00,
-                ])?;
-                thw.write_u32::<BigEndian>(width.checked_mul(0x1_0000).ok_or_else(|| {
-                    VideoError::Container(format!(
-                        "video width {width} exceeds the 16.16 fixed-point field"
-                    ))
-                })?)?; // Width (fixed point 16.16)
-                thw.write_u32::<BigEndian>(height.checked_mul(0x1_0000).ok_or_else(|| {
-                    VideoError::Container(format!(
-                        "video height {height} exceeds the 16.16 fixed-point field"
-                    ))
-                })?)?; // Height (fixed point 16.16)
-
-                write_box_header(tw, b"tkhd", tkhd.len() as u64)?;
-                tw.write_all(&tkhd)?;
-            }
-
-            // mdia
-            {
-                let mut mdia = Vec::new();
-                let mw = &mut mdia;
-
-                // mdhd
-                {
-                    let mut mdhd = Vec::new();
-                    let mhw = &mut mdhd;
-                    mhw.write_u32::<BigEndian>(0)?; // Version/Flags
-                    mhw.write_u32::<BigEndian>(0)?; // Creation time
-                    mhw.write_u32::<BigEndian>(0)?; // Modification time
-                    mhw.write_u32::<BigEndian>(fps)?; // Timescale
-                    mhw.write_u32::<BigEndian>(sample_count)?; // Duration
-                    mhw.write_u16::<BigEndian>(0)?; // Language (0)
-                    mhw.write_u16::<BigEndian>(0)?; // Pre-defined
-
-                    write_box_header(mw, b"mdhd", mdhd.len() as u64)?;
-                    mw.write_all(&mdhd)?;
-                }
-
-                // hdlr
-                {
-                    let mut hdlr = Vec::new();
-                    let hw = &mut hdlr;
-                    hw.write_u32::<BigEndian>(0)?; // Version/Flags
-                    hw.write_u32::<BigEndian>(0)?; // Pre-defined
-                    hw.write_all(b"vide")?; // Component sub-type
-                    hw.write_all(&[0u8; 12])?; // Reserved
-                    hw.write_all(b"VideoHandler\0")?; // Component name
-
-                    write_box_header(mw, b"hdlr", hdlr.len() as u64)?;
-                    mw.write_all(&hdlr)?;
-                }
-
-                // minf
-                {
-                    let mut minf = Vec::new();
-                    let miw = &mut minf;
-
-                    // vmhd
-                    {
-                        let mut vmhd = Vec::new();
-                        let vmw = &mut vmhd;
-                        vmw.write_u32::<BigEndian>(0x0000_0001)?; // Version/Flags
-                        vmw.write_u16::<BigEndian>(0)?; // Graphics mode
-                        vmw.write_all(&[0u8; 6])?; // Opcolor
-
-                        write_box_header(miw, b"vmhd", vmhd.len() as u64)?;
-                        miw.write_all(&vmhd)?;
-                    }
-
-                    // dinf
-                    {
-                        let mut dinf = Vec::new();
-                        let dw = &mut dinf;
-
-                        // dref
-                        let mut dref = Vec::new();
-                        let drw = &mut dref;
-                        drw.write_u32::<BigEndian>(0)?; // Version/Flags
-                        drw.write_u32::<BigEndian>(1)?; // Entry count
-
-                        // url
-                        let mut url = Vec::new();
-                        url.write_u32::<BigEndian>(0x0000_0001)?; // Version/Flags (self-contained)
-                        write_box_header(drw, b"url ", url.len() as u64)?;
-                        drw.write_all(&url)?;
-
-                        write_box_header(dw, b"dref", dref.len() as u64)?;
-                        dw.write_all(&dref)?;
-
-                        write_box_header(miw, b"dinf", dinf.len() as u64)?;
-                        miw.write_all(&dinf)?;
-                    }
-
-                    // stbl
-                    {
-                        let mut stbl = Vec::new();
-                        let sw = &mut stbl;
-
-                        // stsd
-                        {
-                            let mut stsd = Vec::new();
-                            let ssw = &mut stsd;
-                            ssw.write_u32::<BigEndian>(0)?; // Version/Flags
-                            ssw.write_u32::<BigEndian>(1)?; // Entry count
-
-                            // VisualSampleEntry (hvc1 or avc1)
-                            let mut entry = Vec::new();
-                            let ew = &mut entry;
-
-                            ew.write_all(&[0u8; 6])?; // Reserved
-                            ew.write_u16::<BigEndian>(1)?; // Data ref index
-                            ew.write_u16::<BigEndian>(0)?; // Pre-defined
-                            ew.write_u16::<BigEndian>(0)?; // Reserved
-                            ew.write_all(&[0u8; 12])?; // Pre-defined
-                            ew.write_u16::<BigEndian>(u16::try_from(width).map_err(|_| {
-                                VideoError::Container(format!(
-                                    "video width {width} exceeds the u16 sample-entry field"
-                                ))
-                            })?)?;
-                            ew.write_u16::<BigEndian>(u16::try_from(height).map_err(|_| {
-                                VideoError::Container(format!(
-                                    "video height {height} exceeds the u16 sample-entry field"
-                                ))
-                            })?)?;
-                            ew.write_u32::<BigEndian>(0x0048_0000)?; // 72 dpi
-                            ew.write_u32::<BigEndian>(0x0048_0000)?; // 72 dpi
-                            ew.write_u32::<BigEndian>(0)?; // Reserved
-                            ew.write_u16::<BigEndian>(1)?; // Frame count
-                            ew.write_u8(0)?; // Compressor name length
-                            ew.write_all(&[0u8; 31])?; // Padding
-                            ew.write_u16::<BigEndian>(0x0018)?; // Depth
-                            ew.write_i16::<BigEndian>(-1)?; // Pre-defined
-
-                            // Codec Config Box (avcC, hvcC or av1C)
-                            let tag = match codec {
-                                CodecType::H264 => b"avcC",
-                                CodecType::H265 => b"hvcC",
-                                CodecType::Av1 => b"av1C",
-                            };
-                            write_box_header(ew, tag, codec_config.len() as u64)?;
-                            ew.write_all(codec_config)?;
-
-                            let cicp = color.cicp();
-                            let mut colr_payload = Vec::with_capacity(11);
-                            colr_payload.write_all(b"nclx")?;
-                            colr_payload.write_u16::<BigEndian>(u16::from(cicp.primaries))?;
-                            colr_payload.write_u16::<BigEndian>(u16::from(cicp.transfer))?;
-                            colr_payload.write_u16::<BigEndian>(u16::from(cicp.matrix))?;
-                            colr_payload.write_u8(u8::from(cicp.full_range) << 7)?;
-                            write_box_header(ew, b"colr", colr_payload.len() as u64)?;
-                            ew.write_all(&colr_payload)?;
-
-                            if let Some(content_light) = color.content_light_level {
-                                let mut clli = Vec::with_capacity(4);
-                                clli.write_u16::<BigEndian>(
-                                    content_light.max_content_light_level(),
-                                )?;
-                                clli.write_u16::<BigEndian>(
-                                    content_light.max_frame_average_light_level(),
-                                )?;
-                                write_box_header(ew, b"clli", clli.len() as u64)?;
-                                ew.write_all(&clli)?;
-                            }
-
-                            let type_code = match codec {
-                                CodecType::H264 => b"avc1",
-                                CodecType::H265 => b"hev1",
-                                CodecType::Av1 => b"av01",
-                            };
-                            write_box_header(ssw, type_code, entry.len() as u64)?;
-                            ssw.write_all(&entry)?;
-
-                            write_box_header(sw, b"stsd", stsd.len() as u64)?;
-                            sw.write_all(&stsd)?;
-                        }
-
-                        // stts (time to sample)
-                        {
-                            let mut stts = Vec::new();
-                            let stw = &mut stts;
-                            stw.write_u32::<BigEndian>(0)?; // Version/Flags
-                            stw.write_u32::<BigEndian>(1)?; // Entry count
-                            stw.write_u32::<BigEndian>(sample_count)?; // Sample count
-                            stw.write_u32::<BigEndian>(1)?; // Sample delta
-
-                            write_box_header(sw, b"stts", stts.len() as u64)?;
-                            sw.write_all(&stts)?;
-                        }
-
-                        // stsc (sample to chunk)
-                        {
-                            let mut stsc = Vec::new();
-                            let scw = &mut stsc;
-                            scw.write_u32::<BigEndian>(0)?; // Version/Flags
-                            scw.write_u32::<BigEndian>(1)?; // Entry count
-
-                            // 1 entry: first chunk = 1, samples per chunk = 1, description index = 1
-                            // We are writing 1 sample per chunk because we write samples individually in mdat loop
-                            // and sample_offsets array corresponds to each sample.
-                            // Actually, standard usually chunks them. But 1 sample/chunk is valid (though inefficient overhead).
-                            scw.write_u32::<BigEndian>(1)?; // First chunk
-                            scw.write_u32::<BigEndian>(1)?; // Samples per chunk
-                            scw.write_u32::<BigEndian>(1)?; // Sample description index
-
-                            write_box_header(sw, b"stsc", stsc.len() as u64)?;
-                            sw.write_all(&stsc)?;
-                        }
-
-                        // stss (sync samples)
-                        {
-                            let mut stss = Vec::new();
-                            let ssw = &mut stss;
-                            ssw.write_u32::<BigEndian>(0)?; // Version/Flags
-                            ssw.write_u32::<BigEndian>(u32::try_from(table.sync.len()).map_err(
-                                |_| {
-                                    VideoError::Container(String::from(
-                                        "sync sample count exceeds the u32 stss field",
-                                    ))
-                                },
-                            )?)?; // Entry count
-                            for &idx in &table.sync {
-                                ssw.write_u32::<BigEndian>(idx)?;
-                            }
-
-                            write_box_header(sw, b"stss", stss.len() as u64)?;
-                            sw.write_all(&stss)?;
-                        }
-
-                        // stsz (sample sizes)
-                        {
-                            let mut stsz = Vec::new();
-                            let szw = &mut stsz;
-                            szw.write_u32::<BigEndian>(0)?; // Version/Flags
-                            szw.write_u32::<BigEndian>(0)?; // Default sample size (0=variable)
-                            szw.write_u32::<BigEndian>(sample_count)?; // Sample count
-                            for &size in &table.sizes {
-                                szw.write_u32::<BigEndian>(size)?;
-                            }
-
-                            write_box_header(sw, b"stsz", stsz.len() as u64)?;
-                            sw.write_all(&stsz)?;
-                        }
-
-                        // Chunk offsets: stco (32 bit) while every offset fits,
-                        // co64 (64 bit) as soon as one crosses the boundary.
-                        {
-                            let use_co64 = table
-                                .offsets
-                                .iter()
-                                .any(|&offset| offset > u64::from(u32::MAX));
-                            let mut chunk_offsets = Vec::new();
-                            let cow = &mut chunk_offsets;
-                            cow.write_u32::<BigEndian>(0)?; // Version/Flags
-                            cow.write_u32::<BigEndian>(
-                                u32::try_from(table.offsets.len()).map_err(|_| {
-                                    VideoError::Container(String::from(
-                                        "chunk count exceeds the u32 offset-table field",
-                                    ))
-                                })?,
-                            )?; // Entry count
-
-                            if use_co64 {
-                                for &offset in &table.offsets {
-                                    cow.write_u64::<BigEndian>(offset)?;
-                                }
-                                write_box_header(sw, b"co64", chunk_offsets.len() as u64)?;
-                            } else {
-                                for &offset in &table.offsets {
-                                    cow.write_u32::<BigEndian>(u32::try_from(offset).map_err(
-                                        |_| {
-                                            VideoError::Container(String::from(
-                                                "chunk offset does not fit the u32 stco field",
-                                            ))
-                                        },
-                                    )?)?;
-                                }
-                                write_box_header(sw, b"stco", chunk_offsets.len() as u64)?;
-                            }
-                            sw.write_all(&chunk_offsets)?;
-                        }
-
-                        write_box_header(miw, b"stbl", stbl.len() as u64)?;
-                        miw.write_all(&stbl)?;
-                    }
-
-                    write_box_header(mw, b"minf", minf.len() as u64)?;
-                    mw.write_all(&minf)?;
-                }
-
-                write_box_header(tw, b"mdia", mdia.len() as u64)?;
-                tw.write_all(&mdia)?;
-            }
-
-            write_box_header(w, b"trak", trak.len() as u64)?;
-            w.write_all(&trak)?;
-        }
+    let SampleEntryVariant::Mp4a(mp4a) = entry else {
+        return Err(Error::Container(String::from(
+            "unexpected audio sample entry",
+        )));
+    };
+    mp4a.compression_id_and_packet_size = VBR_COMPRESSION_ID;
+    let layout = match mp4a.channelcount {
+        1 => Some(CHANNEL_LAYOUT_MONO),
+        2 => Some(CHANNEL_LAYOUT_STEREO),
+        _ => None,
+    };
+    if let Some(layout) = layout {
+        let mut chan = vec![0; 4];
+        chan.extend_from_slice(&layout.to_be_bytes());
+        chan.extend_from_slice(&[0; 8]);
+        mp4a.config_boxes.push(EntryBox::new(*b"chan", chan));
     }
-
-    Ok(moov)
+    Ok(())
 }
 
-/// Write an ISO BMFF box header for `size_content` bytes of payload.
-///
-/// Emits the compact 8-byte header while the whole box fits the 32-bit size
-/// field, and the extended 16-byte `largesize` form (`size == 1`) above it.
-fn write_box_header<W: Write>(
-    w: &mut W,
-    type_str: &[u8],
-    size_content: u64,
-) -> std::io::Result<()> {
-    let total = size_content.checked_add(8).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "box size overflows u64")
-    })?;
-    if let Ok(compact) = u32::try_from(total) {
-        w.write_u32::<BigEndian>(compact)?;
-        w.write_all(type_str)
-    } else {
-        w.write_u32::<BigEndian>(1)?;
-        w.write_all(type_str)?;
-        w.write_u64::<BigEndian>(total.checked_add(8).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "box largesize overflows u64",
-            )
-        })?)
-    }
+/// `kAudioChannelLayoutTag_Mono`.
+const CHANNEL_LAYOUT_MONO: u32 = 0x0064_0001;
+/// `kAudioChannelLayoutTag_Stereo`.
+const CHANNEL_LAYOUT_STEREO: u32 = 0x0065_0002;
+
+/// Version of a movie, track or media header whose duration is `duration`:
+/// 32-bit fields at version 0, 64-bit at version 1.
+fn header_version(duration: u64) -> u8 {
+    u8::from(u32::try_from(duration).is_err())
 }
 
-/// Header length [`write_box_header`] emits for `size_content` bytes of
-/// payload: 8 bytes for a compact box, 16 for the extended `largesize` form.
-fn box_header_len(size_content: u64) -> u64 {
-    if size_content <= u64::from(u32::MAX) - 8 {
-        8
-    } else {
-        16
-    }
+/// Converts `ticks` between timescales, rounding toward negative infinity.
+fn rescale(ticks: i64, from: u32, to: u32) -> Result<i64, Error> {
+    let scaled = (i128::from(ticks) * i128::from(to)).div_euclid(i128::from(from));
+    i64::try_from(scaled)
+        .map_err(|_| Error::Container(String::from("timestamp exceeds the movie timeline")))
 }
 
-/// Absolute byte offset of the first `mdat` payload byte: the `ftyp` box plus
-/// the `mdat` header, which widens to 16 bytes once the payload no longer fits
-/// the 32-bit box size field.
-fn first_sample_offset(mdat_data_size: u64) -> u64 {
-    FTYP_BOX_LEN + box_header_len(mdat_data_size)
+fn rescale_unsigned(ticks: u64, from: u32, to: u32) -> Result<u64, Error> {
+    let scaled = u128::from(ticks) * u128::from(to) / u128::from(from);
+    u64::try_from(scaled)
+        .map_err(|_| Error::Container(String::from("duration exceeds the movie timeline")))
+}
+
+const fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+fn count_u32(count: usize) -> Result<u32, Error> {
+    u32::try_from(count)
+        .map_err(|_| Error::Container(String::from("sample count exceeds the u32 table fields")))
+}
+
+fn container_error(error: impl std::fmt::Display) -> Error {
+    Error::Container(error.to_string())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Seek, SeekFrom};
-
-    /// Largest payload a box can carry with a compact 8-byte header.
-    const MAX_COMPACT_CONTENT: u64 = u32::MAX as u64 - 8;
-
-    /// Opaque stand-in for an `hvcC` payload; the muxer copies it verbatim and
-    /// the HEVC read path extracts the box without parsing its contents.
-    fn fake_codec_config() -> Vec<u8> {
-        vec![0x01; 32]
-    }
-
-    /// Return the bytes of the first box carrying `tag` inside `haystack`,
-    /// including its header.
-    fn find_box(haystack: &[u8], tag: [u8; 4]) -> Option<&[u8]> {
-        let pos = haystack.windows(4).position(|window| window == tag)?;
-        let start = pos.checked_sub(4)?;
-        let size =
-            usize::try_from(u32::from_be_bytes(haystack[start..pos].try_into().ok()?)).ok()?;
-        haystack.get(start..start + size)
-    }
-
-    /// Assemble a file exactly the way [`VideoWriter::finish`] does, but with
-    /// declared sizes/offsets instead of in-memory sample payloads, so offsets
-    /// past 4 GiB stay sparse on disk.
-    fn write_sparse_file(
-        path: &Path,
-        mdat_data_size: u64,
-        samples: &[(u64, &[u8])],
-        sync_samples: &[u32],
-    ) {
-        let mut file = File::create(path).expect("create sparse output");
-        // NTFS only keeps seek holes for files explicitly marked sparse;
-        // without the flag the multi-GiB seeks below would materialize
-        // gigabytes on disk. `fsutil` is Windows' own mechanism for it.
-        #[cfg(windows)]
-        {
-            let status = std::process::Command::new("fsutil")
-                .args(["sparse", "setflag"])
-                .arg(path)
-                .status()
-                .expect("fsutil must be available on Windows");
-            assert!(
-                status.success(),
-                "fsutil sparse setflag failed for {path:?}"
-            );
-        }
-        write_ftyp(&mut file).expect("write ftyp");
-        write_box_header(&mut file, b"mdat", mdat_data_size).expect("write mdat header");
-        let mdat_end = first_sample_offset(mdat_data_size) + mdat_data_size;
-
-        for &(offset, data) in samples {
-            file.seek(SeekFrom::Start(offset)).expect("seek to sample");
-            file.write_all(data).expect("write sample");
-        }
-        file.seek(SeekFrom::Start(mdat_end))
-            .expect("seek past mdat");
-
-        let table = SampleTable {
-            sizes: samples
-                .iter()
-                .map(|(_, data)| u32::try_from(data.len()).expect("sample fits u32"))
-                .collect(),
-            offsets: samples.iter().map(|(offset, _)| *offset).collect(),
-            sync: sync_samples.to_vec(),
-        };
-        let moov = build_moov(
-            64,
-            48,
-            30,
-            CodecType::H265,
-            &fake_codec_config(),
-            &table,
-            VideoColorInfo::default(),
-        )
-        .expect("build moov");
-        write_box_header(&mut file, b"moov", moov.len() as u64).expect("write moov header");
-        file.write_all(&moov).expect("write moov");
-        file.flush().expect("flush");
-    }
-
-    #[test]
-    fn box_header_boundary_serialization() {
-        // Just below the boundary the compact form is used.
-        assert_eq!(box_header_len(MAX_COMPACT_CONTENT), 8);
-        let mut buf = Vec::new();
-        write_box_header(&mut buf, b"mdat", MAX_COMPACT_CONTENT).expect("compact header");
-        assert_eq!(buf.len(), 8);
-        assert_eq!(buf[..4], u32::MAX.to_be_bytes());
-        assert_eq!(buf[4..8], *b"mdat");
-
-        // Above it the extended largesize form carries the true size.
-        assert_eq!(box_header_len(MAX_COMPACT_CONTENT + 1), 16);
-        let mut buf = Vec::new();
-        write_box_header(&mut buf, b"mdat", MAX_COMPACT_CONTENT + 1).expect("extended header");
-        assert_eq!(buf.len(), 16);
-        assert_eq!(buf[..4], 1_u32.to_be_bytes());
-        assert_eq!(buf[4..8], *b"mdat");
-        assert_eq!(buf[8..16], (MAX_COMPACT_CONTENT + 1 + 16).to_be_bytes());
-    }
-
-    #[test]
-    fn moov_selects_stco_or_co64_from_offsets() {
-        let config = fake_codec_config();
-        let table = SampleTable {
-            sizes: vec![16, 8],
-            offsets: vec![36, 52],
-            sync: vec![1],
-        };
-        let moov = build_moov(
-            64,
-            48,
-            30,
-            CodecType::H265,
-            &config,
-            &table,
-            VideoColorInfo::default(),
-        )
-        .expect("moov with small offsets");
-        let stco = find_box(&moov, *b"stco").expect("small offsets must emit stco");
-        assert!(find_box(&moov, *b"co64").is_none());
-        assert_eq!(stco[8..16], [0_u8, 0, 0, 0, 0, 0, 0, 2]); // version/flags + count
-        let expected: Vec<u8> = [36_u32, 52]
-            .iter()
-            .flat_map(|offset| offset.to_be_bytes())
-            .collect();
-        assert_eq!(stco[16..24], expected[..]);
-
-        let large = u64::from(u32::MAX) + 1;
-        let table = SampleTable {
-            sizes: vec![16, 8],
-            offsets: vec![36, large],
-            sync: vec![1],
-        };
-        let moov = build_moov(
-            64,
-            48,
-            30,
-            CodecType::H265,
-            &config,
-            &table,
-            VideoColorInfo::default(),
-        )
-        .expect("moov with a >32-bit offset");
-        assert!(find_box(&moov, *b"stco").is_none());
-        let co64 = find_box(&moov, *b"co64").expect("large offset must emit co64");
-        assert_eq!(co64[8..16], [0_u8, 0, 0, 0, 0, 0, 0, 2]);
-        assert_eq!(co64[16..24], 36_u64.to_be_bytes());
-        assert_eq!(co64[24..32], large.to_be_bytes());
-    }
-
-    #[test]
-    fn small_recording_roundtrips_through_reader() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("small.mp4");
-        let mut writer = VideoWriter::new(
-            &path,
-            64,
-            48,
-            30,
-            CodecType::H265,
-            VideoColorInfo::default(),
-        )
-        .expect("create writer");
-        writer.set_codec_config(fake_codec_config());
-        writer
-            .write_sample(b"first-sample", true)
-            .expect("sample 1");
-        writer.write_sample(b"second", false).expect("sample 2");
-        writer.finish().expect("finish");
-
-        let mut reader = crate::VideoReader::open(&path).expect("reader opens written file");
-        assert_eq!(reader.dimensions(), (64, 48));
-        assert_eq!(reader.sample_count(), 2);
-        let (data, _, keyframe) = reader
-            .read_sample()
-            .expect("read sample 1")
-            .expect("sample 1 exists");
-        assert_eq!(data, b"first-sample");
-        assert!(keyframe);
-        let (data, _, keyframe) = reader
-            .read_sample()
-            .expect("read sample 2")
-            .expect("sample 2 exists");
-        assert_eq!(data, b"second");
-        assert!(!keyframe);
-    }
-
-    #[test]
-    fn color_metadata_roundtrips_through_public_probe() {
-        use waterkit_video_core::{
-            ColorPrimaries, ColorRange, ContentLightLevel, MatrixCoefficients, TransferFunction,
-        };
-
-        let colors = [
-            VideoColorInfo {
-                matrix: MatrixCoefficients::Bt709,
-                primaries: ColorPrimaries::Bt709,
-                transfer: TransferFunction::Sdr,
-                range: ColorRange::Limited,
-                content_light_level: None,
-                dolby_vision: false,
-            },
-            VideoColorInfo {
-                matrix: MatrixCoefficients::Bt601,
-                primaries: ColorPrimaries::Bt601,
-                transfer: TransferFunction::Sdr,
-                range: ColorRange::Full,
-                content_light_level: None,
-                dolby_vision: false,
-            },
-            VideoColorInfo {
-                matrix: MatrixCoefficients::Bt2020NonConstantLuminance,
-                primaries: ColorPrimaries::Bt2020,
-                transfer: TransferFunction::Hlg,
-                range: ColorRange::Limited,
-                content_light_level: None,
-                dolby_vision: false,
-            },
-            VideoColorInfo {
-                matrix: MatrixCoefficients::Bt709,
-                primaries: ColorPrimaries::DisplayP3,
-                transfer: TransferFunction::Pq,
-                range: ColorRange::Full,
-                content_light_level: Some(ContentLightLevel::new(1_000, 400)),
-                dolby_vision: false,
-            },
-        ];
-        let dir = tempfile::tempdir().expect("temp dir");
-        for (index, color) in colors.into_iter().enumerate() {
-            let path = dir.path().join(format!("color-{index}.mp4"));
-            let mut writer =
-                VideoWriter::new(&path, 64, 48, 30, CodecType::H265, color).expect("create writer");
-            writer.set_codec_config(fake_codec_config());
-            writer.write_sample(b"sample", true).expect("write sample");
-            writer.finish().expect("finish");
-
-            let probed = crate::probe_mp4_color_info(&path, None).expect("probe color metadata");
-            assert_eq!(probed, color);
-        }
-    }
-
-    #[test]
-    fn sparse_file_at_u32_boundary_stays_compact() {
-        // mdat payload sized so the box size field still fits u32, with the
-        // last chunk offset exactly at u32::MAX — the largest stco entry.
-        let mdat_data_size = MAX_COMPACT_CONTENT;
-        let first_offset = first_sample_offset(mdat_data_size);
-        assert_eq!(first_offset, FTYP_BOX_LEN + 8);
-        let sample_a = b"0123456789abcdef";
-        let sample_b = b"at_boundary_offset_!";
-        let offset_b = first_offset + mdat_data_size - sample_b.len() as u64;
-        assert_eq!(offset_b, u64::from(u32::MAX));
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("boundary.mp4");
-        write_sparse_file(
-            &path,
-            mdat_data_size,
-            &[(first_offset, sample_a), (offset_b, sample_b)],
-            &[1],
-        );
-
-        let mut reader = crate::VideoReader::open(&path).expect("reader opens boundary file");
-        assert_eq!(reader.sample_count(), 2);
-        let (data, _, _) = reader.read_sample().expect("read").expect("sample 1");
-        assert_eq!(data, sample_a);
-        let (data, _, _) = reader.read_sample().expect("read").expect("sample 2");
-        assert_eq!(data, sample_b);
-    }
-
-    #[test]
-    fn sparse_file_above_u32_boundary_uses_largesize_and_co64() {
-        // mdat payload past the 32-bit box size: extended header and a chunk
-        // offset beyond u32::MAX.
-        let mdat_data_size = MAX_COMPACT_CONTENT + 16;
-        let first_offset = first_sample_offset(mdat_data_size);
-        assert_eq!(first_offset, FTYP_BOX_LEN + 16);
-        let sample_a = b"0123456789abcdef";
-        let sample_b = b"beyond-4gb";
-        let offset_b = first_offset + mdat_data_size - sample_b.len() as u64;
-        assert!(offset_b > u64::from(u32::MAX));
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("large.mp4");
-        write_sparse_file(
-            &path,
-            mdat_data_size,
-            &[(first_offset, sample_a), (offset_b, sample_b)],
-            &[1],
-        );
-
-        let mut reader = crate::VideoReader::open(&path).expect("reader opens large file");
-        assert_eq!(reader.sample_count(), 2);
-        let (data, _, _) = reader.read_sample().expect("read").expect("sample 1");
-        assert_eq!(data, sample_a);
-        let (data, _, _) = reader.read_sample().expect("read").expect("sample 2");
-        assert_eq!(data, sample_b);
-    }
-}
+pub mod tests;

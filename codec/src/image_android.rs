@@ -20,8 +20,14 @@ use crate::image::{DecodedImage, DecodedPixelFormat};
 /// Returns [`CodecError::DecodingFailed`] when the platform cannot decode the
 /// image — notably AVIF on Android 11 (API 30) and older.
 pub fn decode_isobmff_android(data: &[u8]) -> Result<DecodedImage, CodecError> {
-    let (vm, _context) = waterkit_build::jvm_and_context()
-        .map_err(|err| CodecError::DecodingFailed(format!("JNI runtime unavailable: {err}")))?;
+    let raw_vm: *mut jni::sys::JavaVM = ndk_context::android_context().vm().cast();
+    assert!(
+        !raw_vm.is_null(),
+        "mediax: ndk_context returned a null JavaVM"
+    );
+    // SAFETY: `ndk_context` publishes the process' JavaVM pointer, which stays
+    // valid for the lifetime of the application.
+    let vm = unsafe { jni::JavaVM::from_raw(raw_vm) };
 
     vm.attach_current_thread(
         |env| -> Result<Result<DecodedImage, CodecError>, jni::errors::Error> {

@@ -1,5 +1,5 @@
 [package]
-name = "waterkit-codec"
+name = "mediax-codec"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -17,7 +17,7 @@ libc = "0.2"
 thiserror.workspace = true
 image.workspace = true
 half = "2"
-waterkit-video-core.workspace = true
+mediax-core.workspace = true
 tracing.workspace = true
 
 # GPU texture output. Optional so a decode-only consumer that just wants pixels
@@ -28,7 +28,7 @@ shaderloom = { workspace = true, features = ["runtime"], optional = true }
 [build-dependencies]
 cfg_aliases = "0.2"
 shaderloom = { workspace = true, features = ["build"], optional = true }
-waterkit-video-core.workspace = true
+mediax-core.workspace = true
 
 # Software fallback codecs (private, not exposed in public API)
 # Only enabled on desktop platforms - mobile and wasm use their native decode paths
@@ -40,9 +40,18 @@ avif-parse = { version = "2.1", optional = true }
 yuv = { version = "0.8.19", optional = true }
 moxcms = { version = "0.9.1", features = ["extended_range"], optional = true }
 
+# Pure-Rust AAC-LC decoding for the targets without a platform AAC decoder
+# (Apple decodes through AudioToolbox, Android through MediaCodec, Windows
+# through Media Foundation).
+[target.'cfg(not(any(target_vendor = "apple", target_os = "android", target_os = "windows")))'.dependencies]
+symphonia-core = { workspace = true, optional = true }
+symphonia-codec-aac = { workspace = true, optional = true }
+
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2.workspace = true
 objc2-video-toolbox.workspace = true
+objc2-audio-toolbox = { workspace = true, features = ["AudioConverter", "objc2-core-audio-types"] }
+objc2-core-audio-types.workspace = true
 objc2-core-media.workspace = true
 objc2-core-video.workspace = true
 objc2-core-foundation.workspace = true
@@ -76,13 +85,27 @@ wgpu-hal = { workspace = true, optional = true }
 ndk = { version = "0.9", features = ["media", "bitmap", "api-level-29", "api-level-30"] }
 ndk-sys = "0.6"
 jni.workspace = true
-waterkit-build.workspace = true
+ndk-context.workspace = true
+
+# VA-API is loaded with `dlopen` so a host without libva still builds and runs.
+# `h264-reader` parses the parameter sets and slice headers of the VA-API
+# decoder. The VA-API code also runs against a test double of the driver on
+# other unix hosts, which need both as dev-dependencies, and in the fuzz
+# targets, which ask for the `fuzzing` feature.
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = { version = "0.9", default-features = false }
+h264-reader = { version = "0.9", default-features = false }
+
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
+libloading = { version = "0.9", default-features = false, optional = true }
+h264-reader = { version = "0.9", default-features = false, optional = true }
+
+[target.'cfg(all(unix, not(target_os = "linux")))'.dev-dependencies]
+libloading = { version = "0.9", default-features = false }
+h264-reader = { version = "0.9", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { workspace = true, features = ["Win32_Media_MediaFoundation", "Win32_System_Com"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-cros-codecs = { version = "0.0.6", default-features = false, features = ["vaapi"], optional = true }
+windows = { workspace = true, features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
 
 # The software AV1 decoder's end-to-end test builds its input with `image`'s
 # AVIF *encoder*. Nothing else in the workspace encodes AVIF, so that encoder
@@ -90,11 +113,21 @@ cros-codecs = { version = "0.0.6", default-features = false, features = ["vaapi"
 [target.'cfg(not(any(target_os = "android", target_arch = "wasm32")))'.dev-dependencies]
 image = { workspace = true, features = ["avif"] }
 
+# The AudioToolbox AAC decoder's tests compare it against the pure-Rust decoder.
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+symphonia-core.workspace = true
+symphonia-codec-aac.workspace = true
+
 [dev-dependencies]
 pollster.workspace = true
+tracing-subscriber.workspace = true
+hex.workspace = true
 
 [features]
 default = ["gpu", "software-encode"]
+# Packet-oriented AAC decoding (`audio`): AudioToolbox on Apple, MediaCodec on
+# Android, Media Foundation on Windows, a pure-Rust AAC-LC decoder elsewhere.
+aac = ["dep:symphonia-core", "dep:symphonia-codec-aac"]
 # Uploads decoded frames to `wgpu` textures and converts them to linear RGBA on
 # the GPU. Off, the crate decodes to CPU memory only and links no `wgpu`.
 gpu = [
@@ -110,11 +143,9 @@ gpu = [
 software-decode = ["dep:rav1d", "dep:avif-parse", "dep:yuv", "dep:moxcms"]
 # AV1 *encode* in software adds `rav1e` on top of the decode stack.
 software-encode = ["dep:rav1e", "dep:num-traits", "software-decode"]
-# VA-API hardware decode/encode on Linux via `cros-codecs`, which compiles
-# `cros-libva` against the system libva headers (>= 2.20). Off by default so a
-# consumer that only decodes still images links no hardware video decoder —
-# video consumers (waterkit-video-player and friends) opt in explicitly.
-vaapi = ["dep:cros-codecs"]
+# Exposes the VA-API H.264 parser, DPB and decoder, with a driver double, to
+# the fuzz targets in `fuzz/` on unix hosts. Not for applications.
+fuzzing = ["dep:libloading", "dep:h264-reader"]
 
 [lints]
 workspace = true

@@ -5,33 +5,29 @@ use std::time::Duration;
 
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(target_vendor = "apple")]
+mod apple;
 #[cfg(target_os = "windows")]
 mod windows;
 
-#[cfg(all(
-    not(any(target_os = "android", target_os = "windows", target_arch = "wasm32")),
-    feature = "he-aac"
-))]
-use symphonia_adapter_fdk_aac::AacDecoder as FdkAacDecoder;
-#[cfg(all(
-    not(any(target_os = "android", target_os = "windows")),
-    any(not(feature = "he-aac"), target_arch = "wasm32")
-))]
+#[cfg(mediax_aac_pure_rust)]
 use symphonia_codec_aac::AacDecoder;
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 use symphonia_core::codecs::audio::well_known::CODEC_ID_AAC;
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 use symphonia_core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 use symphonia_core::packet::Packet;
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 use symphonia_core::units::{Duration as SymphoniaDuration, Timestamp};
 
+#[cfg(target_vendor = "apple")]
+type SelectedAacDecoder = apple::AppleAacDecoder;
 #[cfg(target_os = "android")]
 type SelectedAacDecoder = android::AndroidAacDecoder;
 #[cfg(target_os = "windows")]
 type SelectedAacDecoder = windows::WindowsAacDecoder;
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 type SelectedAacDecoder = Box<dyn AudioDecoder>;
 
 /// Errors raised by packet-oriented audio decoding.
@@ -299,10 +295,13 @@ pub trait PacketAudioDecoder: Send {
 
 /// Packet decoder for AAC access units.
 ///
-/// Android and Windows use their platform AAC decoders. On other targets, the
-/// `he-aac` feature selects the complete FDK decoder for AAC-LC, HE-AAC, and
-/// HE-AAC v2. Without that feature, and always on `wasm32`, where FDK does not
-/// build, the smaller pure-Rust decoder supports AAC-LC only.
+/// Apple, Android and Windows use their platform AAC decoders (`AudioToolbox`,
+/// `MediaCodec`, Media Foundation), which also decode HE-AAC. On other targets, a
+/// pure-Rust decoder supports AAC-LC only.
+///
+/// The configured channel count and sample rate are the decoded output format:
+/// for HE-AAC that is the SBR-doubled rate and, with parametric stereo, two
+/// channels.
 pub struct AacPacketDecoder {
     decoder: SelectedAacDecoder,
     channels: NonZeroU16,
@@ -343,7 +342,7 @@ impl AacPacketDecoder {
     }
 }
 
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 fn create_aac_decoder(config: AacDecoderConfig) -> Result<SelectedAacDecoder, String> {
     let mut parameters = AudioCodecParameters::new();
     parameters
@@ -351,6 +350,11 @@ fn create_aac_decoder(config: AacDecoderConfig) -> Result<SelectedAacDecoder, St
         .with_sample_rate(config.sample_rate.get())
         .with_extra_data(config.audio_specific_config);
     create_symphonia_aac_decoder(&parameters).map_err(|error| error.to_string())
+}
+
+#[cfg(target_vendor = "apple")]
+fn create_aac_decoder(config: AacDecoderConfig) -> Result<SelectedAacDecoder, String> {
+    apple::AppleAacDecoder::new(config)
 }
 
 #[cfg(target_os = "android")]
@@ -363,10 +367,7 @@ fn create_aac_decoder(config: AacDecoderConfig) -> Result<SelectedAacDecoder, St
     windows::WindowsAacDecoder::new(config)
 }
 
-#[cfg(all(
-    not(any(target_os = "android", target_os = "windows")),
-    any(not(feature = "he-aac"), target_arch = "wasm32")
-))]
+#[cfg(mediax_aac_pure_rust)]
 fn create_symphonia_aac_decoder(
     parameters: &AudioCodecParameters,
 ) -> symphonia_core::errors::Result<SelectedAacDecoder> {
@@ -374,21 +375,7 @@ fn create_symphonia_aac_decoder(
         .map(|decoder| Box::new(decoder) as Box<dyn AudioDecoder>)
 }
 
-#[cfg(all(
-    not(any(target_os = "android", target_os = "windows", target_arch = "wasm32")),
-    feature = "he-aac"
-))]
-fn create_symphonia_aac_decoder(
-    parameters: &AudioCodecParameters,
-) -> symphonia_core::errors::Result<SelectedAacDecoder> {
-    use symphonia_core::codecs::registry::CodecRegistry;
-
-    let mut codecs = CodecRegistry::new();
-    codecs.register_audio_decoder::<FdkAacDecoder>();
-    codecs.make_audio_decoder(parameters, &AudioDecoderOptions::default())
-}
-
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
+#[cfg(mediax_aac_pure_rust)]
 impl PacketAudioDecoder for AacPacketDecoder {
     fn decode(
         &mut self,
@@ -444,7 +431,7 @@ impl PacketAudioDecoder for AacPacketDecoder {
     }
 }
 
-#[cfg(any(target_os = "android", target_os = "windows"))]
+#[cfg(not(mediax_aac_pure_rust))]
 impl PacketAudioDecoder for AacPacketDecoder {
     fn decode(
         &mut self,
@@ -554,53 +541,10 @@ mod tests {
         ));
     }
 
-    #[cfg(all(feature = "he-aac", not(target_arch = "wasm32")))]
-    #[test]
-    fn decodes_real_he_aac_access_unit_with_sbr() {
-        let fixture = include_str!("fixtures/heaac-48k-stereo.hex");
-        // `lines` and not a split on '\n': a Windows checkout gives the
-        // fixture CRLF line endings.
-        let mut lines = fixture.lines();
-        let (Some(configuration), Some(packet)) = (lines.next(), lines.next()) else {
-            panic!("HE-AAC fixture must contain configuration and packet lines");
-        };
-        let configuration = hex::decode(configuration).expect("HE-AAC config must be valid hex");
-        let packet = hex::decode(packet).expect("HE-AAC packet must be valid hex");
-        let mut decoder = AacPacketDecoder::new(AacDecoderConfig::new(
-            configuration,
-            NonZeroU16::new(2).expect("two channels must be non-zero"),
-            NonZeroU32::new(48_000).expect("sample rate must be non-zero"),
-        ))
-        .expect("valid HE-AAC configuration must initialize");
-
-        let mut frames = decoder
-            .decode(EncodedAudioPacket::new(
-                Duration::ZERO,
-                Duration::from_micros(42_667),
-                packet,
-            ))
-            .expect("HE-AAC access unit must decode with SBR");
-        frames.extend(
-            decoder
-                .finish()
-                .expect("HE-AAC decoder must drain its buffered access units"),
-        );
-        let frame = frames
-            .first()
-            .expect("one access unit must produce exactly one PCM frame");
-
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frame.channels().get(), 2);
-        assert_eq!(frame.sample_rate().get(), 48_000);
-        assert_eq!(frame.sample_frames(), 2_048);
-        assert!(frame.samples().iter().all(|sample| sample.is_finite()));
-    }
-
     /// Consecutive access units must decode as one continuous PCM run. A
     /// decoder that resets its prediction state between units breaks AAC's
-    /// MDCT overlap-add (and the HE-AAC SBR tool's state), which shows up as
-    /// a sample jump at every frame boundary that the continuous signal
-    /// itself never reaches.
+    /// MDCT overlap-add, which shows up as a sample jump at every frame
+    /// boundary that the continuous signal itself never reaches.
     #[test]
     fn decodes_consecutive_access_units_without_boundary_discontinuities() {
         let packets: Vec<Vec<u8>> = AAC_LC_44K_STEREO_STREAM

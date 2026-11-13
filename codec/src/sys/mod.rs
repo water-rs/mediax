@@ -1,13 +1,14 @@
 //! Platform-specific hardware codec implementations.
 
-#[cfg(waterkit_hw_codec_apple)]
+#[cfg(mediax_hw_codec_apple)]
 pub mod apple;
 
-#[cfg(waterkit_hw_codec_android)]
+#[cfg(mediax_hw_codec_android)]
 pub mod android;
 
-#[cfg(waterkit_hw_codec_windows)]
+#[cfg(mediax_hw_codec_windows)]
 pub mod windows;
 
-#[cfg(waterkit_hw_codec_vaapi)]
-pub mod linux;
+// The driver-double tests need unix file descriptors and a dynamic loader.
+#[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
+pub mod vaapi;

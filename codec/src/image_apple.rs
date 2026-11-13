@@ -8,21 +8,37 @@
 //! `kCMVideoCodecType_AV1` hardware decode support is reported by
 //! `VideoToolbox` on iOS 17 / macOS 14 and later.
 
-use core::ptr::NonNull;
+use core::ffi::c_void;
+use core::ptr::{self, NonNull};
+use std::sync::mpsc::{Sender, channel};
 
 use half::f16;
 use objc2::available;
 use objc2::runtime::AnyObject;
-use objc2_core_foundation::{CFData, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{
+    CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect,
+    CGSize, kCFAllocatorNull,
+};
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceExtendedLinearSRGB};
 use objc2_core_image::{
     CIContext, CIContextOption, CIImage, kCIContextOutputColorSpace, kCIContextWorkingColorSpace,
     kCIFormatRGBAh,
 };
-use objc2_core_media::kCMVideoCodecType_AV1;
+use objc2_core_media::{
+    CMBlockBuffer, CMSampleBuffer, CMTime, CMVideoFormatDescription,
+    CMVideoFormatDescriptionCreate, kCMVideoCodecType_AV1, kCMVideoCodecType_JPEG,
+};
+use objc2_core_video::{
+    CVPixelBuffer, kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey,
+    kCVPixelFormatType_32BGRA,
+};
 use objc2_foundation::{NSData, NSDictionary};
 use objc2_image_io::CGImageSource;
-use objc2_video_toolbox::VTIsHardwareDecodeSupported;
+use objc2_video_toolbox::{
+    VTDecodeFrameFlags, VTDecodeInfoFlags, VTDecompressionOutputCallbackRecord,
+    VTDecompressionSession, VTIsHardwareDecodeSupported,
+    kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
+};
 
 use crate::CodecError;
 
@@ -245,4 +261,217 @@ fn rgba16f_to_rgba8(rgba16f: &[u8]) -> Vec<u8> {
         ]);
     }
     rgba8
+}
+
+/// Wraps the JPEG bytes as a one-sample `CMSampleBuffer`.
+///
+/// The block buffer borrows `data` (no allocator frees it), so the sample
+/// must not outlive `data`.
+fn jpeg_sample_buffer(data: &[u8]) -> Result<CFRetained<CMSampleBuffer>, CodecError> {
+    let failed = |what: &str, status: i32| {
+        CodecError::DecodingFailed(format!("JPEG decode: {what} failed: OSStatus {status}"))
+    };
+    let (width, height) =
+        image::ImageReader::with_format(std::io::Cursor::new(data), image::ImageFormat::Jpeg)
+            .into_dimensions()
+            .map_err(|error| CodecError::DecodingFailed(format!("JPEG decode: {error}")))?;
+    let (Ok(width), Ok(height)) = (i32::try_from(width), i32::try_from(height)) else {
+        return Err(CodecError::DecodingFailed(
+            "JPEG decode: dimensions exceed i32::MAX".into(),
+        ));
+    };
+
+    let mut description_ptr: *const CMVideoFormatDescription = ptr::null();
+    // SAFETY: `description_ptr` is a valid out pointer.
+    let status = unsafe {
+        CMVideoFormatDescriptionCreate(
+            None,
+            kCMVideoCodecType_JPEG,
+            width,
+            height,
+            None,
+            NonNull::from(&mut description_ptr),
+        )
+    };
+    let description = NonNull::new(description_ptr.cast_mut())
+        .filter(|_| status == 0)
+        .ok_or_else(|| failed("CMVideoFormatDescriptionCreate", status))?;
+    // SAFETY: the create rule returns a +1 retained description.
+    let description = unsafe { CFRetained::from_raw(description) };
+
+    // The block buffer borrows `data` (no allocator frees it) and is dropped
+    // before this function returns, after the synchronous decode below.
+    let mut block_ptr: *mut CMBlockBuffer = ptr::null_mut();
+    // SAFETY: `data` is valid for `data.len()` bytes for the buffer's life.
+    let status = unsafe {
+        CMBlockBuffer::create_with_memory_block(
+            None,
+            data.as_ptr().cast_mut().cast::<c_void>(),
+            data.len(),
+            kCFAllocatorNull,
+            ptr::null(),
+            0,
+            data.len(),
+            0,
+            NonNull::from(&mut block_ptr),
+        )
+    };
+    let block = NonNull::new(block_ptr)
+        .filter(|_| status == 0)
+        .ok_or_else(|| failed("CMBlockBufferCreateWithMemoryBlock", status))?;
+    // SAFETY: the create rule returns a +1 retained block buffer.
+    let block = unsafe { CFRetained::from_raw(block) };
+
+    let mut sample_ptr: *mut CMSampleBuffer = ptr::null_mut();
+    let sample_size = data.len();
+    // SAFETY: one sample of `sample_size` bytes, no timing entries.
+    let status = unsafe {
+        CMSampleBuffer::create_ready(
+            None,
+            Some(&block),
+            Some(&description),
+            1,
+            0,
+            ptr::null(),
+            1,
+            &raw const sample_size,
+            NonNull::from(&mut sample_ptr),
+        )
+    };
+    let sample = NonNull::new(sample_ptr)
+        .filter(|_| status == 0)
+        .ok_or_else(|| failed("CMSampleBufferCreateReady", status))?;
+    // SAFETY: the create rule returns a +1 retained sample buffer.
+    let sample = unsafe { CFRetained::from_raw(sample) };
+    Ok(sample)
+}
+
+/// Decodes a JPEG into an `IOSurface`-backed BGRA `CVPixelBuffer` on the
+/// platform's hardware JPEG decoder.
+///
+/// A `VideoToolbox` decompression session with the hardware decoder required
+/// reads the JPEG bytes and writes into a BGRA surface, so the pixels never
+/// pass through CPU memory. BGRA rather than the decoder's native YCbCr, so
+/// an encoder converts to its own matrix and range instead of inheriting the
+/// JPEG's.
+///
+/// # Errors
+/// Returns `CodecError::DecodingFailed` when the bytes are not a decodable
+/// JPEG, and `CodecError::Unsupported` when no hardware JPEG decoder is
+/// available.
+pub fn decode_jpeg_pixel_buffer(data: &[u8]) -> Result<CFRetained<CVPixelBuffer>, CodecError> {
+    let failed = |what: &str, status: i32| {
+        CodecError::DecodingFailed(format!("JPEG decode: {what} failed: OSStatus {status}"))
+    };
+    let sample = jpeg_sample_buffer(data)?;
+    // SAFETY: read-only accessor on a live sample buffer.
+    let description = unsafe { sample.format_description() }
+        .ok_or_else(|| CodecError::DecodingFailed("JPEG decode: sample has no format".into()))?;
+
+    // SAFETY: constant keys exported by `VideoToolbox` and `CoreVideo`.
+    let (hardware_key, format_key, surface_key) = unsafe {
+        (
+            kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
+            kCVPixelBufferPixelFormatTypeKey,
+            kCVPixelBufferIOSurfacePropertiesKey,
+        )
+    };
+    let specification = CFDictionary::<CFString, CFType>::from_slices(
+        &[hardware_key],
+        &[CFBoolean::new(true).as_ref()],
+    );
+    let format = CFNumber::new_i32(
+        i32::try_from(kCVPixelFormatType_32BGRA).expect("the BGRA format code fits in i32"),
+    );
+    let destination = CFDictionary::<CFString, CFType>::from_slices(
+        &[format_key, surface_key],
+        &[
+            format.as_ref(),
+            CFDictionary::<CFString, CFType>::empty().as_ref(),
+        ],
+    );
+
+    let (sender, receiver) = channel::<JpegOutput>();
+    let callback = VTDecompressionOutputCallbackRecord {
+        decompressionOutputCallback: Some(jpeg_output_callback),
+        decompressionOutputRefCon: ptr::from_ref(&sender).cast_mut().cast::<c_void>(),
+    };
+    let mut session_ptr: *mut VTDecompressionSession = ptr::null_mut();
+    // SAFETY: `callback` and `sender` outlive the session, which is
+    // invalidated before they drop.
+    let status = unsafe {
+        VTDecompressionSession::create(
+            None,
+            &description,
+            Some(specification.as_ref()),
+            Some(destination.as_ref()),
+            &raw const callback,
+            NonNull::from(&mut session_ptr),
+        )
+    };
+    let session = NonNull::new(session_ptr)
+        .filter(|_| status == 0)
+        .ok_or_else(|| {
+            CodecError::Unsupported(format!(
+                "no hardware JPEG decoder: VTDecompressionSessionCreate failed: OSStatus {status}"
+            ))
+        })?;
+    // SAFETY: the create rule returns a +1 retained session.
+    let session = unsafe { CFRetained::from_raw(session) };
+
+    let mut info_flags = VTDecodeInfoFlags(0);
+    // SAFETY: flags 0 decode synchronously, so the callback has run (and
+    // sent its result) when this returns.
+    let status = unsafe {
+        session.decode_frame(
+            &sample,
+            VTDecodeFrameFlags(0),
+            ptr::null_mut(),
+            &raw mut info_flags,
+        )
+    };
+    // SAFETY: the session is live; waiting makes sure no callback is pending
+    // before `sender` drops.
+    let wait_status = unsafe { session.wait_for_asynchronous_frames() };
+    // SAFETY: the session is live and no longer needed.
+    unsafe { session.invalidate() };
+    if status != 0 {
+        return Err(failed("VTDecompressionSessionDecodeFrame", status));
+    }
+    if wait_status != 0 {
+        return Err(failed(
+            "VTDecompressionSessionWaitForAsynchronousFrames",
+            wait_status,
+        ));
+    }
+    drop(sender);
+    receiver
+        .recv()
+        .map_err(|_| CodecError::DecodingFailed("JPEG decode produced no frame".into()))?
+}
+
+type JpegOutput = Result<CFRetained<CVPixelBuffer>, CodecError>;
+
+/// Hands the decoded JPEG surface (or the failure) to the waiting decode.
+unsafe extern "C-unwind" fn jpeg_output_callback(
+    output_ref_con: *mut c_void,
+    _source_frame_ref_con: *mut c_void,
+    status: i32,
+    _info_flags: VTDecodeInfoFlags,
+    image_buffer: *mut CVPixelBuffer,
+    _presentation_time_stamp: CMTime,
+    _presentation_duration: CMTime,
+) {
+    // SAFETY: `output_ref_con` is the sender `decode_jpeg_pixel_buffer` keeps
+    // alive until the session is invalidated.
+    let sender = unsafe { &*output_ref_con.cast::<Sender<JpegOutput>>() };
+    let result = match NonNull::new(image_buffer) {
+        // SAFETY: VideoToolbox passes a live image buffer; retain it past the call.
+        Some(buffer) if status == 0 => Ok(unsafe { CFRetained::retain(buffer) }),
+        _ => Err(CodecError::DecodingFailed(format!(
+            "JPEG decode: the decoder reported OSStatus {status}"
+        ))),
+    };
+    // The receiver outlives the session.
+    let _ = sender.send(result);
 }

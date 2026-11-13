@@ -1,11 +1,11 @@
 //! Shared color-conversion contract for decoded YUV textures.
 
-use waterkit_video_core::{ColorPrimaries, TransferFunction, VideoColorInfo};
+use mediax_core::{ColorPrimaries, TransferFunction, VideoColorInfo};
 
 use crate::DecodedPixelLayout;
 
-/// Unified GPU shader used by `WaterKit` conversion and presentation pipelines:
-/// the complete module, `waterkit-video-core`'s shared YCbCr fragment followed
+/// Unified GPU shader used by mediax conversion and presentation pipelines:
+/// the complete module, `mediax-core`'s shared YCbCr fragment followed
 /// by the codec's YUV source.
 pub const YUV_COLOR_SHADER_WGSL: &str =
     include_str!(concat!(env!("OUT_DIR"), "/yuv_color_source.wgsl"));
@@ -99,7 +99,7 @@ pub fn video_color_uniform(
 
 #[cfg(test)]
 mod tests {
-    use waterkit_video_core::{
+    use mediax_core::{
         ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction, VideoColorInfo,
     };
 

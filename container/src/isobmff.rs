@@ -3,7 +3,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use waterkit_video_core::Error;
+use mediax_core::Error;
 
 const BASIC_HEADER_LENGTH: usize = 8;
 const BASIC_HEADER_SIZE: u64 = 8;
@@ -93,10 +93,28 @@ fn read_top_level_header(
 pub fn scan_top_level_boxes(path: &Path) -> Result<Vec<TopLevelBoxSpan>, Error> {
     let mut file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
+    scan_boxes(&mut file, 0, file_len)
+}
+
+/// Lists the boxes directly inside `parent` in file order without reading
+/// their payloads.
+pub fn scan_child_boxes(
+    path: &Path,
+    parent: &TopLevelBoxSpan,
+) -> Result<Vec<TopLevelBoxSpan>, Error> {
+    let mut file = std::fs::File::open(path)?;
+    scan_boxes(&mut file, parent.body_offset, parent.offset + parent.size)
+}
+
+fn scan_boxes(
+    file: &mut std::fs::File,
+    start: u64,
+    end: u64,
+) -> Result<Vec<TopLevelBoxSpan>, Error> {
     let mut spans = Vec::new();
-    let mut offset = 0_u64;
-    while offset < file_len {
-        let span = read_top_level_header(&mut file, offset, file_len)?;
+    let mut offset = start;
+    while offset < end {
+        let span = read_top_level_header(file, offset, end)?;
         offset = span.offset + span.size;
         spans.push(span);
     }

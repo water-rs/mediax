@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, num::NonZeroU64, time::Duration};
 
+use mediax_core::Error;
 use quick_m3u8::{
     HlsLine, Reader,
     config::ParsingOptions,
@@ -9,7 +10,6 @@ use quick_m3u8::{
     },
 };
 use url::Url;
-use waterkit_video_core::Error;
 
 use crate::{MediaByteRange, MediaRequest, StreamVariant, fetch_media};
 
@@ -461,17 +461,14 @@ fn stream_variant(
             ))
         })
         .transpose()?;
-    let codecs = stream_data
-        .codecs()
-        .map(|codecs| {
-            codecs
-                .split(',')
-                .map(str::trim)
-                .filter(|codec| !codec.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
+    let codecs = stream_data.codecs().map_or_else(Vec::new, |codecs| {
+        codecs
+            .split(',')
+            .map(str::trim)
+            .filter(|codec| !codec.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    });
 
     Ok(StreamVariant {
         url: resolve_url(base_url, uri)?,

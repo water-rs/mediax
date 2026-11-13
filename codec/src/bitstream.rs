@@ -1,7 +1,15 @@
-use crate::CodecError;
-use waterkit_video_core::EncryptionSubsample;
-
-const START_CODE: [u8; 4] = [0, 0, 0, 1];
+#[cfg(any(
+    test,
+    target_os = "android",
+    target_os = "windows",
+    mediax_hw_codec_vaapi
+))]
+use crate::annexb::length_prefixed_to_annex_b;
+use crate::{
+    CodecError,
+    annexb::{START_CODE, annex_b_nalus, read_length_field},
+};
+use mediax_core::EncryptionSubsample;
 
 /// Converts ISO BMFF length-prefixed H.264/H.265 access units to Annex B.
 ///
@@ -20,7 +28,7 @@ pub enum NalStreamConverter {
         #[cfg(any(test, target_os = "android"))]
         /// Boundary between primary and secondary platform codec data.
         secondary_parameter_set_offset: Option<usize>,
-        #[cfg(any(test, target_os = "linux", target_os = "windows"))]
+        #[cfg(any(test, target_os = "windows", mediax_hw_codec_vaapi))]
         /// Whether the parameter sets have already been prefixed in-band.
         sent_parameter_sets: bool,
     },
@@ -77,7 +85,7 @@ impl NalStreamConverter {
             parameter_sets: parsed.parameter_sets,
             #[cfg(any(test, target_os = "android"))]
             secondary_parameter_set_offset: parsed.secondary_parameter_set_offset,
-            #[cfg(any(test, target_os = "linux", target_os = "windows"))]
+            #[cfg(any(test, target_os = "windows", mediax_hw_codec_vaapi))]
             sent_parameter_sets: false,
         })
     }
@@ -125,7 +133,8 @@ impl NalStreamConverter {
             Self::AnnexB => Ok(sample.to_vec()),
             Self::LengthPrefixed {
                 nal_length_size, ..
-            } => length_prefixed_to_annex_b(sample, *nal_length_size),
+            } => length_prefixed_to_annex_b(sample, *nal_length_size)
+                .map_err(|reason| CodecError::DecodingFailed(reason.into())),
         }
     }
 
@@ -156,7 +165,7 @@ impl NalStreamConverter {
         }
     }
 
-    #[cfg(any(test, target_os = "linux", target_os = "windows"))]
+    #[cfg(any(test, target_os = "windows", mediax_hw_codec_vaapi))]
     /// Converts one access unit and prepends configuration parameter sets once.
     ///
     /// A decoder fed a raw Annex B elementary stream has nowhere else to learn
@@ -180,7 +189,8 @@ impl NalStreamConverter {
                 sent_parameter_sets,
                 ..
             } => {
-                let mut annex_b = length_prefixed_to_annex_b(sample, *nal_length_size)?;
+                let mut annex_b = length_prefixed_to_annex_b(sample, *nal_length_size)
+                    .map_err(|reason| CodecError::DecodingFailed(reason.into()))?;
                 if *sent_parameter_sets {
                     return Ok(annex_b);
                 }
@@ -318,46 +328,12 @@ pub fn annex_b_to_length_prefixed(data: &[u8], is_hevc: bool) -> (Option<Vec<u8>
     (Some(out), is_keyframe)
 }
 
-/// Returns `(start, end)` byte ranges of each NAL unit after its start code.
-fn annex_b_nalus(data: &[u8]) -> Vec<(usize, usize)> {
-    let mut nalus = Vec::new();
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        let (is_start, start_code_len) = if data[i..].starts_with(&[0, 0, 0, 1]) {
-            (true, 4)
-        } else if data[i..].starts_with(&[0, 0, 1]) {
-            (true, 3)
-        } else {
-            (false, 0)
-        };
-        if is_start {
-            let start = i + start_code_len;
-            let mut end = data.len();
-            let mut j = start;
-            while j + 3 <= data.len() {
-                if data[j..].starts_with(&[0, 0, 1]) || data[j..].starts_with(&[0, 0, 0, 1]) {
-                    end = j;
-                    break;
-                }
-                j += 1;
-            }
-            if start < end {
-                nalus.push((start, end));
-            }
-            i = end;
-        } else {
-            i += 1;
-        }
-    }
-    nalus
-}
-
 /// Builds the `avcC` (`AVCDecoderConfigurationRecord`) payload from an
 /// Annex-B bitstream that contains SPS (NAL type 7) and PPS (NAL type 8)
 /// units — either the parameter sets an encoder prepends to its first IDR
 /// access unit or the raw `MF_MT_MPEG_SEQUENCE_HEADER` blob on Windows.
 /// Returns `None` when the bitstream carries no usable SPS/PPS pair.
-#[cfg(any(waterkit_hw_codec_vaapi, waterkit_hw_codec_windows))]
+#[cfg(any(all(test, unix), mediax_hw_codec_windows, mediax_hw_codec_vaapi))]
 pub fn build_h264_avcc_from_annex_b(bitstream: &[u8]) -> Option<Vec<u8>> {
     let mut sps = None;
     let mut pps = None;
@@ -406,7 +382,7 @@ pub fn build_h264_avcc_from_annex_b(bitstream: &[u8]) -> Option<Vec<u8>> {
 /// (type 33) and PPS (type 34) units. Profile/tier/level and the temporal
 /// layer fields are read out of the first SPS; the record is `None` when any
 /// of the three parameter sets is missing.
-#[cfg(waterkit_hw_codec_windows)]
+#[cfg(any(all(test, unix), mediax_hw_codec_windows))]
 pub fn build_h265_hvcc_from_annex_b(bitstream: &[u8]) -> Option<Vec<u8>> {
     let mut vps_nalus: Vec<&[u8]> = Vec::new();
     let mut sps_nalus: Vec<&[u8]> = Vec::new();
@@ -671,50 +647,10 @@ fn append_parameter_set(
     Ok(())
 }
 
-fn length_prefixed_to_annex_b(
-    sample: &[u8],
-    nal_length_size: usize,
-) -> Result<Vec<u8>, CodecError> {
-    let mut offset = 0;
-    let mut output = Vec::with_capacity(sample.len() + 64);
-    while offset + nal_length_size <= sample.len() {
-        let nal_len = read_length_field(&sample[offset..offset + nal_length_size]);
-        offset += nal_length_size;
-        if nal_len == 0 {
-            continue;
-        }
-        let end = offset.checked_add(nal_len).ok_or_else(|| {
-            CodecError::DecodingFailed("length-prefixed NAL size overflowed usize".into())
-        })?;
-        let nal = sample.get(offset..end).ok_or_else(|| {
-            CodecError::DecodingFailed("length-prefixed sample has a truncated NAL unit".into())
-        })?;
-        output.extend_from_slice(&START_CODE);
-        output.extend_from_slice(nal);
-        offset = end;
-    }
-    if offset != sample.len() {
-        return Err(CodecError::DecodingFailed(
-            "length-prefixed sample has trailing bytes".into(),
-        ));
-    }
-    Ok(output)
-}
-
-fn read_length_field(bytes: &[u8]) -> usize {
-    match bytes {
-        [a] => *a as usize,
-        [a, b] => u16::from_be_bytes([*a, *b]) as usize,
-        [a, b, c] => ((*a as usize) << 16) | ((*b as usize) << 8) | (*c as usize),
-        [a, b, c, d] => u32::from_be_bytes([*a, *b, *c, *d]) as usize,
-        _ => unreachable!("NAL length size is encoded in two bits and must be 1..=4"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::NalStreamConverter;
-    use waterkit_video_core::EncryptionSubsample;
+    use mediax_core::EncryptionSubsample;
 
     #[test]
     fn converts_length_prefixed_avc_and_prepends_parameter_sets_once() {

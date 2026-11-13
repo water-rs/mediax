@@ -1,0 +1,41 @@
+[package]
+name = "mediax-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "The mediax command line: probe, transcode and remux media files"
+keywords = ["video", "cli", "transcode", "mp4", "ffprobe"]
+categories = ["multimedia::video", "command-line-utilities"]
+
+[[bin]]
+name = "mediax"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+mediax-container.workspace = true
+# AV1 encodes and decodes in software on every desktop host; H.264 and H.265
+# use the platform's hardware codecs.
+mediax-codec = { workspace = true, features = ["software-encode"] }
+askama.workspace = true
+bytes.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# Test media is generated, never committed: real encoded samples, muxed with
+# `Muxer`, then repackaged by `transmux` into fragmented MP4 and MPEG-TS.
+broadcast-common.workspace = true
+hex.workspace = true
+mediax-core.workspace = true
+tempfile = "3"
+transmux.workspace = true

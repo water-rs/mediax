@@ -1,0 +1,43 @@
+[package]
+name = "mediax-codec-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4.13", default-features = false, features = ["link_libfuzzer"] }
+mediax-codec = { path = "..", default-features = false, features = ["fuzzing"] }
+
+# Not a member of the repository's workspace.
+[workspace]
+
+[[bin]]
+name = "parse_h264"
+path = "fuzz_targets/parse_h264.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_h264"
+path = "fuzz_targets/decode_h264.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_h265"
+path = "fuzz_targets/parse_h265.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_h265"
+path = "fuzz_targets/decode_h265.rs"
+test = false
+doc = false
+bench = false

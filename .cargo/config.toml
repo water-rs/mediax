@@ -1,0 +1,5 @@
+[env]
+# VideoToolbox's Constrained Baseline profile (WebRTC's H.264 profile) needs
+# macOS 12 and iOS 15.
+MACOSX_DEPLOYMENT_TARGET = "12.0"
+IPHONEOS_DEPLOYMENT_TARGET = "15.0"

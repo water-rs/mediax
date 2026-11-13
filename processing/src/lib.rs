@@ -14,7 +14,7 @@ pub use gpu_effect::{GpuEffectProcessor, GpuTextureFrame};
 
 use std::future::Future;
 
-use waterkit_video_core::{Error, FrameTiming};
+use mediax_core::{Error, FrameTiming};
 
 /// A frame payload paired with deterministic media timing.
 #[derive(Debug)]
@@ -118,7 +118,7 @@ impl<Frame> FrameProcessor<Frame> for Identity {
 mod tests {
     use std::time::Duration;
 
-    use waterkit_video_core::{Error, FrameTiming};
+    use mediax_core::{Error, FrameTiming};
 
     use super::{FrameProcessor, Identity, TimedFrame};
 
