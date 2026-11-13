@@ -618,9 +618,9 @@ impl SliceSpec {
                     }
                 }
                 if config.lists_modification && total_curr > 1 {
-                    for list in 0..lists {
-                        bits.bit(self.list_entries[list].is_some());
-                        if let Some(entries) = &self.list_entries[list] {
+                    for list_entry in &self.list_entries[..lists] {
+                        bits.bit(list_entry.is_some());
+                        if let Some(entries) = list_entry {
                             for &entry in entries {
                                 bits.u(ceil_log2(u32::try_from(total_curr).unwrap()), entry);
                             }

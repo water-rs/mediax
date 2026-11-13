@@ -192,13 +192,13 @@ impl ScalingLists {
                         next = syntax.se_range(-7, 247, "scaling_list_dc_coef_minus8")? + 8;
                         result.dc[size_id][matrix_id] = narrow(next)?;
                     }
-                    for coefficient in 0..count {
+                    for slot in &mut result.lists[size_id][matrix_id][..count] {
                         let delta = syntax.se_range(-128, 127, "scaling_list_delta_coef")?;
                         next = (next + delta + 256) % 256;
                         if next == 0 {
                             return Err(H265Error::Invalid("a scaling list coefficient is 0"));
                         }
-                        result.lists[size_id][matrix_id][coefficient] = narrow(next)?;
+                        *slot = narrow(next)?;
                     }
                 } else {
                     let delta: usize = narrow(
