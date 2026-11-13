@@ -53,4 +53,4 @@ Every crate has its own `thiserror` error enum. Workspace lints are strict (all 
 
 ## Branches and releases
 
-Topic branches start from `dev`; `main` only accepts merges from `dev` or a `release-plz-*` branch. Releases go through release-plz and crates.io trusted publishing (`release.yml`); version bumps and `chore: release` commits belong to release-plz alone.
+`main` is the only long-lived branch: topic branches start from and merge into `main`. Releases go through release-plz and crates.io trusted publishing (`release.yml`); version bumps and `chore: release` commits belong to release-plz alone.
