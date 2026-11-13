@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/water-rs/mediax/compare/mediax-container-v0.0.0...mediax-container-v0.1.0) - 2026-11-13
+
+### Added
+
+- *(codec)* decode H.265 Main and Main 10 through VA-API
+- *(codec)* VA-API decoding of progressive H.264 on Linux
+- *(codec)* [**breaking**] encoded packets carry their frame's presentation and decode time
+- *(container)* [**breaking**] open any supported container from a path with parsed codec parameters
+- *(container)* [**breaking**] multi-track MP4/MOV muxer with sample timestamps
+- *(codec)* [**breaking**] realtime encoding for WebRTC
+- *(codec)* [**breaking**] remove cros-codecs and the vaapi feature
+- stand up mediax from waterkit's media crates
+- record compressed and raw camera video on desktop
+- *(video)* read the track's codec from the container, and demux AV1
+
+### Fixed
+
+- *(container)* [**breaking**] apply MP4/MOV edit lists when reading, and write pre-roll through them
+- *(camera)* [**breaking**] record YCbCr matrix and range in WKRV raw recordings
+- *(camera)* tag desktop recordings with source color
+- *(video)* keep keyframe seek safe on empty tracks
+- *(video)* chain fragment bases per moof and decode by PTS
+- *(video)* honor fragment timing when reading fragmented MP4
+- *(container)* preserve 64-bit recording sizes and offsets ([#117](https://github.com/water-rs/mediax/pull/117))
+- *(android)* unbreak the Android workspace build and clear its lint debt
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into feat/9-vaapi-h264-decoder
+- Merge remote-tracking branch 'origin/dev' into feat/24-packet-timestamps
+- release v0.2.0
+- *(deps)* update every dependency to its latest release
+- *(container)* name fragment run fixture parameters clearly
+- release v0.1.2 ([#55](https://github.com/water-rs/mediax/pull/55))
+- ship the licence texts in every published crate
+- upgrade WaterKit dependencies
+- build modular cross-platform media stack
+
 ## [0.2.0](https://github.com/water-rs/waterkit/compare/waterkit-video-container-v0.1.4...waterkit-video-container-v0.2.0) - 2026-10-16
 
 ### Added

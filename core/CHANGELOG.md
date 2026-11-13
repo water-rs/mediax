@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/water-rs/mediax/compare/mediax-core-v0.0.0...mediax-core-v0.1.0) - 2026-11-13
+
+### Added
+
+- *(codec)* decode H.265 Main and Main 10 through VA-API
+- *(codec)* VA-API decoding of progressive H.264 on Linux
+- *(codec)* [**breaking**] realtime encoding for WebRTC
+- *(codec)* [**breaking**] remove cros-codecs and the vaapi feature
+- stand up mediax from waterkit's media crates
+
+### Fixed
+
+- *(video-core)* decode 10-bit samples from the high bits of their element
+- *(camera)* [**breaking**] record YCbCr matrix and range in WKRV raw recordings
+- *(camera)* tag desktop recordings with source color
+- *(camera)* address review of the zero-copy frame path
+
+### Other
+
+- release v0.2.0
+- Merge branch 'fix/169-recording-colour-tags' into fix/174-raw-recording-matrix
+- Merge branch 'feat/175-frame-colour-description' into fix/169-recording-colour-tags
+- Merge remote-tracking branch 'origin/dev' into feat/175-frame-colour-description
+- Merge branch 'fix/169-recording-colour-tags' into fix/174-raw-recording-matrix
+- Merge branch 'feat/175-frame-colour-description' into fix/169-recording-colour-tags
+- *(video-core)* map matrix and range to the shared YCbCr modes once
+- *(codec,video-core)* share the YCbCr range and matrix WGSL
+- release v0.1.2 ([#55](https://github.com/water-rs/mediax/pull/55))
+- ship the licence texts in every published crate
+- build modular cross-platform media stack
+
 ## [0.2.0](https://github.com/water-rs/waterkit/compare/waterkit-video-core-v0.1.4...waterkit-video-core-v0.2.0) - 2026-10-16
 
 ### Added
