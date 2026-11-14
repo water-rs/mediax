@@ -27,8 +27,9 @@ release = false
 name = "mediax-processing"
 release = false
 
-# The facade enables `mediax-processing/filtrate` under `full`, which cannot
-# compile in the semver check's out-of-workspace copy for the same reason.
+# The facade depends on `mediax-processing = "^0.1.0"`, which is still at its
+# 0.0.0 placeholder on crates.io for the reason above; keep the facade
+# unreleased alongside it until `mediax-processing` can be published.
 [[package]]
 name = "mediax"
-semver_check = false
+release = false
