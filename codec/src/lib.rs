@@ -59,7 +59,7 @@
 
 #![warn(missing_docs)]
 
-#[cfg(any(test, mediax_hw_codec, mediax_hw_codec_vaapi, mediax_vaapi_testing))]
+#[cfg(any(test, mediax_hw_codec, mediax_hw_codec_vaapi, mediax_vaapi_fuzzing))]
 mod annexb;
 #[cfg(feature = "aac")]
 pub mod audio;
@@ -69,7 +69,7 @@ pub mod audio;
     mediax_hw_codec_android,
     mediax_hw_codec_windows,
     mediax_hw_codec_vaapi,
-    mediax_vaapi_testing
+    mediax_vaapi_fuzzing
 ))]
 mod bitstream;
 mod color;
@@ -82,10 +82,10 @@ mod color;
 mod config;
 mod encoder_config;
 mod frame;
-#[cfg(mediax_vaapi_testing)]
+#[cfg(any(all(test, unix), mediax_vaapi_fuzzing))]
 #[doc(hidden)]
 pub mod fuzzing;
-#[cfg(any(mediax_vaapi_testing, mediax_hw_codec_vaapi))]
+#[cfg(any(all(test, unix), mediax_vaapi_fuzzing, mediax_hw_codec_vaapi))]
 #[cfg_attr(
     all(feature = "fuzzing", not(test), not(mediax_hw_codec_vaapi)),
     expect(
@@ -94,7 +94,7 @@ pub mod fuzzing;
     )
 )]
 mod h264;
-#[cfg(any(mediax_vaapi_testing, mediax_hw_codec_vaapi))]
+#[cfg(any(all(test, unix), mediax_vaapi_fuzzing, mediax_hw_codec_vaapi))]
 #[cfg_attr(
     all(feature = "fuzzing", not(test), not(mediax_hw_codec_vaapi)),
     expect(
@@ -108,7 +108,7 @@ pub mod image;
 pub(crate) mod image_android;
 #[cfg(target_vendor = "apple")]
 mod image_apple;
-#[cfg(any(mediax_vaapi_testing, mediax_hw_codec_vaapi))]
+#[cfg(any(all(test, unix), mediax_vaapi_fuzzing, mediax_hw_codec_vaapi))]
 #[cfg_attr(
     all(feature = "fuzzing", not(test), not(mediax_hw_codec_vaapi)),
     expect(
@@ -125,7 +125,7 @@ mod sys;
     mediax_hw_codec_android,
     mediax_hw_codec_windows,
     mediax_hw_codec_vaapi,
-    mediax_vaapi_testing
+    mediax_vaapi_fuzzing
 ))]
 pub use bitstream::{ConvertedProtectedSample, NalStreamConverter, annex_b_to_length_prefixed};
 pub use color::{

@@ -3,7 +3,7 @@
     target_os = "android",
     target_os = "windows",
     mediax_hw_codec_vaapi,
-    mediax_vaapi_testing
+    mediax_vaapi_fuzzing
 ))]
 use crate::annexb::length_prefixed_to_annex_b;
 use crate::{
@@ -33,7 +33,7 @@ pub enum NalStreamConverter {
             test,
             target_os = "windows",
             mediax_hw_codec_vaapi,
-            mediax_vaapi_testing
+            mediax_vaapi_fuzzing
         ))]
         /// Whether the parameter sets have already been prefixed in-band.
         sent_parameter_sets: bool,
@@ -95,7 +95,7 @@ impl NalStreamConverter {
                 test,
                 target_os = "windows",
                 mediax_hw_codec_vaapi,
-                mediax_vaapi_testing
+                mediax_vaapi_fuzzing
             ))]
             sent_parameter_sets: false,
         })
@@ -180,7 +180,7 @@ impl NalStreamConverter {
         test,
         target_os = "windows",
         mediax_hw_codec_vaapi,
-        mediax_vaapi_testing
+        mediax_vaapi_fuzzing
     ))]
     /// Converts one access unit and prepends configuration parameter sets once.
     ///
