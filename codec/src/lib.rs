@@ -59,7 +59,7 @@
 
 #![warn(missing_docs)]
 
-#[cfg(any(test, mediax_hw_codec, mediax_hw_codec_vaapi))]
+#[cfg(any(test, mediax_hw_codec, mediax_hw_codec_vaapi, mediax_vaapi_fuzzing))]
 mod annexb;
 #[cfg(feature = "aac")]
 pub mod audio;
@@ -68,7 +68,8 @@ pub mod audio;
     test,
     mediax_hw_codec_android,
     mediax_hw_codec_windows,
-    mediax_hw_codec_vaapi
+    mediax_hw_codec_vaapi,
+    mediax_vaapi_fuzzing
 ))]
 mod bitstream;
 mod color;
@@ -81,19 +82,40 @@ mod color;
 mod config;
 mod encoder_config;
 mod frame;
-#[cfg(any(all(feature = "fuzzing", mediax_hw_codec_vaapi), all(test, unix)))]
+#[cfg(any(all(test, unix), mediax_vaapi_fuzzing))]
 #[doc(hidden)]
 pub mod fuzzing;
-#[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
+#[cfg(any(all(test, unix), mediax_vaapi_fuzzing, mediax_hw_codec_vaapi))]
+#[cfg_attr(
+    all(feature = "fuzzing", not(test), not(mediax_hw_codec_vaapi)),
+    expect(
+        dead_code,
+        reason = "fuzz targets exercise a subset of the shared codec implementation"
+    )
+)]
 mod h264;
-#[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
+#[cfg(any(all(test, unix), mediax_vaapi_fuzzing, mediax_hw_codec_vaapi))]
+#[cfg_attr(
+    all(feature = "fuzzing", not(test), not(mediax_hw_codec_vaapi)),
+    expect(
+        dead_code,
+        reason = "fuzz targets exercise a subset of the shared codec implementation"
+    )
+)]
 mod h265;
 pub mod image;
 #[cfg(target_os = "android")]
 pub(crate) mod image_android;
 #[cfg(target_vendor = "apple")]
 mod image_apple;
-#[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
+#[cfg(any(all(test, unix), mediax_vaapi_fuzzing, mediax_hw_codec_vaapi))]
+#[cfg_attr(
+    all(feature = "fuzzing", not(test), not(mediax_hw_codec_vaapi)),
+    expect(
+        dead_code,
+        reason = "fuzz targets exercise a subset of the shared codec implementation"
+    )
+)]
 mod rbsp;
 mod software;
 mod sys;
@@ -102,7 +124,8 @@ mod sys;
     test,
     mediax_hw_codec_android,
     mediax_hw_codec_windows,
-    mediax_hw_codec_vaapi
+    mediax_hw_codec_vaapi,
+    mediax_vaapi_fuzzing
 ))]
 pub use bitstream::{ConvertedProtectedSample, NalStreamConverter, annex_b_to_length_prefixed};
 pub use color::{

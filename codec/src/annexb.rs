@@ -23,7 +23,8 @@ pub const START_CODE: [u8; 4] = [0, 0, 0, 1];
     test,
     mediax_hw_codec_android,
     mediax_hw_codec_windows,
-    mediax_hw_codec_vaapi
+    mediax_hw_codec_vaapi,
+    mediax_vaapi_fuzzing
 ))]
 pub fn annex_b_nalus(data: &[u8]) -> Vec<(usize, usize)> {
     let mut nalus = Vec::new();
@@ -64,7 +65,8 @@ pub fn annex_b_nalus(data: &[u8]) -> Vec<(usize, usize)> {
     mediax_hw_codec_apple,
     mediax_hw_codec_android,
     mediax_hw_codec_windows,
-    mediax_hw_codec_vaapi
+    mediax_hw_codec_vaapi,
+    mediax_vaapi_fuzzing
 ))]
 pub fn length_prefixed_to_annex_b(
     sample: &[u8],
