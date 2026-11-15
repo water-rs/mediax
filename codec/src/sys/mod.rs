@@ -10,5 +10,12 @@ pub mod android;
 pub mod windows;
 
 // The driver-double tests need unix file descriptors and a dynamic loader.
-#[cfg(any(all(test, unix), mediax_hw_codec_vaapi))]
+#[cfg(any(mediax_vaapi_testing, mediax_hw_codec_vaapi))]
+#[cfg_attr(
+    all(feature = "fuzzing", not(test), not(mediax_hw_codec_vaapi)),
+    expect(
+        dead_code,
+        reason = "fuzz targets use the driver double rather than the native backend"
+    )
+)]
 pub mod vaapi;
