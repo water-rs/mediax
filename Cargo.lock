@@ -2297,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "mediax"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mediax-codec",
  "mediax-container",
@@ -2308,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "mediax-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "env_logger",
  "mediax-codec",
@@ -2318,7 +2318,7 @@ dependencies = [
 
 [[package]]
 name = "mediax-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "askama",
  "broadcast-common",
@@ -2339,7 +2339,7 @@ dependencies = [
 
 [[package]]
 name = "mediax-codec"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "avif-parse",
  "cfg_aliases",
@@ -2386,7 +2386,7 @@ dependencies = [
 
 [[package]]
 name = "mediax-container"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "broadcast-common",
  "bytes",
@@ -2402,14 +2402,14 @@ dependencies = [
 
 [[package]]
 name = "mediax-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "mediax-processing"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "filtrate",
  "futures-lite",
@@ -2419,7 +2419,7 @@ dependencies = [
 
 [[package]]
 name = "mediax-streaming"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-channel",
  "async-fs",
