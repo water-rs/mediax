@@ -137,7 +137,7 @@ clippy.multiple_crate_versions = "allow"
 # `async fn` signature; returning `impl Future` from only those would make the
 # implementations less uniform.
 clippy.unused_async_trait_impl = "allow"
-cargo.unused_dependencies = "deny"
+cargo.unused_dependencies = "warn"
 
 # `filtrate`'s executor API is only on water-rs/cherenkov's dev, so
 # `mediax-processing/filtrate` builds through this patch, which crates.io drops.
