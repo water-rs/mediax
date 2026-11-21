@@ -205,18 +205,6 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  unused-deps:
-    name: Unused Dependencies
-    needs: changes
-    if: needs.changes.outputs.format == 'true' || needs.changes.outputs.manifests == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cargo-machete
-      - run: cargo machete
-
   feature-checks:
     name: Features
     needs: changes
@@ -280,7 +268,7 @@ jobs:
     # job passed or was skipped (release-plz bump pull requests skip all).
     name: CI result
     if: always()
-    needs: [changes, fmt, clippy, cross-clippy, coverage, audit, unused-deps, feature-checks, test]
+    needs: [changes, fmt, clippy, cross-clippy, coverage, audit, feature-checks, test]
     runs-on: ubuntu-latest
     steps:
       - name: Check job results

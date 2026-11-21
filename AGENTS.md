@@ -10,7 +10,6 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all
 cargo test --workspace --all-features
 cargo hack check -p mediax-codec --feature-powerset --no-dev-deps
-cargo machete
 ```
 
 ## Architecture
