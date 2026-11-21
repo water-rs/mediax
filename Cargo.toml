@@ -4,7 +4,7 @@ members = ["core", "codec", "container", "streaming", "processing", "cli", "benc
 exclude = ["codec/fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Lexo Liu"]
 license = "MIT OR Apache-2.0"
@@ -54,14 +54,14 @@ aac = ["codec", "mediax-codec/aac"]
 full = ["container", "streaming", "offline", "processing", "filtrate", "gpu", "software-encode", "aac"]
 
 [workspace.dependencies]
-mediax-core = { path = "core", version = "0.1.0" }
+mediax-core = { path = "core", version = "0.1.1" }
 # No default features: consumers opt into `gpu` (decoded-frame upload),
 # `software-decode` (rav1d + image decoding), `software-encode` (adds rav1e)
 # and `aac` explicitly.
-mediax-codec = { path = "codec", version = "0.1.0", default-features = false }
-mediax-container = { path = "container", version = "0.1.0" }
-mediax-streaming = { path = "streaming", version = "0.1.0" }
-mediax-processing = { path = "processing", version = "0.1.0" }
+mediax-codec = { path = "codec", version = "0.1.1", default-features = false }
+mediax-container = { path = "container", version = "0.1.1" }
+mediax-streaming = { path = "streaming", version = "0.1.1" }
+mediax-processing = { path = "processing", version = "0.1.1" }
 
 thiserror = "2"
 tracing = "0.1.44"

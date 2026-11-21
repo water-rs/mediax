@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/water-rs/mediax/compare/mediax-codec-v0.1.0...mediax-codec-v0.1.1) - 2026-11-21
+
+### Fixed
+
+- *(codec)* preserve VA-API unit-test configuration without fuzzing
+- *(codec)* enable VA-API fuzz targets on Unix hosts
+
 ## [0.2.0](https://github.com/water-rs/waterkit/compare/waterkit-codec-v0.1.4...waterkit-codec-v0.2.0) - 2026-10-16
 
 ### Added
